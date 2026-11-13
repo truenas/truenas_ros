@@ -1,15 +1,12 @@
-//! IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) from a unix timestamp --
-//! the one date shape RFC 9110 sec. 5.6.7 requires servers to *send*. Pure
-//! arithmetic (Howard Hinnant's civil-from-days), no clock access: the
-//! caller supplies the seconds so serialization stays deterministic and
-//! testable.
+//! IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) from a unix timestamp -- the one date shape RFC 9110 sec. 5.6.7
+//! requires servers to *send*. Pure arithmetic (Howard Hinnant's civil-from-days), no clock access: the caller supplies
+//! the seconds so serialization stays deterministic and testable.
 
 use std::fmt;
 
 /// A UTC wall-clock instant formatted as an IMF-fixdate via [`fmt::Display`].
 ///
-/// Construct with [`HttpDate::from_unix`]; the glue layer feeds it
-/// `SystemTime::now()` once per response.
+/// Construct with [`HttpDate::from_unix`]; the glue layer feeds it `SystemTime::now()` once per response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpDate {
     year: i64,
@@ -22,22 +19,20 @@ pub struct HttpDate {
 }
 
 const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
-    "Nov", "Dec",
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 impl HttpDate {
     /// Convert seconds since the unix epoch (UTC) into calendar fields.
     ///
-    /// Negative inputs (pre-1970) are handled by the same arithmetic; leap
-    /// seconds don't exist in unix time, so none are represented.
+    /// Negative inputs (pre-1970) are handled by the same arithmetic; leap seconds don't exist in unix time, so none
+    /// are represented.
     pub fn from_unix(secs: i64) -> Self {
         let days = secs.div_euclid(86_400);
         let secs_of_day = secs.rem_euclid(86_400);
 
-        // Civil-from-days (Hinnant): shift the epoch to 0000-03-01 so leap
-        // days land at the end of the cycle year.
+        // Civil-from-days (Hinnant): shift the epoch to 0000-03-01 so leap days land at the end of the cycle year.
         let z = days + 719_468;
         let era = z.div_euclid(146_097);
         let doe = z.rem_euclid(146_097); // [0, 146096]
@@ -80,20 +75,17 @@ impl fmt::Display for HttpDate {
     }
 }
 
-/// A cache of the rendered `Date` value, keyed by the unix second. HTTP
-/// dates have one-second resolution and handlers run single-threaded on
-/// their reactor, so re-running the calendar math and formatting per
-/// response (~750 ns) is waste: the glue owns one of these per protocol
-/// instance (= per reactor) and re-renders only when the second changes.
-/// Pure like the rest of the module - the caller supplies the seconds, so
-/// serialization stays deterministic and testable.
+/// A cache of the rendered `Date` value, keyed by the unix second. HTTP dates have one-second resolution and handlers
+/// run single-threaded on their reactor, so re-running the calendar math and formatting per response (~750 ns) is
+/// waste: the glue owns one of these per protocol instance (= per reactor) and re-renders only when the second changes.
+/// Pure like the rest of the module - the caller supplies the seconds, so serialization stays deterministic and
+/// testable.
 #[derive(Debug)]
 pub(crate) struct DateCache {
     /// The second the buffer holds; `None` until the first render.
     sec: Option<i64>,
-    /// Rendered length. IMF-fixdate is 29 bytes for four-digit years; the
-    /// buffer leaves room for the degenerate years an arbitrary `i64`
-    /// second can name (+/-12 digits), which cannot overflow it.
+    /// Rendered length. IMF-fixdate is 29 bytes for four-digit years; the buffer leaves room for the degenerate years
+    /// an arbitrary `i64` second can name (+/-12 digits), which cannot overflow it.
     len: usize,
     text: [u8; 40],
     /// Renders performed - pins the caching in tests.
@@ -115,19 +107,14 @@ impl Default for DateCache {
 }
 
 impl DateCache {
-    /// The rendered IMF-fixdate for `secs`, re-rendered only when the
-    /// second differs from the previous call.
+    /// The rendered IMF-fixdate for `secs`, re-rendered only when the second differs from the previous call.
     pub(crate) fn get(&mut self, secs: i64) -> &[u8] {
         if self.sec != Some(secs) {
             let mut cur = std::io::Cursor::new(&mut self.text[..]);
-            // Infallible: the widest renderable year fits the buffer (see
-            // the field doc), and a Cursor over `&mut [u8]` errors only on
-            // overflow.
-            std::io::Write::write_fmt(
-                &mut cur,
-                format_args!("{}", HttpDate::from_unix(secs)),
-            )
-            .expect("rendered date fits the buffer");
+            // Infallible: the widest renderable year fits the buffer (see the field doc), and a Cursor over `&mut [u8]`
+            // errors only on overflow.
+            std::io::Write::write_fmt(&mut cur, format_args!("{}", HttpDate::from_unix(secs)))
+                .expect("rendered date fits the buffer");
             self.len = cur.position() as usize;
             self.sec = Some(secs);
             #[cfg(test)]
@@ -167,10 +154,7 @@ mod tests {
 
     #[test]
     fn epoch() {
-        assert_eq!(
-            HttpDate::from_unix(0).to_string(),
-            "Thu, 01 Jan 1970 00:00:00 GMT"
-        );
+        assert_eq!(HttpDate::from_unix(0).to_string(), "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 
     #[test]
@@ -184,8 +168,8 @@ mod tests {
 
     #[test]
     fn century_non_leap() {
-        // 1900 was not a leap year: the day after 1900-02-28 is March 1.
-        // -2203891200 = 1900-03-01 00:00:00 UTC (a Thursday).
+        // 1900 was not a leap year: the day after 1900-02-28 is March 1. -2203891200 = 1900-03-01 00:00:00 UTC (a
+        // Thursday).
         assert_eq!(
             HttpDate::from_unix(-2_203_891_200).to_string(),
             "Thu, 01 Mar 1900 00:00:00 GMT"

@@ -1,12 +1,11 @@
 //! `secrets` through its public surface, across a real `fork(2)`.
 //!
-//! The unit tests in `src/secrets.rs` drive the mapping directly. These drive
-//! the shape a consumer has, and the one the `Send`/`Sync` impls exist for: a
-//! credential snapshot behind a shared `Arc`, a process that forks after
-//! building it, and a child whose teardown runs its own destructors.
+//! The unit tests in `src/secrets.rs` drive the mapping directly. These drive the shape a consumer has, and the one the
+//! `Send`/`Sync` impls exist for: a credential snapshot behind a shared `Arc`, a process that forks after building it,
+//! and a child whose teardown runs its own destructors.
 //!
-//! Skips when the kernel has no `memfd_secret`; the QEMU job sets
-//! `TRUENAS_ROS_REQUIRE_SECRETMEM` so a skip there is a failure.
+//! Skips when the kernel has no `memfd_secret`; the QEMU job sets `TRUENAS_ROS_REQUIRE_SECRETMEM` so a skip there is a
+//! failure.
 #![cfg(all(target_os = "linux", feature = "secrets"))]
 
 use std::sync::Arc;
@@ -28,13 +27,12 @@ fn secretmem_or_skip() -> bool {
 
 /// Fork, returning 0 in the child as `fork(2)` does.
 ///
-/// Each child branch is inline rather than passed in as a closure: the child
-/// has to own the handles to drop them, and a `move` closure would take them
-/// from the parent. A branch ending in `_exit` diverges, so the parent's
-/// copies survive it.
+/// Each child branch is inline rather than passed in as a closure: the child has to own the handles to drop them, and a
+/// `move` closure would take them from the parent. A branch ending in `_exit` diverges, so the parent's copies survive
+/// it.
 fn fork_now() -> libc::pid_t {
-    // SAFETY: `fork` in a test binary; each child below only drops its own
-    // values, or reads one address, and then `_exit`s.
+    // SAFETY: `fork` in a test binary; each child below only drops its own values, or reads one address, and then
+    // `_exit`s.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
     pid
@@ -53,9 +51,8 @@ fn key_region() -> Arc<SecretMem> {
     Arc::new(mem)
 }
 
-/// The credential-snapshot pattern: a signing key behind an `Arc`, a worker
-/// holding a second handle, a fork, and then the child's last handle going
-/// out of scope. The parent must still hold the key it signs with.
+/// The credential-snapshot pattern: a signing key behind an `Arc`, a worker holding a second handle, a fork, and then
+/// the child's last handle going out of scope. The parent must still hold the key it signs with.
 #[test]
 fn a_child_dropping_its_last_handle_leaves_the_parent_signing() {
     if !secretmem_or_skip() {
@@ -66,8 +63,8 @@ fn a_child_dropping_its_last_handle_leaves_the_parent_signing() {
 
     let pid = fork_now();
     if pid == 0 {
-        // Both handles go here, so the child's refcount reaches zero and
-        // `SecretMem::drop` runs - the teardown of a forked worker.
+        // Both handles go here, so the child's refcount reaches zero and `SecretMem::drop` runs - the teardown of a
+        // forked worker.
         drop(worker);
         drop(key);
         // SAFETY: async-signal-safe exit; nothing buffered to flush.
@@ -89,8 +86,8 @@ fn a_child_dropping_its_last_handle_leaves_the_parent_signing() {
     assert_eq!(Arc::strong_count(&key), 2, "the parent lost a handle");
 }
 
-/// The other half: the address the child inherited is not mapped there, so
-/// reading it faults instead of yielding key material.
+/// The other half: the address the child inherited is not mapped there, so reading it faults instead of yielding key
+/// material.
 #[test]
 fn a_forked_child_cannot_read_the_key() {
     if !secretmem_or_skip() {
@@ -101,17 +98,12 @@ fn a_forked_child_cannot_read_the_key() {
 
     let pid = fork_now();
     if pid == 0 {
-        // The fault below is the pass condition, so the child is going to
-        // be killed by a signal that dumps core. With the ordinary
-        // `core_pattern` of `core` and `core_uses_pid` set, that writes a
-        // `core.<pid>` the size of the child's address space into
-        // whatever directory `cargo test` was run from - measured at
-        // 6.9 MiB per run, left behind in the source tree. Refuse the
-        // dump rather than produce and ignore it. Lowering `RLIMIT_CORE`
-        // needs no privilege, changes no signal (the child still dies
-        // `SIGSEGV`, which is what the parent asserts), and is a bare
-        // syscall, so it is safe in the post-fork child alongside the
-        // `_exit` below.
+        // The fault below is the pass condition, so the child is going to be killed by a signal that dumps core. With
+        // the ordinary `core_pattern` of `core` and `core_uses_pid` set, that writes a `core.<pid>` the size of the
+        // child's address space into whatever directory `cargo test` was run from - measured at 6.9 MiB per run, left
+        // behind in the source tree. Refuse the dump rather than produce and ignore it. Lowering `RLIMIT_CORE` needs no
+        // privilege, changes no signal (the child still dies `SIGSEGV`, which is what the parent asserts), and is a
+        // bare syscall, so it is safe in the post-fork child alongside the `_exit` below.
         // SAFETY: a valid rlimit for a limit any process may lower.
         unsafe {
             libc::setrlimit(
@@ -122,11 +114,11 @@ fn a_forked_child_cannot_read_the_key() {
                 },
             )
         };
-        // SAFETY: deliberately reading an address this process should not
-        // have. Faulting is the pass condition; the parent checks the signal.
+        // SAFETY: deliberately reading an address this process should not have. Faulting is the pass condition; the
+        // parent checks the signal.
         let first = unsafe { std::ptr::read_volatile(addr as *const u8) };
-        // Reached only if the mapping was inherited, which is the failure --
-        // exit non-zero, and make the read observable so it is not elided.
+        // Reached only if the mapping was inherited, which is the failure -- exit non-zero, and make the read
+        // observable so it is not elided.
         unsafe { libc::_exit(if first == KEY[0] { 2 } else { 3 }) };
     }
     let status = wait_for(pid);

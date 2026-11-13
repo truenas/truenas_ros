@@ -1,32 +1,26 @@
-//! Integration tests for `truenas_ros::audit` (mirrors `src/`, nix
-//! convention).
+//! Integration tests for `truenas_ros::audit` (mirrors `src/`, nix convention).
 //!
-//! These send **real records** to the kernel audit subsystem. Three
-//! environments are tolerated, because all three are legitimate:
+//! These send **real records** to the kernel audit subsystem. Three environments are tolerated, because all three are
+//! legitimate:
 //!
 //! * no `NETLINK_AUDIT` at all (a sandbox, or audit compiled out) - the socket
 //!   cannot open, and the suite skips;
 //! * a socket but no `CAP_AUDIT_WRITE` - the kernel answers `EPERM`, surfaced
 //!   as [`SendStatus::Unavailable`], which is a pass;
-//! * the real thing - records are accepted and land in `audit.log`
-//!   (`ausearch -m TEST,TRUSTED_APP -ts recent` to see them).
+//! * the real thing - records are accepted and land in `audit.log` (`ausearch -m TEST,TRUSTED_APP -ts recent` to see
+//!   them).
 //!
-//! Set `TRUENAS_ROS_REQUIRE_AUDIT=1` to turn the first two into hard failures,
-//! the way `TRUENAS_ROS_REQUIRE_IO_URING` does for the net suites.
+//! Set `TRUENAS_ROS_REQUIRE_AUDIT=1` to turn the first two into hard failures, the way `TRUENAS_ROS_REQUIRE_IO_URING`
+//! does for the net suites.
 #![cfg(all(target_os = "linux", feature = "audit"))]
 
-use truenas_ros::audit::{
-    AuditEvent, AuditPrincipal, AuditSocket, AuditType, MAX_RECORD_LEN,
-    SendStatus,
-};
+use truenas_ros::audit::{AuditEvent, AuditPrincipal, AuditSocket, AuditType, MAX_RECORD_LEN, SendStatus};
 use truenas_ros::errno::Errno;
 
 /// Whether a missing audit subsystem should fail rather than skip.
 fn audit_required() -> bool {
-    // Presence, not the value: every other REQUIRE gate in the tree is
-    // `var_os(..).is_none()`, so `=yes` or `=true` arms all forty of them
-    // and used to leave this one - and the five tests behind it - silently
-    // skipping to green.
+    // Presence, not the value: every other REQUIRE gate in the tree is `var_os(..).is_none()`, so `=yes` or `=true`
+    // arms all forty of them and used to leave this one - and the five tests behind it - silently skipping to green.
     std::env::var_os("TRUENAS_ROS_REQUIRE_AUDIT").is_some()
 }
 
@@ -74,8 +68,8 @@ fn sends_a_test_record() {
 
 #[test]
 fn sends_a_burst_over_one_socket() {
-    // The sequence counter advances per record and each ack is matched to its
-    // own send; a burst is where a mismatch would show up.
+    // The sequence counter advances per record and each ack is matched to its own send; a burst is where a mismatch
+    // would show up.
     let Some(mut sock) = socket() else { return };
     for i in 0..32 {
         let n = i.to_string();

@@ -1,6 +1,5 @@
-//! The error vocabulary: what a call, a session, or the transport can
-//! report, with middlewared's own error payload decoded rather than handed
-//! back as a blob.
+//! The error vocabulary: what a call, a session, or the transport can report, with middlewared's own error payload
+//! decoded rather than handed back as a blob.
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -9,31 +8,25 @@ use std::fmt;
 use std::io;
 use truenas_ros::ws::HandshakeError;
 
-/// middlewared's JSON-RPC error code for "too many concurrent calls" - the
-/// per-connection semaphore (soft 10 / hard 20) refusing at the hard limit.
-/// Retryable once earlier calls complete.
+/// middlewared's JSON-RPC error code for "too many concurrent calls" - the per-connection semaphore (soft 10 / hard 20)
+/// refusing at the hard limit. Retryable once earlier calls complete.
 pub const TOO_MANY_CONCURRENT_CALLS: i64 = -32000;
 
-/// middlewared's JSON-RPC error code for a method call that raised - the
-/// interesting one, whose `data` member carries [`CallError`].
+/// middlewared's JSON-RPC error code for a method call that raised - the interesting one, whose `data` member carries
+/// [`CallError`].
 pub const CALL_ERROR: i64 = -32001;
 
-/// JSON-RPC 2.0 §5.1's `-32602`, which middlewared answers a validation
-/// failure with - carrying the *same* `data` payload as [`CALL_ERROR`],
-/// and the only code that carries `extra`
-/// (`middlewared/api/base/server/ws_handler/rpc.py`:
-/// `send_truenas_validation_error` -> `format_truenas_validation_error` ->
-/// `format_truenas_error`). The reference Python client decodes both codes
-/// for exactly that reason.
+/// JSON-RPC 2.0 §5.1's `-32602`, which middlewared answers a validation failure with - carrying the *same* `data`
+/// payload as [`CALL_ERROR`], and the only code that carries `extra` (`middlewared/api/base/server/ws_handler/rpc.py`:
+/// `send_truenas_validation_error` -> `format_truenas_validation_error` -> `format_truenas_error`). The reference
+/// Python client decodes both codes for exactly that reason.
 pub const INVALID_PARAMS: i64 = -32602;
 
-/// One entry of a middlewared validation error's `extra` list:
-/// `(attribute, message, errno)`.
+/// One entry of a middlewared validation error's `extra` list: `(attribute, message, errno)`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ExtraError(pub String, pub String, pub i64);
 
-/// The `trace` object inside a [`CallError`]: the server-side exception,
-/// formatted.
+/// The `trace` object inside a [`CallError`]: the server-side exception, formatted.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Trace {
     /// The exception class name.
@@ -52,21 +45,17 @@ pub struct Trace {
 
 /// The decoded `data` payload of a middlewared `-32001` call error.
 ///
-/// Every field is optional by construction: the payload's shape belongs to
-/// the server release, and a client that refuses an error because the
-/// error's decoration drifted would be manufacturing a second failure out
-/// of the first. `message` alone is always present (it is the JSON-RPC
-/// `error.message`).
+/// Every field is optional by construction: the payload's shape belongs to the server release, and a client that
+/// refuses an error because the error's decoration drifted would be manufacturing a second failure out of the first.
+/// `message` alone is always present (it is the JSON-RPC `error.message`).
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct CallError {
-    /// The JSON-RPC `error.message` (middlewared sends "Method call
-    /// error" here; the interesting text is in `reason`).
+    /// The JSON-RPC `error.message` (middlewared sends "Method call error" here; the interesting text is in `reason`).
     pub message: String,
     /// The middleware errno (`data.error`).
     pub errno: Option<i64>,
-    /// The errno's symbolic name (`data.errname`, e.g. `EPERM`,
-    /// `ENOTAUTHENTICATED`).
+    /// The errno's symbolic name (`data.errname`, e.g. `EPERM`, `ENOTAUTHENTICATED`).
     pub errname: Option<String>,
     /// The human-readable failure (`data.reason`).
     pub reason: Option<String>,
@@ -74,27 +63,22 @@ pub struct CallError {
     pub trace: Option<Trace>,
     /// Validation failures as `(attribute, message, errno)` triples.
     ///
-    /// Populated only when `data.extra` really is that list, which is the
-    /// `-32602` shape: `send_truenas_validation_error` passes
-    /// `ValidationErrors`, whose `__iter__` yields
-    /// `(attribute, errmsg, errno)`. On `-32001` the member is whatever
-    /// the raiser handed `CallError(..., extra=...)`, and every raiser in
-    /// middlewared hands it a **dict** - `{'dependencies': [...]}` from
-    /// `crud_service.py`'s delete-with-dependents, the open-files report
-    /// from `pool_/dataset_processes.py`. Those arrive in
-    /// [`CallError::extra_raw`] instead of being dropped.
+    /// Populated only when `data.extra` really is that list, which is the `-32602` shape:
+    /// `send_truenas_validation_error` passes `ValidationErrors`, whose `__iter__` yields `(attribute, errmsg, errno)`.
+    /// On `-32001` the member is whatever the raiser handed `CallError(..., extra=...)`, and every raiser in
+    /// middlewared hands it a **dict** - `{'dependencies': [...]}` from `crud_service.py`'s delete-with-dependents, the
+    /// open-files report from `pool_/dataset_processes.py`. Those arrive in [`CallError::extra_raw`] instead of being
+    /// dropped.
     pub extra: Option<Vec<ExtraError>>,
     /// `data.extra` exactly as the server sent it, whatever its shape.
     ///
-    /// Always carries the member when there is one, so nothing the server
-    /// put there is lost to a type that did not fit it. [`CallError::extra`]
-    /// is this decoded, for the one shape that has a type.
+    /// Always carries the member when there is one, so nothing the server put there is lost to a type that did not fit
+    /// it. [`CallError::extra`] is this decoded, for the one shape that has a type.
     pub extra_raw: Option<Value>,
 }
 
 impl fmt::Display for CallError {
-    /// The reason when the server sent one, the generic message
-    /// otherwise, with the errname in brackets when known.
+    /// The reason when the server sent one, the generic message otherwise, with the errname in brackets when known.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(name) = &self.errname {
             write!(f, "[{name}] ")?;
@@ -107,23 +91,19 @@ impl fmt::Display for CallError {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ApiError {
-    /// The method ran and failed: middlewared's `-32001` with its payload
-    /// decoded.
+    /// The method ran and failed: middlewared's `-32001` with its payload decoded.
     Call(Box<CallError>),
-    /// The parameters did not validate: middlewared's `-32602` with the
-    /// same payload decoded. Held apart from [`ApiError::Call`] because
-    /// the method never ran - nothing was attempted, so nothing needs
-    /// undoing - and because this is the code whose
-    /// [`CallError::extra`] carries the per-attribute failures.
+    /// The parameters did not validate: middlewared's `-32602` with the same payload decoded. Held apart from
+    /// [`ApiError::Call`] because the method never ran - nothing was attempted, so nothing needs undoing - and because
+    /// this is the code whose [`CallError::extra`] carries the per-attribute failures.
     InvalidParams(Box<CallError>),
-    /// middlewared refused the call at its per-connection concurrency
-    /// hard limit (`-32000`). Retryable once earlier calls finish.
+    /// middlewared refused the call at its per-connection concurrency hard limit (`-32000`). Retryable once earlier
+    /// calls finish.
     TooManyConcurrentCalls {
         /// The server's message.
         message: String,
     },
-    /// Any other JSON-RPC error object (`-32601` method not found,
-    /// `-32602` invalid params, ...).
+    /// Any other JSON-RPC error object (`-32601` method not found, `-32602` invalid params, ...).
     Rpc {
         /// The JSON-RPC error code.
         code: i64,
@@ -134,29 +114,24 @@ pub enum ApiError {
     },
     /// The WebSocket upgrade failed; the session never opened.
     Handshake(HandshakeError),
-    /// The peer violated the protocol (a masked or malformed frame, a
-    /// binary frame, a batch answer, a response to no outstanding call,
-    /// non-JSON text); the session is closed.
+    /// The peer violated the protocol (a masked or malformed frame, a binary frame, a batch answer, a response to no
+    /// outstanding call, non-JSON text); the session is closed.
     Protocol(&'static str),
-    /// The call's `params` did not serialize to a JSON Array, which is
-    /// the only shape middlewared accepts (named params are rejected
-    /// server-side).
+    /// The call's `params` did not serialize to a JSON Array, which is the only shape middlewared accepts (named params
+    /// are rejected server-side).
     ParamsNotArray,
-    /// The encoded message exceeds the session's outbound cap. Sending it
-    /// anyway would not fail the call - middlewared closes the whole
-    /// connection on an oversized message (WS close 1009), taking every
-    /// other call with it - so it is refused here instead.
+    /// The encoded message exceeds the session's outbound cap. Sending it anyway would not fail the call - middlewared
+    /// closes the whole connection on an oversized message (WS close 1009), taking every other call with it - so it is
+    /// refused here instead.
     TooLarge {
         /// The encoded JSON length.
         len: usize,
         /// The session's cap.
         cap: usize,
     },
-    /// The call did not complete inside the configured deadline. The
-    /// session stays open; a late answer is discarded.
+    /// The call did not complete inside the configured deadline. The session stays open; a late answer is discarded.
     Timeout,
-    /// The session (or the connection under it) closed before the
-    /// operation completed.
+    /// The session (or the connection under it) closed before the operation completed.
     Closed {
         /// Why, as far as the transport said.
         reason: String,
@@ -165,23 +140,18 @@ pub enum ApiError {
     Io(io::Error),
     /// A payload did not decode into the requested type.
     Decode(serde_json::Error),
-    /// A queue is at its bound and the work was not accepted: the
-    /// deferred [`queue_bulk`](crate::ApiClient::queue_bulk) queue
-    /// ([`ApiConfig::max_queued_bulk_items`](crate::ApiConfig::max_queued_bulk_items)),
-    /// or a session's own backlog behind its concurrency budget
-    /// ([`ApiConfig::max_queued_calls`](crate::ApiConfig::max_queued_calls)).
+    /// A queue is at its bound and the work was not accepted: the deferred [`queue_bulk`](crate::ApiClient::queue_bulk)
+    /// queue ([`ApiConfig::max_queued_bulk_items`](crate::ApiConfig::max_queued_bulk_items)), or a session's own
+    /// backlog behind its concurrency budget ([`ApiConfig::max_queued_calls`](crate::ApiConfig::max_queued_calls)).
     /// Retry once earlier work drains.
     QueueFull {
-        /// Which bound was reached, in the units it counts - four
-        /// different queues raise this and an operator reading the
-        /// message needs to know which. See the producers in
-        /// `bulk.rs`, `session.rs` and `lib.rs`.
+        /// Which bound was reached, in the units it counts - four different queues raise this and an operator reading
+        /// the message needs to know which. See the producers in `bulk.rs`, `session.rs` and `lib.rs`.
         queue: &'static str,
         /// The configured bound, in `queue`'s units.
         cap: usize,
     },
-    /// [`ApiConfig::endpoint`](crate::ApiConfig::endpoint) pins an API
-    /// version this client does not speak (see
+    /// [`ApiConfig::endpoint`](crate::ApiConfig::endpoint) pins an API version this client does not speak (see
     /// [`MIN_API_VERSION`](crate::MIN_API_VERSION)).
     UnsupportedApiVersion {
         /// The `(major, minor, patch)` the endpoint pinned.
@@ -189,11 +159,9 @@ pub enum ApiError {
         /// The oldest version this client speaks.
         minimum: (u32, u32, u32),
     },
-    /// The handle names no live session (already closed, or never this
-    /// client's).
+    /// The handle names no live session (already closed, or never this client's).
     UnknownSession,
-    /// The JSON-RPC frame could not be built (a params serializer
-    /// failed).
+    /// The JSON-RPC frame could not be built (a params serializer failed).
     Build(String),
 }
 
@@ -210,9 +178,7 @@ impl fmt::Display for ApiError {
             }
             Self::Handshake(e) => write!(f, "handshake: {e}"),
             Self::Protocol(what) => write!(f, "protocol violation: {what}"),
-            Self::ParamsNotArray => {
-                f.write_str("params must serialize to a JSON Array")
-            }
+            Self::ParamsNotArray => f.write_str("params must serialize to a JSON Array"),
             Self::TooLarge { len, cap } => write!(
                 f,
                 "message of {len} bytes exceeds the {cap}-byte outbound cap \
@@ -259,14 +225,12 @@ impl From<serde_json::Error> for ApiError {
     }
 }
 
-/// Decode a JSON-RPC error object into the [`ApiError`] middlewared meant
-/// by it.
+/// Decode a JSON-RPC error object into the [`ApiError`] middlewared meant by it.
 pub(crate) fn from_rpc_error(e: &truenas_jsonrpc::ErrorObject) -> ApiError {
     match e.code() {
         CALL_ERROR => ApiError::Call(Box::new(call_error(e))),
-        // middlewared builds a validation failure's `data` with the same
-        // `format_truenas_error` it uses for -32001, so the same decode
-        // applies - and this is the code that actually carries `extra`.
+        // middlewared builds a validation failure's `data` with the same `format_truenas_error` it uses for -32001, so
+        // the same decode applies - and this is the code that actually carries `extra`.
         INVALID_PARAMS => ApiError::InvalidParams(Box::new(call_error(e))),
         TOO_MANY_CONCURRENT_CALLS => ApiError::TooManyConcurrentCalls {
             message: e.message().to_owned(),
@@ -281,10 +245,9 @@ pub(crate) fn from_rpc_error(e: &truenas_jsonrpc::ErrorObject) -> ApiError {
 
 /// One member of a JSON-RPC `error.data` object, decoded on its own.
 ///
-/// `None` when `data` is absent or not an Object, when the member is absent or
-/// `null`, or when it will not decode into `T` - the last of which is the
-/// point: JSON-RPC 2.0 §5.1 leaves `data` entirely to the server, so a client
-/// must be able to lose one drifted member without losing the rest.
+/// `None` when `data` is absent or not an Object, when the member is absent or `null`, or when it will not decode into
+/// `T` - the last of which is the point: JSON-RPC 2.0 §5.1 leaves `data` entirely to the server, so a client must be
+/// able to lose one drifted member without losing the rest.
 fn member<T: DeserializeOwned>(data: Option<&Value>, name: &str) -> Option<T> {
     data.and_then(Value::as_object)
         .and_then(|m| m.get(name))
@@ -292,13 +255,11 @@ fn member<T: DeserializeOwned>(data: Option<&Value>, name: &str) -> Option<T> {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
-/// Decode middlewared's TrueNAS error payload out of an error object's
-/// `data`, one member at a time (see [`member`]).
+/// Decode middlewared's TrueNAS error payload out of an error object's `data`, one member at a time (see [`member`]).
 ///
-/// Shared by the two codes that carry that payload: `-32001`, and `-32602`,
-/// which is the one that actually delivers `extra`. Per-member decoding
-/// matters most here - a validation failure's `extra` is the part most likely
-/// to gain a field, and losing it must not also lose `errname`.
+/// Shared by the two codes that carry that payload: `-32001`, and `-32602`, which is the one that actually delivers
+/// `extra`. Per-member decoding matters most here - a validation failure's `extra` is the part most likely to gain a
+/// field, and losing it must not also lose `errname`.
 fn call_error(e: &truenas_jsonrpc::ErrorObject) -> CallError {
     let data = e.data();
     CallError {
@@ -322,26 +283,20 @@ mod tests {
     use serde_json::json;
     use truenas_jsonrpc::ErrorObject;
 
-    /// middlewared's validation failure: -32602 with the full TrueNAS
-    /// payload, including the per-attribute `extra` list. It decodes like
-    /// -32001 rather than being handed back as an opaque blob.
-    /// `format_truenas_error` always emits the member -
-    /// `"extra": extra` with `extra` defaulting to `None`
-    /// (`api/base/server/ws_handler/rpc.py`) - so the common `-32001`
-    /// carries `"extra": null`. Without the null filter `extra_raw`
-    /// would be `Some(Value::Null)` and a caller testing `is_some()`
-    /// would act on a payload that is not there.
+    /// middlewared's validation failure: -32602 with the full TrueNAS payload, including the per-attribute `extra`
+    /// list. It decodes like -32001 rather than being handed back as an opaque blob. `format_truenas_error` always
+    /// emits the member - `"extra": extra` with `extra` defaulting to `None` (`api/base/server/ws_handler/rpc.py`) - so
+    /// the common `-32001` carries `"extra": null`. Without the null filter `extra_raw` would be `Some(Value::Null)`
+    /// and a caller testing `is_some()` would act on a payload that is not there.
     #[test]
     fn a_null_extra_is_absent_not_present() {
-        let e = ErrorObject::new(CALL_ERROR, "Method call error").with_data(
-            serde_json::json!({
-                "error": 1,
-                "errname": "EPERM",
-                "reason": "Not authorized",
-                "trace": null,
-                "extra": null,
-            }),
-        );
+        let e = ErrorObject::new(CALL_ERROR, "Method call error").with_data(serde_json::json!({
+            "error": 1,
+            "errname": "EPERM",
+            "reason": "Not authorized",
+            "trace": null,
+            "extra": null,
+        }));
         match from_rpc_error(&e) {
             ApiError::Call(err) => {
                 assert_eq!(err.errname.as_deref(), Some("EPERM"));
@@ -357,20 +312,17 @@ mod tests {
         }
     }
 
-    /// `-32001`'s `extra` is whatever the raiser passed
-    /// `CallError(..., extra=...)`, and every middlewared raiser passes a
-    /// dict - the delete-with-dependents report, the open-files list.
+    /// `-32001`'s `extra` is whatever the raiser passed `CallError(..., extra=...)`, and every middlewared raiser
+    /// passes a dict - the delete-with-dependents report, the open-files list.
     /// The typed field cannot hold one; the raw field must not lose it.
     #[test]
     fn a_dict_extra_survives_as_raw() {
-        let e = ErrorObject::new(CALL_ERROR, "Method call error").with_data(
-            serde_json::json!({
-                "error": 16,
-                "errname": "EBUSY",
-                "reason": "Device busy",
-                "extra": { "dependencies": ["share/smb/1"] },
-            }),
-        );
+        let e = ErrorObject::new(CALL_ERROR, "Method call error").with_data(serde_json::json!({
+            "error": 16,
+            "errname": "EBUSY",
+            "reason": "Device busy",
+            "extra": { "dependencies": ["share/smb/1"] },
+        }));
         match from_rpc_error(&e) {
             ApiError::Call(err) => {
                 // The members around it still decode.
@@ -386,15 +338,12 @@ mod tests {
         }
     }
 
-    /// The `-32602` shape still decodes into the typed field, and the raw
-    /// one carries it too - one member, two views.
+    /// The `-32602` shape still decodes into the typed field, and the raw one carries it too - one member, two views.
     #[test]
     fn a_list_extra_decodes_and_is_also_raw() {
-        let e = ErrorObject::new(INVALID_PARAMS, "Invalid params").with_data(
-            serde_json::json!({
-                "extra": [["pool_create.name", "Invalid", 22]],
-            }),
-        );
+        let e = ErrorObject::new(INVALID_PARAMS, "Invalid params").with_data(serde_json::json!({
+            "extra": [["pool_create.name", "Invalid", 22]],
+        }));
         match from_rpc_error(&e) {
             ApiError::InvalidParams(err) => {
                 let typed = err.extra.expect("the triple decodes");
@@ -408,27 +357,19 @@ mod tests {
 
     #[test]
     fn a_validation_error_decodes_its_payload() {
-        let e = ErrorObject::new(INVALID_PARAMS, "Invalid params").with_data(
-            json!({
-                "error": 22,
-                "errname": "EINVAL",
-                "reason": "[EINVAL] pool_create.name: Invalid name",
-                "trace": { "class": "ValidationErrors" },
-                "extra": [["pool_create.name", "Invalid name", 22]]
-            }),
-        );
+        let e = ErrorObject::new(INVALID_PARAMS, "Invalid params").with_data(json!({
+            "error": 22,
+            "errname": "EINVAL",
+            "reason": "[EINVAL] pool_create.name: Invalid name",
+            "trace": { "class": "ValidationErrors" },
+            "extra": [["pool_create.name", "Invalid name", 22]]
+        }));
         match from_rpc_error(&e) {
             ApiError::InvalidParams(err) => {
                 assert_eq!(err.errno, Some(22));
                 assert_eq!(err.errname.as_deref(), Some("EINVAL"));
-                assert_eq!(
-                    err.reason.as_deref(),
-                    Some("[EINVAL] pool_create.name: Invalid name")
-                );
-                assert_eq!(
-                    err.to_string(),
-                    "[EINVAL] [EINVAL] pool_create.name: Invalid name"
-                );
+                assert_eq!(err.reason.as_deref(), Some("[EINVAL] pool_create.name: Invalid name"));
+                assert_eq!(err.to_string(), "[EINVAL] [EINVAL] pool_create.name: Invalid name");
                 let extra = err.extra.expect("the attribute failures");
                 assert_eq!(extra[0].0, "pool_create.name");
                 assert_eq!(extra[0].2, 22);
@@ -437,8 +378,7 @@ mod tests {
         }
     }
 
-    /// A -32602 with no `data` at all (a peer that is not middlewared)
-    /// still decodes, carrying just the message.
+    /// A -32602 with no `data` at all (a peer that is not middlewared) still decodes, carrying just the message.
     #[test]
     fn a_bare_invalid_params_still_decodes() {
         let e = ErrorObject::new(INVALID_PARAMS, "Invalid params");
@@ -455,9 +395,6 @@ mod tests {
     #[test]
     fn an_unknown_code_stays_opaque() {
         let e = ErrorObject::new(-32601, "Method not found");
-        assert!(matches!(
-            from_rpc_error(&e),
-            ApiError::Rpc { code: -32601, .. }
-        ));
+        assert!(matches!(from_rpc_error(&e), ApiError::Rpc { code: -32601, .. }));
     }
 }

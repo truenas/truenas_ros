@@ -1,34 +1,27 @@
 //! The `user_data` completion-routing codec every domain on a ring shares.
 //!
-//! Layout: low 8 bits = the op tag, bits 8..32 = the slot (24 bits), bits
-//! 32..64 = the low 32 bits of the slot's generation. The codec is one
-//! mechanism with domain-owned tag vocabularies on top: the stream stack
-//! (`net`) assigns its `Op` tags inside `0x00..=0x7F`, and the fs domain owns
-//! `0x80..=0xFF` ([`TAG_FS_DOMAIN`]) - so a loop hosting both routes a
-//! completion to its domain with a single bit test, before either domain
-//! decodes the tag any further. Each domain hand-writes its own dispatch
-//! `match` over its tags; nothing here interprets them.
+//! Layout: low 8 bits = the op tag, bits 8..32 = the slot (24 bits), bits 32..64 = the low 32 bits of the slot's
+//! generation. The codec is one mechanism with domain-owned tag vocabularies on top: the stream stack (`net`) assigns
+//! its `Op` tags inside `0x00..=0x7F`, and the fs domain owns `0x80..=0xFF` ([`TAG_FS_DOMAIN`]) - so a loop hosting
+//! both routes a completion to its domain with a single bit test, before either domain decodes the tag any further.
+//! Each domain hand-writes its own dispatch `match` over its tags; nothing here interprets them.
 
 /// The slot field's width: 24 bits, matching the largest supported pool.
 pub(crate) const SLOT_MASK: u64 = 0x00ff_ffff;
 
-/// The tag-byte bit that marks a completion as belonging to the fs domain.
-/// Stream tags stay below it; a host loop tests `user_data as u8 &
-/// TAG_FS_DOMAIN` before its stream `match` (whose unknown-tag arm silently
-/// ignores - it must never swallow another domain's completions).
+/// The tag-byte bit that marks a completion as belonging to the fs domain. Stream tags stay below it; a host loop tests
+/// `user_data as u8 & TAG_FS_DOMAIN` before its stream `match` (whose unknown-tag arm silently ignores - it must never
+/// swallow another domain's completions).
 pub(crate) const TAG_FS_DOMAIN: u8 = 0x80;
 
-/// The stream tag of a completion another ring posts to this one with
-/// `IORING_OP_MSG_RING`. This ring submitted nothing for it, so it is never
-/// counted off `inflight`: counting it would let the teardown drain stop
-/// while an op this ring did submit still names its buffers.
+/// The stream tag of a completion another ring posts to this one with `IORING_OP_MSG_RING`. This ring submitted nothing
+/// for it, so it is never counted off `inflight`: counting it would let the teardown drain stop while an op this ring
+/// did submit still names its buffers.
 pub(crate) const TAG_POSTED: u8 = 0x7f;
 
 /// Encode `(tag, slot, generation-low)` into an SQE `user_data` token.
 pub(crate) fn pack_raw(tag: u8, slot: u32, generation: u32) -> u64 {
-    u64::from(tag)
-        | ((u64::from(slot) & SLOT_MASK) << 8)
-        | (u64::from(generation) << 32)
+    u64::from(tag) | ((u64::from(slot) & SLOT_MASK) << 8) | (u64::from(generation) << 32)
 }
 
 /// Decode a CQE `user_data` token into `(tag, slot, generation-low)`.

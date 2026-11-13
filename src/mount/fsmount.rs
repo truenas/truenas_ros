@@ -85,15 +85,12 @@ pub enum FsConfig<'a> {
     CreateExcl,
 }
 
-/// Create a new filesystem-configuration context for filesystem type
-/// `fs_name`.
+/// Create a new filesystem-configuration context for filesystem type `fs_name`.
 ///
 /// See [`fsopen(2)`](https://man7.org/linux/man-pages/man2/fsopen.2.html).
 pub fn fsopen(fs_name: &str, flags: FsopenFlags) -> errno::Result<OwnedFd> {
     let name = cstr(fs_name)?;
-    let fd = retry_on_eintr(|| unsafe {
-        libc::syscall(libc::SYS_fsopen, name.as_ptr(), flags.bits())
-    })?;
+    let fd = retry_on_eintr(|| unsafe { libc::syscall(libc::SYS_fsopen, name.as_ptr(), flags.bits()) })?;
     // SAFETY: fsopen returns a fresh owned fd on success.
     Ok(unsafe { owned_from_raw(fd as RawFd) })
 }
@@ -108,16 +105,7 @@ pub fn fsconfig<Fd: AsFd>(fs_fd: Fd, op: FsConfig<'_>) -> errno::Result<()> {
                 value: *const c_void,
                 aux: libc::c_int|
      -> errno::Result<libc::c_long> {
-        retry_on_eintr(|| unsafe {
-            libc::syscall(
-                libc::SYS_fsconfig,
-                fd,
-                cmd as libc::c_uint,
-                key,
-                value,
-                aux,
-            )
-        })
+        retry_on_eintr(|| unsafe { libc::syscall(libc::SYS_fsconfig, fd, cmd as libc::c_uint, key, value, aux) })
     };
     match op {
         FsConfig::Flag { key } => {
@@ -160,20 +148,10 @@ pub fn fsconfig<Fd: AsFd>(fs_fd: Fd, op: FsConfig<'_>) -> errno::Result<()> {
 /// `attr` supplies the initial per-mount attributes (`MOUNT_ATTR_*`).
 ///
 /// See [`fsmount(2)`](https://man7.org/linux/man-pages/man2/fsmount.2.html).
-pub fn fsmount<Fd: AsFd>(
-    fs_fd: Fd,
-    flags: FsmountFlags,
-    attr: MountAttr,
-) -> errno::Result<OwnedFd> {
+pub fn fsmount<Fd: AsFd>(fs_fd: Fd, flags: FsmountFlags, attr: MountAttr) -> errno::Result<OwnedFd> {
     let fd = fs_fd.as_fd().as_raw_fd();
-    let m = retry_on_eintr(|| unsafe {
-        libc::syscall(
-            libc::SYS_fsmount,
-            fd,
-            flags.bits(),
-            attr.bits() as libc::c_uint,
-        )
-    })?;
+    let m =
+        retry_on_eintr(|| unsafe { libc::syscall(libc::SYS_fsmount, fd, flags.bits(), attr.bits() as libc::c_uint) })?;
     // SAFETY: fsmount returns a fresh owned fd on success.
     Ok(unsafe { owned_from_raw(m as RawFd) })
 }

@@ -1,9 +1,7 @@
 //! The `http` codec on the io_uring reactor: a minimal HTTP/1.1 endpoint.
 //!
-//! Wires `http::protocol` - accept, per-connection state, and a request
-//! handler - onto a loopback `net::server`. Everything HTTP (framing,
-//! keep-alive, 100-continue, error farewells) is the codec's job; this file
-//! is only routing.
+//! Wires `http::protocol` - accept, per-connection state, and a request handler - onto a loopback `net::server`.
+//! Everything HTTP (framing, keep-alive, 100-continue, error farewells) is the codec's job; this file is only routing.
 //!
 //! Run (loopback only):
 //!   cargo run --example http_hello --features http
@@ -13,11 +11,9 @@
 //!   curl -v -X PUT --data-binary @somefile http://127.0.0.1:8080/echo
 //!   curl -v -H 'Expect: 100-continue' -T somefile http://127.0.0.1:8080/echo
 //!
-//! The default caps compose: `HttpConfig::default()` accepts bodies up to
-//! ~1 MiB (a larger upload is answered with a clean 413). To accept more,
-//! raise `HttpConfig::max_body` and give `Server::with_config` a
-//! `ServerConfig::max_request_bytes` of at least
-//! `HttpConfig::min_request_bytes()`.
+//! The default caps compose: `HttpConfig::default()` accepts bodies up to ~1 MiB (a larger upload is answered with a
+//! clean 413). To accept more, raise `HttpConfig::max_body` and give `Server::with_config` a
+//! `ServerConfig::max_request_bytes` of at least `HttpConfig::min_request_bytes()`.
 
 use truenas_ros::http::{HttpConfig, HttpRequest, HttpResponse, protocol};
 use truenas_ros::net::ClientAddr;
@@ -30,9 +26,7 @@ struct Session {
 
 fn admit(inc: Incoming<'_>) -> Option<Session> {
     match inc.peer {
-        ClientAddr::Inet(sa) if sa.ip().is_loopback() => {
-            Some(Session { requests: 0 })
-        }
+        ClientAddr::Inet(sa) if sa.ip().is_loopback() => Some(Session { requests: 0 }),
         _ => None,
     }
 }

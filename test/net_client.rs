@@ -1,27 +1,18 @@
-//! Integration tests for the `net::client` module - a live loopback client
-//! driving a real in-process [`net::server`](truenas_ros::net::server) over a
-//! 4-byte big-endian length prefix. Beyond the basic echo round-trip they cover
-//! the feature-complete plain-TCP surface: blocking vs. non-blocking connect,
-//! pipelined multi-in-flight (FIFO reply correlation), multi-connection fan-out
-//! on one ring, the response/idle/send timeouts, zero-copy body placement, the
-//! bounded [`next_event_timeout`](Client::next_event_timeout) pump, and
-//! stale-`ConnId` safety.
+//! Integration tests for the `net::client` module - a live loopback client driving a real in-process
+//! [`net::server`](truenas_ros::net::server) over a 4-byte big-endian length prefix. Beyond the basic echo round-trip
+//! they cover the feature-complete plain-TCP surface: blocking vs. non-blocking connect, pipelined multi-in-flight
+//! (FIFO reply correlation), multi-connection fan-out on one ring, the response/idle/send timeouts, zero-copy body
+//! placement, the bounded [`next_event_timeout`](Client::next_event_timeout) pump, and stale-`ConnId` safety.
 //!
-//! These are client<->server *interop* tests, so they need both roles built --
-//! hence the `net-server` gate alongside `net-client`. Like `test/net_server.rs`
-//! they **skip** (return early) when io_uring is unavailable (the CI/dev sandbox
-//! blocks the io_uring syscalls with ENOSYS/EPERM/EACCES); set
-//! `TRUENAS_ROS_REQUIRE_IO_URING=1` to turn a skip into a hard failure.
+//! These are client<->server *interop* tests, so they need both roles built -- hence the `net-server` gate alongside
+//! `net-client`. Like `test/net_server.rs` they **skip** (return early) when io_uring is unavailable (the CI/dev
+//! sandbox blocks the io_uring syscalls with ENOSYS/EPERM/EACCES); set `TRUENAS_ROS_REQUIRE_IO_URING=1` to turn a skip
+//! into a hard failure.
 //!
-//! Both `Server` and `Client` are `!Send` (each owns a single-thread ring), so
-//! the server runs `serve_forever` on the test thread while the client is
-//! constructed and driven on a spawned thread, stopping the server via the
-//! `Send` [`ShutdownHandle`] when done.
-#![cfg(all(
-    target_os = "linux",
-    feature = "net-client",
-    feature = "net-server"
-))]
+//! Both `Server` and `Client` are `!Send` (each owns a single-thread ring), so the server runs `serve_forever` on the
+//! test thread while the client is constructed and driven on a spawned thread, stopping the server via the `Send`
+//! [`ShutdownHandle`] when done.
+#![cfg(all(target_os = "linux", feature = "net-client", feature = "net-server"))]
 
 use std::collections::HashMap;
 use std::io;
@@ -30,29 +21,22 @@ use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use truenas_ros::net::client::{
-    Client, ClientConfig, ConnId, ConnectOpts, Event, RequestId, setup_ring,
-};
+use truenas_ros::net::client::{Client, ClientConfig, ConnId, ConnectOpts, Event, RequestId, setup_ring};
 use truenas_ros::net::server::{
-    Endian, Incoming, Listen, PrefixWidth, Protocol, PushHandle, Request,
-    Response, Server, ServerAddr, ShutdownHandle, length_prefix_header,
-    length_prefixed,
+    Endian, Incoming, Listen, PrefixWidth, Protocol, PushHandle, Request, Response, Server, ServerAddr, ShutdownHandle,
+    length_prefix_header, length_prefixed,
 };
 use truenas_ros::net::{ClientAddr, CloseReason, Framing};
 use truenas_ros::{Errno, Error};
 
-/// Errors that mean "io_uring is unavailable here" - an environmental skip.
-/// Excludes `EINVAL` (a real setup bug we want to fail on).
+/// Errors that mean "io_uring is unavailable here" - an environmental skip. Excludes `EINVAL` (a real setup bug we want
+/// to fail on).
 fn is_unavailable(e: &Error) -> bool {
     matches!(
         e,
-        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded
-        // box exhausts it and ring creation fails - environmental, and
-        // the REQUIRE variable turns the skip red where it must not
-        // happen.
-        Error::Errno(
-            Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM
-        )
+        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded box exhausts it and ring creation fails -
+        // environmental, and the REQUIRE variable turns the skip red where it must not happen.
+        Error::Errno(Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM)
     )
 }
 
@@ -71,8 +55,8 @@ fn to_io(e: Error) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Frame a payload with a 4-byte BE length prefix (matches the server's
-/// `length_prefixed(U32, Big, false, ..)` framing and its echo reply).
+/// Frame a payload with a 4-byte BE length prefix (matches the server's `length_prefixed(U32, Big, false, ..)` framing
+/// and its echo reply).
 fn frame(payload: &[u8]) -> Vec<u8> {
     let mut pdu = (payload.len() as u32).to_be_bytes().to_vec();
     pdu.extend_from_slice(payload);
@@ -84,26 +68,21 @@ fn echo(_header: &[u8], body: &[u8], _peer: &ClientAddr) -> Option<Vec<u8>> {
     Some(frame(body))
 }
 
-/// A server handler that replies with a bare 4-byte length prefix declaring a
-/// 100-byte body it never sends. The client, having read the prefix, arms a
-/// (non-idle) body recv that carries the core request clock - so its
-/// `response_timeout` fires and evicts the stalled connection. A normal echo
-/// handler can't express a partial frame; a hand-built prefix can.
+/// A server handler that replies with a bare 4-byte length prefix declaring a 100-byte body it never sends. The client,
+/// having read the prefix, arms a (non-idle) body recv that carries the core request clock - so its `response_timeout`
+/// fires and evicts the stalled connection. A normal echo handler can't express a partial frame; a hand-built prefix
+/// can.
 fn stalled_reply(_h: &[u8], _b: &[u8], _p: &ClientAddr) -> Option<Vec<u8>> {
     Some(vec![0, 0, 0, 100])
 }
 
 /// The client's reply framer: a 4-byte BE length prefix over the reply.
 fn client_framer() -> impl FnMut(&[u8], &mut ()) -> Framing {
-    truenas_ros::net::length_prefix_header::<()>(
-        PrefixWidth::U32,
-        Endian::Big,
-        false,
-    )
+    truenas_ros::net::length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false)
 }
 
-/// Guard that stops the server if the client thread panics, so a failed assert
-/// surfaces through `join` instead of hanging `serve_forever`.
+/// Guard that stops the server if the client thread panics, so a failed assert surfaces through `join` instead of
+/// hanging `serve_forever`.
 struct ShutdownOnDrop(ShutdownHandle);
 impl Drop for ShutdownOnDrop {
     fn drop(&mut self) {
@@ -111,21 +90,16 @@ impl Drop for ShutdownOnDrop {
     }
 }
 
-/// Bind a single-listener TCP `net::server` with `handler`, run `client` on a
-/// spawned thread against its resolved address, and propagate the client's
-/// result. Skips cleanly when io_uring is unavailable. The server stays on the
-/// test thread in `serve_forever`; the client owns its own ring on the spawned
-/// thread and stops the server when it returns.
+/// Bind a single-listener TCP `net::server` with `handler`, run `client` on a spawned thread against its resolved
+/// address, and propagate the client's result. Skips cleanly when io_uring is unavailable. The server stays on the test
+/// thread in `serve_forever`; the client owns its own ring on the spawned thread and stops the server when it returns.
 fn with_server<Handler, ClientBody>(handler: Handler, client: ClientBody)
 where
     Handler: FnMut(&[u8], &[u8], &ClientAddr) -> Option<Vec<u8>>,
     ClientBody: FnOnce(SocketAddrV4) -> io::Result<()> + Send + 'static,
 {
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::bind(
-        [addr],
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, handler),
-    ) {
+    let mut server = match Server::bind([addr], length_prefixed(PrefixWidth::U32, Endian::Big, false, handler)) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -141,28 +115,17 @@ where
         r
     });
     server.serve_forever().expect("serve_forever");
-    handle
-        .join()
-        .expect("client thread join")
-        .expect("client body");
+    handle.join().expect("client thread join").expect("client body");
 }
 
-/// Connect to `addr` (blocking), run a request round-trip for each message
-/// (keep-alive on one connection), gracefully close, and return the reply
-/// bodies.
+/// Connect to `addr` (blocking), run a request round-trip for each message (keep-alive on one connection), gracefully
+/// close, and return the reply bodies.
 fn echo_client(addr: ServerAddr, msgs: &[&[u8]]) -> io::Result<Vec<Vec<u8>>> {
-    let mut client =
-        Client::new(ClientConfig::default(), client_framer()).map_err(to_io)?;
+    let mut client = Client::new(ClientConfig::default(), client_framer()).map_err(to_io)?;
     // Blocking connect: it returns a serving connection ready for requests.
     let conn = client.connect(addr, ConnectOpts::default())?;
-    assert!(
-        client.is_open(conn),
-        "connection is open after a blocking connect"
-    );
-    assert!(
-        client.conn_state(conn).is_some(),
-        "state reachable while open"
-    );
+    assert!(client.is_open(conn), "connection is open after a blocking connect");
+    assert!(client.conn_state(conn).is_some(), "state reachable while open");
 
     let mut replies = Vec::with_capacity(msgs.len());
     for m in msgs {
@@ -170,9 +133,8 @@ fn echo_client(addr: ServerAddr, msgs: &[&[u8]]) -> io::Result<Vec<Vec<u8>>> {
         replies.push(body.to_vec());
     }
 
-    // Graceful close, then drive it to the Closed event (the idle reply recv is
-    // cancelled and the teardown reclaims the slot - no other traffic is
-    // expected on an echo connection).
+    // Graceful close, then drive it to the Closed event (the idle reply recv is cancelled and the teardown reclaims the
+    // slot - no other traffic is expected on an echo connection).
     client.close(conn);
     match client.next_event()? {
         Some(Event::Closed { conn: c, .. }) => {
@@ -180,17 +142,15 @@ fn echo_client(addr: ServerAddr, msgs: &[&[u8]]) -> io::Result<Vec<Vec<u8>>> {
         }
         None => {} // connection ended without a distinct event
         Some(other) => {
-            return Err(io::Error::other(format!(
-                "unexpected event after close: {other:?}"
-            )));
+            return Err(io::Error::other(format!("unexpected event after close: {other:?}")));
         }
     }
     assert!(!client.is_open(conn), "connection should be closed");
     Ok(replies)
 }
 
-/// Bind an echo server, run `echo_client` against it, and assert the echoes
-/// come back verbatim. Skips cleanly when io_uring is unavailable.
+/// Bind an echo server, run `echo_client` against it, and assert the echoes come back verbatim. Skips cleanly when
+/// io_uring is unavailable.
 fn run_echo(msgs: Vec<Vec<u8>>) {
     let want = msgs.clone();
     with_server(echo, move |v4| {
@@ -212,25 +172,22 @@ fn tcp_echo_roundtrip() {
 
 #[test]
 fn tcp_keepalive() {
-    // Several requests on ONE connection - proves the connection is reused
-    // (each request's reply is FIFO-correlated to it).
-    let msgs: Vec<Vec<u8>> =
-        (0..12).map(|i| format!("req-{i}").into_bytes()).collect();
+    // Several requests on ONE connection - proves the connection is reused (each request's reply is FIFO-correlated to
+    // it).
+    let msgs: Vec<Vec<u8>> = (0..12).map(|i| format!("req-{i}").into_bytes()).collect();
     run_echo(msgs);
 }
 
 #[test]
 fn tcp_connect_refused() {
-    // A pure client test (no server): a *blocking* connect to a dead address
-    // surfaces the failure directly as an `Err`.
+    // A pure client test (no server): a *blocking* connect to a dead address surfaces the failure directly as an `Err`.
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let SocketAddr::V4(dead) = probe.local_addr().unwrap() else {
         unreachable!("bound v4");
     };
     drop(probe); // free the port so a connect is refused
 
-    let mut client = match Client::new(ClientConfig::default(), client_framer())
-    {
+    let mut client = match Client::new(ClientConfig::default(), client_framer()) {
         Ok(c) => c,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("client new: {e}"),
@@ -241,15 +198,12 @@ fn tcp_connect_refused() {
     assert!(
         matches!(
             err.kind(),
-            io::ErrorKind::ConnectionRefused
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::TimedOut
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset | io::ErrorKind::TimedOut
         ),
         "unexpected connect error: {err} ({:?})",
         err.kind()
     );
-    // The failed connect's slot is reclaimed; with no live connections the next
-    // event is `None`.
+    // The failed connect's slot is reclaimed; with no live connections the next event is `None`.
     assert!(
         client.next_event().expect("drain").is_none(),
         "expected no events after a failed blocking connect"
@@ -258,16 +212,15 @@ fn tcp_connect_refused() {
 
 #[test]
 fn tcp_connect_start_refused() {
-    // The non-blocking form: a refusal surfaces as an `Event::ConnectFailed`
-    // from `next_event`, not as an `Err` from the call.
+    // The non-blocking form: a refusal surfaces as an `Event::ConnectFailed` from `next_event`, not as an `Err` from
+    // the call.
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let SocketAddr::V4(dead) = probe.local_addr().unwrap() else {
         unreachable!("bound v4");
     };
     drop(probe);
 
-    let mut client = match Client::new(ClientConfig::default(), client_framer())
-    {
+    let mut client = match Client::new(ClientConfig::default(), client_framer()) {
         Ok(c) => c,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("client new: {e}"),
@@ -280,10 +233,7 @@ fn tcp_connect_start_refused() {
         Some(Event::ConnectFailed { conn: c, err }) => {
             assert_eq!(c, conn, "ConnectFailed for the wrong connection");
             assert!(
-                matches!(
-                    err,
-                    Errno::ECONNREFUSED | Errno::ECONNRESET | Errno::ETIMEDOUT
-                ),
+                matches!(err, Errno::ECONNREFUSED | Errno::ECONNRESET | Errno::ETIMEDOUT),
                 "unexpected connect error: {err:?}"
             );
         }
@@ -298,20 +248,17 @@ fn tcp_connect_start_refused() {
 
 #[test]
 fn tcp_pipelined() {
-    // Send several requests before pumping any reply (true multi-in-flight),
-    // then assert the replies come back in FIFO order, each correlated to the
-    // right RequestId with the right echoed body.
+    // Send several requests before pumping any reply (true multi-in-flight), then assert the replies come back in FIFO
+    // order, each correlated to the right RequestId with the right echoed body.
     with_server(echo, |v4| {
         let cfg = ClientConfig {
             max_in_flight: 8,
             ..ClientConfig::default()
         };
         let mut client = Client::new(cfg, client_framer()).map_err(to_io)?;
-        let conn =
-            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        let conn = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
 
-        let payloads: Vec<Vec<u8>> =
-            (0..5).map(|i| format!("pipe-{i}").into_bytes()).collect();
+        let payloads: Vec<Vec<u8>> = (0..5).map(|i| format!("pipe-{i}").into_bytes()).collect();
         let mut ids: Vec<RequestId> = Vec::new();
         for p in &payloads {
             ids.push(client.send(conn, frame(p))?);
@@ -326,17 +273,12 @@ fn tcp_pipelined() {
                     body,
                 }) => {
                     assert_eq!(c, conn, "reply on the wrong connection");
-                    assert_eq!(
-                        id, *expected_id,
-                        "replies must be FIFO-correlated to sent ids"
-                    );
+                    assert_eq!(id, *expected_id, "replies must be FIFO-correlated to sent ids");
                     assert_eq!(header.len(), 4, "4-byte length prefix header");
                     assert_eq!(&body[..], &payload[..], "echoed body");
                 }
                 other => {
-                    return Err(io::Error::other(format!(
-                        "expected Reply, got {other:?}"
-                    )));
+                    return Err(io::Error::other(format!("expected Reply, got {other:?}")));
                 }
             }
         }
@@ -347,20 +289,15 @@ fn tcp_pipelined() {
 
 #[test]
 fn tcp_empty_pdu_rejected() {
-    // An empty request PDU is refused up front: a zero-length IORING_OP_SEND
-    // completes `res == 0`, which the core reads as a fatal send failure, so a
-    // degenerate input would otherwise tear down a healthy connection, which
-    // stays usable here.
+    // An empty request PDU is refused up front: a zero-length IORING_OP_SEND completes `res == 0`, which the core reads
+    // as a fatal send failure, so a degenerate input would otherwise tear down a healthy connection, which stays usable
+    // here.
     with_server(echo, |v4| {
-        let mut client = Client::new(ClientConfig::default(), client_framer())
-            .map_err(to_io)?;
-        let conn =
-            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        let mut client = Client::new(ClientConfig::default(), client_framer()).map_err(to_io)?;
+        let conn = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
 
         for empty in [Vec::new(), Vec::with_capacity(64)] {
-            let e = client
-                .send(conn, empty)
-                .expect_err("an empty PDU is not a request");
+            let e = client.send(conn, empty).expect_err("an empty PDU is not a request");
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e:?}");
         }
         let e = client
@@ -369,23 +306,18 @@ fn tcp_empty_pdu_rejected() {
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e:?}");
         assert!(client.is_open(conn), "the connection is untouched");
 
-        // A real request on the same connection still round-trips: the rejected
-        // PDUs left no queued bytes and no request awaiting a reply.
+        // A real request on the same connection still round-trips: the rejected PDUs left no queued bytes and no
+        // request awaiting a reply.
         let id = client.send(conn, frame(b"after"))?;
         match client.next_event()? {
             Some(Event::Reply {
-                conn: c,
-                id: rid,
-                body,
-                ..
+                conn: c, id: rid, body, ..
             }) => {
                 assert_eq!((c, rid), (conn, id));
                 assert_eq!(&body[..], b"after", "echoed body");
             }
             other => {
-                return Err(io::Error::other(format!(
-                    "expected Reply, got {other:?}"
-                )));
+                return Err(io::Error::other(format!("expected Reply, got {other:?}")));
             }
         }
         client.close_now(conn);
@@ -395,38 +327,26 @@ fn tcp_empty_pdu_rejected() {
 
 #[test]
 fn tcp_multi_conn_fanout() {
-    // Open N connections (non-blocking), drive them all up on one ring, send a
-    // distinct request on each, and confirm every reply maps back to the right
-    // ConnId.
+    // Open N connections (non-blocking), drive them all up on one ring, send a distinct request on each, and confirm
+    // every reply maps back to the right ConnId.
     with_server(echo, |v4| {
-        let mut client = Client::new(ClientConfig::default(), client_framer())
-            .map_err(to_io)?;
+        let mut client = Client::new(ClientConfig::default(), client_framer()).map_err(to_io)?;
         const N: usize = 4;
 
         let mut conns: Vec<ConnId> = Vec::new();
         for _ in 0..N {
-            conns.push(
-                client.connect_start(
-                    ServerAddr::Tcp(v4),
-                    ConnectOpts::default(),
-                )?,
-            );
+            conns.push(client.connect_start(ServerAddr::Tcp(v4), ConnectOpts::default())?);
         }
         // One ring drives all N connects to completion.
         let mut connected = 0;
         while connected < N {
             match client.next_event()? {
                 Some(Event::Connected { conn }) => {
-                    assert!(
-                        conns.contains(&conn),
-                        "Connected for an unknown connection"
-                    );
+                    assert!(conns.contains(&conn), "Connected for an unknown connection");
                     connected += 1;
                 }
                 other => {
-                    return Err(io::Error::other(format!(
-                        "expected Connected, got {other:?}"
-                    )));
+                    return Err(io::Error::other(format!("expected Connected, got {other:?}")));
                 }
             }
         }
@@ -444,20 +364,12 @@ fn tcp_multi_conn_fanout() {
         while seen < N {
             match client.next_event()? {
                 Some(Event::Reply { conn, body, .. }) => {
-                    let want = expected
-                        .get(&conn)
-                        .expect("reply for an unknown connection");
-                    assert_eq!(
-                        &body[..],
-                        &want[..],
-                        "reply body maps to its connection"
-                    );
+                    let want = expected.get(&conn).expect("reply for an unknown connection");
+                    assert_eq!(&body[..], &want[..], "reply body maps to its connection");
                     seen += 1;
                 }
                 other => {
-                    return Err(io::Error::other(format!(
-                        "expected Reply, got {other:?}"
-                    )));
+                    return Err(io::Error::other(format!("expected Reply, got {other:?}")));
                 }
             }
         }
@@ -470,17 +382,15 @@ fn tcp_multi_conn_fanout() {
 
 #[test]
 fn tcp_response_timeout() {
-    // The server answers with a bare length prefix (a body it never sends),
-    // leaving the client mid-reply; its `response_timeout` (the core request
-    // clock) fires and closes the connection with `RequestTimeout`.
+    // The server answers with a bare length prefix (a body it never sends), leaving the client mid-reply; its
+    // `response_timeout` (the core request clock) fires and closes the connection with `RequestTimeout`.
     with_server(stalled_reply, |v4| {
         let cfg = ClientConfig {
             response_timeout: Some(Duration::from_millis(300)),
             ..ClientConfig::default()
         };
         let mut client = Client::new(cfg, client_framer()).map_err(to_io)?;
-        let conn =
-            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        let conn = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
         client.send(conn, frame(b"trigger"))?;
 
         match client.next_event()? {
@@ -504,30 +414,23 @@ fn tcp_response_timeout() {
 
 #[test]
 fn tcp_idle_timeout() {
-    // Connect and send nothing: the connection is parked on an idle reply recv
-    // that carries the idle clock, so it is reaped after the idle window.
+    // Connect and send nothing: the connection is parked on an idle reply recv that carries the idle clock, so it is
+    // reaped after the idle window.
     with_server(echo, |v4| {
         let cfg = ClientConfig {
             idle_timeout: Some(Duration::from_millis(250)),
             ..ClientConfig::default()
         };
         let mut client = Client::new(cfg, client_framer()).map_err(to_io)?;
-        let conn =
-            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        let conn = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
 
         match client.next_event()? {
             Some(Event::Closed { conn: c, reason }) => {
                 assert_eq!(c, conn);
-                assert_eq!(
-                    reason,
-                    CloseReason::IdleTimeout,
-                    "expected IdleTimeout, got {reason:?}"
-                );
+                assert_eq!(reason, CloseReason::IdleTimeout, "expected IdleTimeout, got {reason:?}");
             }
             other => {
-                return Err(io::Error::other(format!(
-                    "expected Closed(IdleTimeout), got {other:?}"
-                )));
+                return Err(io::Error::other(format!("expected Closed(IdleTimeout), got {other:?}")));
             }
         }
         assert!(!client.is_open(conn), "the idle connection was reaped");
@@ -537,16 +440,13 @@ fn tcp_idle_timeout() {
 
 #[test]
 fn tcp_body_placement() {
-    // A reply body comfortably over the 64 KiB placement threshold is read into
-    // its own allocation and moved out zero-copy; assert it comes back intact.
+    // A reply body comfortably over the 64 KiB placement threshold is read into its own allocation and moved out
+    // zero-copy; assert it comes back intact.
     with_server(echo, |v4| {
-        let mut client = Client::new(ClientConfig::default(), client_framer())
-            .map_err(to_io)?;
-        let conn =
-            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        let mut client = Client::new(ClientConfig::default(), client_framer()).map_err(to_io)?;
+        let conn = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
 
-        let payload: Vec<u8> =
-            (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+        let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
         let body = client.request(conn, frame(&payload))?;
         assert_eq!(body.len(), payload.len(), "placed body length");
         assert_eq!(&body[..], &payload[..], "placed body is intact");
@@ -558,14 +458,11 @@ fn tcp_body_placement() {
 
 #[test]
 fn tcp_next_event_timeout() {
-    // A bounded wait on an idle-but-open connection (no idle_timeout): the
-    // deadline fires, `next_event_timeout` returns None, and the connection is
-    // left open - repeatable, so the deadline is fully reaped each call.
+    // A bounded wait on an idle-but-open connection (no idle_timeout): the deadline fires, `next_event_timeout` returns
+    // None, and the connection is left open - repeatable, so the deadline is fully reaped each call.
     with_server(echo, |v4| {
-        let mut client = Client::new(ClientConfig::default(), client_framer())
-            .map_err(to_io)?;
-        let conn =
-            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        let mut client = Client::new(ClientConfig::default(), client_framer()).map_err(to_io)?;
+        let conn = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
 
         let ev = client.next_event_timeout(Duration::from_millis(200))?;
         assert!(ev.is_none(), "expected no event within the window: {ev:?}");
@@ -573,8 +470,8 @@ fn tcp_next_event_timeout() {
             client.is_open(conn),
             "connection stays open after a bounded wait times out"
         );
-        // A second bounded wait still finds nothing and still leaves it open
-        // (the first call's deadline did not leak into this one).
+        // A second bounded wait still finds nothing and still leaves it open (the first call's deadline did not leak
+        // into this one).
         let ev = client.next_event_timeout(Duration::from_millis(80))?;
         assert!(ev.is_none(), "expected no event on the second wait: {ev:?}");
         assert!(client.is_open(conn), "still open after the second wait");
@@ -586,35 +483,26 @@ fn tcp_next_event_timeout() {
 
 #[test]
 fn tcp_stale_connid() {
-    // A ConnId retained past its connection's close is inert: operations return
-    // NotConnected / None, and close/close_now are no-ops (never a panic).
+    // A ConnId retained past its connection's close is inert: operations return NotConnected / None, and
+    // close/close_now are no-ops (never a panic).
     with_server(echo, |v4| {
-        let mut client = Client::new(ClientConfig::default(), client_framer())
-            .map_err(to_io)?;
-        let conn =
-            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        let mut client = Client::new(ClientConfig::default(), client_framer()).map_err(to_io)?;
+        let conn = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
 
-        // Close and drive to the Closed event so the slot is reclaimed (its
-        // generation bumped) and the ConnId goes stale.
+        // Close and drive to the Closed event so the slot is reclaimed (its generation bumped) and the ConnId goes
+        // stale.
         client.close(conn);
         match client.next_event()? {
             Some(Event::Closed { conn: c, .. }) => assert_eq!(c, conn),
             None => {}
             Some(other) => {
-                return Err(io::Error::other(format!(
-                    "unexpected event: {other:?}"
-                )));
+                return Err(io::Error::other(format!("unexpected event: {other:?}")));
             }
         }
 
         assert!(!client.is_open(conn), "a stale conn is not open");
-        assert!(
-            client.conn_state(conn).is_none(),
-            "no state for a stale conn"
-        );
-        let e = client
-            .send(conn, frame(b"x"))
-            .expect_err("send on a stale conn fails");
+        assert!(client.conn_state(conn).is_none(), "no state for a stale conn");
+        let e = client.send(conn, frame(b"x")).expect_err("send on a stale conn fails");
         assert_eq!(e.kind(), io::ErrorKind::NotConnected);
         let e = client
             .request(conn, frame(b"x"))
@@ -629,11 +517,9 @@ fn tcp_stale_connid() {
 
 #[test]
 fn tcp_send_timeout() {
-    // A raw TCP server that accepts but never reads: the client's large send
-    // fills the socket buffers and then stalls, so `send_timeout` evicts the
-    // connection with `SendTimeout`. Built on a raw socket (not `net::server`,
-    // which always drains its peer) with a payload far larger than any
-    // autotuned buffer, so the stall is reliable.
+    // A raw TCP server that accepts but never reads: the client's large send fills the socket buffers and then stalls,
+    // so `send_timeout` evicts the connection with `SendTimeout`. Built on a raw socket (not `net::server`, which
+    // always drains its peer) with a payload far larger than any autotuned buffer, so the stall is reliable.
     let mut client = match Client::new(
         ClientConfig {
             send_timeout: Some(Duration::from_millis(500)),
@@ -652,8 +538,8 @@ fn tcp_send_timeout() {
         unreachable!("bound v4");
     };
     let server = thread::spawn(move || {
-        // Accept one connection and hold it open without reading a byte, long
-        // enough for the client's send_timeout to fire.
+        // Accept one connection and hold it open without reading a byte, long enough for the client's send_timeout to
+        // fire.
         if let Ok((stream, _)) = listener.accept() {
             thread::sleep(Duration::from_secs(2));
             drop(stream);
@@ -664,19 +550,14 @@ fn tcp_send_timeout() {
     let conn = client
         .connect(ServerAddr::Tcp(v4), ConnectOpts::default())
         .expect("connect to the raw server");
-    // 16 MiB dwarfs any autotuned send/recv buffer, so the send cannot drain to
-    // a peer that never reads.
+    // 16 MiB dwarfs any autotuned send/recv buffer, so the send cannot drain to a peer that never reads.
     let payload = vec![0u8; 16 * 1024 * 1024];
     client.send(conn, frame(&payload)).expect("send stages");
 
     match client.next_event().expect("next_event") {
         Some(Event::Closed { conn: c, reason }) => {
             assert_eq!(c, conn);
-            assert_eq!(
-                reason,
-                CloseReason::SendTimeout,
-                "expected SendTimeout, got {reason:?}"
-            );
+            assert_eq!(reason, CloseReason::SendTimeout, "expected SendTimeout, got {reason:?}");
         }
         other => panic!("expected Closed(SendTimeout), got {other:?}"),
     }
@@ -685,9 +566,8 @@ fn tcp_send_timeout() {
 
 // ---- zero-copy body splice ------------------------------------------------
 
-/// A client reply framer that diverts every reply body straight to the sink fd
-/// stashed in `U`: read the 4-byte BE length prefix (exact `Need`, so no body
-/// byte is over-read into the buffer), then splice `len` body bytes to the sink
+/// A client reply framer that diverts every reply body straight to the sink fd stashed in `U`: read the 4-byte BE
+/// length prefix (exact `Need`, so no body byte is over-read into the buffer), then splice `len` body bytes to the sink
 /// via `Framing::SpliceBody`. `U` is the sink fd (a pipe write end).
 fn splice_framer() -> impl FnMut(&[u8], &mut RawFd) -> Framing {
     |buf: &[u8], sink: &mut RawFd| {
@@ -705,39 +585,30 @@ fn splice_framer() -> impl FnMut(&[u8], &mut RawFd) -> Framing {
 
 #[test]
 fn tcp_splice_body() {
-    // A large reply body splices straight from the socket to a blocking pipe
-    // write end (stashed in `U`) - zero-copy, never buffered - surfacing as
-    // `Event::Splice{body_len}`; a reader thread drains exactly that many bytes
-    // off the pipe read end and checks them intact.
+    // A large reply body splices straight from the socket to a blocking pipe write end (stashed in `U`) - zero-copy,
+    // never buffered - surfacing as `Event::Splice{body_len}`; a reader thread drains exactly that many bytes off the
+    // pipe read end and checks them intact.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
 
-    // Several times a pipe's 64 KiB capacity, so the splice completes in
-    // multiple partial steps as the reader drains (end-to-end backpressure).
+    // Several times a pipe's 64 KiB capacity, so the splice completes in multiple partial steps as the reader drains
+    // (end-to-end backpressure).
     const BODY: usize = 256 * 1024;
     let payload: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
     let expected = payload.clone();
 
-    // Reader thread: drain the pipe until BODY bytes arrive or the write
-    // end closes. The EOF arm is what an io_uring *skip* looks like from
-    // here: `with_server` returns without ever running the client body, so
-    // nothing is spliced, and a reader that only ever stops at BODY blocks
-    // for the life of the run - a hang with no test named. The main thread
-    // closes the write end before joining, which is the EOF.
+    // Reader thread: drain the pipe until BODY bytes arrive or the write end closes. The EOF arm is what an io_uring
+    // *skip* looks like from here: `with_server` returns without ever running the client body, so nothing is spliced,
+    // and a reader that only ever stops at BODY blocks for the life of the run - a hang with no test named. The main
+    // thread closes the write end before joining, which is the EOF.
     let reader = thread::spawn(move || {
         let mut got = vec![0u8; BODY];
         let mut off = 0;
         while off < BODY {
             // SAFETY: read into `got[off..]`, within bounds.
-            let n = unsafe {
-                libc::read(
-                    pipe_rd,
-                    got.as_mut_ptr().add(off).cast(),
-                    (BODY - off) as libc::size_t,
-                )
-            };
+            let n = unsafe { libc::read(pipe_rd, got.as_mut_ptr().add(off).cast(), (BODY - off) as libc::size_t) };
             if n == 0 {
                 break; // write end closed: nothing more is coming
             }
@@ -749,23 +620,16 @@ fn tcp_splice_body() {
         (off, got)
     });
 
-    // Set as the client body's first act, so the assertions below can tell
-    // "io_uring is unavailable, `with_server` never ran the body" from "the
-    // body ran and moved nothing". `off > 0` cannot tell them apart: a splice
-    // aimed at the wrong sink completes, reports `Event::Splice` with the
-    // DECLARED body_len, and leaves this pipe empty.
+    // Set as the client body's first act, so the assertions below can tell "io_uring is unavailable, `with_server`
+    // never ran the body" from "the body ran and moved nothing". `off > 0` cannot tell them apart: a splice aimed at
+    // the wrong sink completes, reports `Event::Splice` with the DECLARED body_len, and leaves this pipe empty.
     let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ran_in = Arc::clone(&ran);
     with_server(echo, move |v4| {
         ran_in.store(true, std::sync::atomic::Ordering::SeqCst);
-        let mut client = Client::new(ClientConfig::default(), splice_framer())
-            .map_err(to_io)?;
+        let mut client = Client::new(ClientConfig::default(), splice_framer()).map_err(to_io)?;
         // The sink fd rides in `U`; the framer reads it from there.
-        let conn = client.connect_with_state(
-            ServerAddr::Tcp(v4),
-            ConnectOpts::default(),
-            pipe_wr,
-        )?;
+        let conn = client.connect_with_state(ServerAddr::Tcp(v4), ConnectOpts::default(), pipe_wr)?;
         // Send a request whose echoed reply body is spliced to the pipe.
         let id = client.send(conn, frame(&payload))?;
         // Drive the ring to completion; the reader drains the pipe concurrently.
@@ -782,9 +646,7 @@ fn tcp_splice_body() {
                 assert_eq!(body_len, BODY, "spliced body length");
             }
             other => {
-                return Err(io::Error::other(format!(
-                    "expected Splice, got {other:?}"
-                )));
+                return Err(io::Error::other(format!("expected Splice, got {other:?}")));
             }
         }
         client.close_now(conn);
@@ -794,9 +656,8 @@ fn tcp_splice_body() {
     // SAFETY: closing the test-owned write end (the client only borrowed it).
     unsafe { libc::close(pipe_wr) };
     let (off, got) = reader.join().expect("reader join");
-    // On an io_uring skip the client body never ran and nothing was
-    // spliced; on a real run the transfer is the whole point, so assert it
-    // unconditionally.
+    // On an io_uring skip the client body never ran and nothing was spliced; on a real run the transfer is the whole
+    // point, so assert it unconditionally.
     if ran.load(std::sync::atomic::Ordering::SeqCst) {
         assert_eq!(off, BODY, "splice moved {off} of {BODY} body bytes");
         assert_eq!(got, expected, "spliced body mismatch");
@@ -805,9 +666,8 @@ fn tcp_splice_body() {
 
 #[test]
 fn tcp_splice_bad_fd() {
-    // A NON-blocking sink fd is a consumer bug: the framer's `SpliceBody` is
-    // rejected before the socket is read (else a full non-blocking pipe would
-    // spin the readiness poll), closing the connection with `SpliceBadFd`.
+    // A NON-blocking sink fd is a consumer bug: the framer's `SpliceBody` is rejected before the socket is read (else a
+    // full non-blocking pipe would spin the readiness poll), closing the connection with `SpliceBadFd`.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -819,27 +679,16 @@ fn tcp_splice_bad_fd() {
     }
 
     with_server(echo, move |v4| {
-        let mut client = Client::new(ClientConfig::default(), splice_framer())
-            .map_err(to_io)?;
-        let conn = client.connect_with_state(
-            ServerAddr::Tcp(v4),
-            ConnectOpts::default(),
-            pipe_wr,
-        )?;
+        let mut client = Client::new(ClientConfig::default(), splice_framer()).map_err(to_io)?;
+        let conn = client.connect_with_state(ServerAddr::Tcp(v4), ConnectOpts::default(), pipe_wr)?;
         client.send(conn, frame(b"trigger"))?;
         match client.next_event()? {
             Some(Event::Closed { conn: c, reason }) => {
                 assert_eq!(c, conn);
-                assert_eq!(
-                    reason,
-                    CloseReason::SpliceBadFd,
-                    "expected SpliceBadFd, got {reason:?}"
-                );
+                assert_eq!(reason, CloseReason::SpliceBadFd, "expected SpliceBadFd, got {reason:?}");
             }
             other => {
-                return Err(io::Error::other(format!(
-                    "expected Closed(SpliceBadFd), got {other:?}"
-                )));
+                return Err(io::Error::other(format!("expected Closed(SpliceBadFd), got {other:?}")));
             }
         }
         Ok(())
@@ -853,14 +702,11 @@ fn tcp_splice_bad_fd() {
 
 // ---- kernel TLS (kTLS) connect --------------------------------------------
 //
-// A real end-to-end TLS handshake around the client's kernel-TLS transport:
-// the server worker drives `truenas_ktls` (the packaged accept side), the
-// client runs `SSL_connect` in its own worker - exactly the split a real
-// consumer implements. The library brings no TLS crate; the client side uses
-// OpenSSL as a dev-dependency, raw, because the crate has no connect role.
-// Skips when the kernel lacks the `tls` ULP (or `FIXED_FD_INSTALL`), or when
-// libssl cannot engage kTLS at all ([`ktls_engages`] - Ubuntu ships OpenSSL
-// 3.0 without `enable-ktls`); force on a known-good host with
+// A real end-to-end TLS handshake around the client's kernel-TLS transport: the server worker drives `truenas_ktls`
+// (the packaged accept side), the client runs `SSL_connect` in its own worker - exactly the split a real consumer
+// implements. The library brings no TLS crate; the client side uses OpenSSL as a dev-dependency, raw, because the crate
+// has no connect role. Skips when the kernel lacks the `tls` ULP (or `FIXED_FD_INSTALL`), or when libssl cannot engage
+// kTLS at all ([`ktls_engages`] - Ubuntu ships OpenSSL 3.0 without `enable-ktls`); force on a known-good host with
 // `TRUENAS_ROS_REQUIRE_KTLS`.
 
 use foreign_types::ForeignType; // Ssl::as_ptr for the raw BIO/SSL_connect path
@@ -873,12 +719,10 @@ const SOL_TLS: libc::c_int = 282;
 const TLS_TX: libc::c_int = 1;
 const TLS_RX: libc::c_int = 2;
 
-/// True when the `kTLS ... TLS ULP` server-bind validation fires - the kernel
-/// lacks `CONFIG_TLS`. Force the test on known-good hosts with
-/// `TRUENAS_ROS_REQUIRE_KTLS`.
+/// True when the `kTLS ... TLS ULP` server-bind validation fires - the kernel lacks `CONFIG_TLS`. Force the test on
+/// known-good hosts with `TRUENAS_ROS_REQUIRE_KTLS`.
 fn ktls_unsupported(e: &Error) -> bool {
-    let unsupported =
-        matches!(e, Error::Validation(m) if m.contains("kernel TLS ULP"));
+    let unsupported = matches!(e, Error::Validation(m) if m.contains("kernel TLS ULP"));
     if unsupported {
         assert!(
             std::env::var_os("TRUENAS_ROS_REQUIRE_KTLS").is_none(),
@@ -888,9 +732,8 @@ fn ktls_unsupported(e: &Error) -> bool {
     unsupported
 }
 
-/// True when a `tls` connect fails because this kernel can't furnish the fd
-/// (`FIXED_FD_INSTALL`) or run kTLS (the ULP) - the client-side skip for the
-/// raw-listener kTLS tests (the echo test skips at the server's bind instead).
+/// True when a `tls` connect fails because this kernel can't furnish the fd (`FIXED_FD_INSTALL`) or run kTLS (the
+/// ULP) - the client-side skip for the raw-listener kTLS tests (the echo test skips at the server's bind instead).
 fn ktls_connect_unsupported(e: &io::Error) -> bool {
     let unsupported = e.kind() == io::ErrorKind::Unsupported;
     if unsupported {
@@ -918,15 +761,10 @@ fn self_signed() -> (Vec<u8>, Vec<u8>) {
     b.set_subject_name(&name).unwrap();
     b.set_issuer_name(&name).unwrap();
     b.set_pubkey(&key).unwrap();
-    b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
-        .unwrap();
-    b.set_not_after(&Asn1Time::days_from_now(1).unwrap())
-        .unwrap();
+    b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+    b.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
     b.sign(&key, MessageDigest::sha256()).unwrap();
-    (
-        b.build().to_pem().unwrap(),
-        key.private_key_to_pem_pkcs8().unwrap(),
-    )
+    (b.build().to_pem().unwrap(), key.private_key_to_pem_pkcs8().unwrap())
 }
 
 /// Build a [`truenas_ktls::Acceptor`] over a throwaway cert. The acceptor is
@@ -941,17 +779,12 @@ fn ktls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Acceptor {
     Acceptor::from_pem_files(&cert, &key).unwrap()
 }
 
-/// The server's handshake worker: run the blocking server TLS handshake on
-/// the furnished fd through `truenas_ktls` - which installs kernel TLS on the
-/// socket and refuses the connection unless the readback shows it engaged
-/// both directions - then close the furnished fd (the pool descriptor keeps
-/// the kTLS socket).
-fn ktls_server_handshake(
-    fd: RawFd,
-    acceptor: &Acceptor,
-) -> Result<(), KtlsProbe> {
-    // This worker owns the furnished fd: EVERY return path must close it (the
-    // set_tls_handshake contract), or each failed handshake leaks a process fd.
+/// The server's handshake worker: run the blocking server TLS handshake on the furnished fd through `truenas_ktls` -
+/// which installs kernel TLS on the socket and refuses the connection unless the readback shows it engaged both
+/// directions - then close the furnished fd (the pool descriptor keeps the kTLS socket).
+fn ktls_server_handshake(fd: RawFd, acceptor: &Acceptor) -> Result<(), KtlsProbe> {
+    // This worker owns the furnished fd: EVERY return path must close it (the set_tls_handshake contract), or each
+    // failed handshake leaks a process fd.
     struct FdCloser(RawFd);
     impl Drop for FdCloser {
         fn drop(&mut self) {
@@ -960,38 +793,28 @@ fn ktls_server_handshake(
         }
     }
     let _fd_owner = FdCloser(fd);
-    // The handshake wants a blocking socket; io_uring recv/send ignore
-    // O_NONBLOCK.
+    // The handshake wants a blocking socket; io_uring recv/send ignore O_NONBLOCK.
     // SAFETY: fcntl on a live fd.
     unsafe {
         let fl = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
     }
-    // SAFETY: `fd` stays open for the borrow - `_fd_owner` closes it only on
-    // return.
+    // SAFETY: `fd` stays open for the borrow - `_fd_owner` closes it only on return.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    acceptor
-        .accept(borrowed)
-        .map(|_| ())
-        .map_err(KtlsProbe::from)
+    acceptor.accept(borrowed).map(|_| ()).map_err(KtlsProbe::from)
 }
 
-/// Why a probe handshake did not engage kTLS, which is two answers and not
-/// one.
+/// Why a probe handshake did not engage kTLS, which is two answers and not one.
 ///
-/// [`KtlsProbe::NotEngaged`] is this **host's** verdict - libssl built
-/// without `enable-ktls`, OpenSSL's TLS 1.3 RX gap, no `tls` module - and
-/// the data-path tests skip on it. [`KtlsProbe::Broken`] is the probe's own
-/// failure, descriptor exhaustion above all, which CI and the nightly VM
-/// reach at a soft `NOFILE` of 1024. Folded into one channel the decision
-/// site cannot tell them apart even in principle: unarmed it skips silently
-/// on a suite that tested nothing, and armed it asserts "OpenSSL cannot
-/// engage kTLS: dup", sending a maintainer to the wrong subsystem.
+/// [`KtlsProbe::NotEngaged`] is this **host's** verdict - libssl built without `enable-ktls`, OpenSSL's TLS 1.3 RX gap,
+/// no `tls` module - and the data-path tests skip on it. [`KtlsProbe::Broken`] is the probe's own failure, descriptor
+/// exhaustion above all, which CI and the nightly VM reach at a soft `NOFILE` of 1024. Folded into one channel the
+/// decision site cannot tell them apart even in principle: unarmed it skips silently on a suite that tested nothing,
+/// and armed it asserts "OpenSSL cannot engage kTLS: dup", sending a maintainer to the wrong subsystem.
 ///
-/// `test/support/ktls.rs` gets this split from
-/// `truenas_ktls::Error::NotEngaged` for free. The client half here has no
-/// such type - `SSL_connect` and the `SOL_TLS` readback are two different
-/// questions asked of one `unsafe` block - so it is spelled out.
+/// `test/support/ktls.rs` gets this split from `truenas_ktls::Error::NotEngaged` for free. The client half here has no
+/// such type - `SSL_connect` and the `SOL_TLS` readback are two different questions asked of one `unsafe` block - so it
+/// is spelled out.
 #[derive(Debug)]
 enum KtlsProbe {
     /// This host cannot engage kTLS.
@@ -1003,9 +826,7 @@ enum KtlsProbe {
 impl From<truenas_ktls::Error> for KtlsProbe {
     fn from(e: truenas_ktls::Error) -> KtlsProbe {
         match e {
-            truenas_ktls::Error::NotEngaged { .. } => {
-                KtlsProbe::NotEngaged(e.to_string())
-            }
+            truenas_ktls::Error::NotEngaged { .. } => KtlsProbe::NotEngaged(e.to_string()),
             other => KtlsProbe::Broken(other.to_string()),
         }
     }
@@ -1019,8 +840,7 @@ impl std::fmt::Display for KtlsProbe {
     }
 }
 
-/// A kTLS-enabled OpenSSL client context: `SSL_OP_ENABLE_KTLS` + no cert
-/// verification (the server cert is self-signed).
+/// A kTLS-enabled OpenSSL client context: `SSL_OP_ENABLE_KTLS` + no cert verification (the server cert is self-signed).
 fn ktls_client_ctx() -> SslContext {
     let mut b = SslContext::builder(SslMethod::tls()).unwrap();
     b.set_verify(SslVerifyMode::NONE);
@@ -1028,11 +848,10 @@ fn ktls_client_ctx() -> SslContext {
     b.build()
 }
 
-/// The client's handshake worker: run the blocking client TLS handshake
-/// (`SSL_connect`) on the furnished fd over a socket BIO (so OpenSSL installs
-/// kTLS on the socket), confirm kTLS engaged both directions, then close the
-/// furnished fd. The mirror of `ktls_server_handshake`, `SSL_connect` for
-/// `SSL_accept` - exactly what a `Client::set_tls_handshake` worker does.
+/// The client's handshake worker: run the blocking client TLS handshake (`SSL_connect`) on the furnished fd over a
+/// socket BIO (so OpenSSL installs kTLS on the socket), confirm kTLS engaged both directions, then close the furnished
+/// fd. The mirror of `ktls_server_handshake`, `SSL_connect` for `SSL_accept` - exactly what a
+/// `Client::set_tls_handshake` worker does.
 fn ktls_client_handshake(fd: RawFd, ctx: &SslContext) -> Result<(), KtlsProbe> {
     struct FdCloser(RawFd);
     impl Drop for FdCloser {
@@ -1048,11 +867,9 @@ fn ktls_client_handshake(fd: RawFd, ctx: &SslContext) -> Result<(), KtlsProbe> {
         let fl = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
     }
-    let mut ssl =
-        Ssl::new(ctx).map_err(|e| KtlsProbe::Broken(e.to_string()))?;
+    let mut ssl = Ssl::new(ctx).map_err(|e| KtlsProbe::Broken(e.to_string()))?;
     ssl.set_connect_state();
-    // SAFETY: a BIO_NOCLOSE socket BIO over `fd`; SSL owns the BIO (freed on
-    // drop), and `fd` outlives `ssl` here.
+    // SAFETY: a BIO_NOCLOSE socket BIO over `fd`; SSL owns the BIO (freed on drop), and `fd` outlives `ssl` here.
     let rc = unsafe {
         let bio = openssl_sys::BIO_new_socket(fd, BIO_NOCLOSE);
         if bio.is_null() {
@@ -1062,9 +879,8 @@ fn ktls_client_handshake(fd: RawFd, ctx: &SslContext) -> Result<(), KtlsProbe> {
         openssl_sys::SSL_connect(ssl.as_ptr())
     };
     if rc != 1 {
-        // The handshake completes even where engagement cannot - the
-        // fallback is userspace records - so a failure here is the probe's,
-        // not this host's kTLS answer.
+        // The handshake completes even where engagement cannot - the fallback is userspace records - so a failure here
+        // is the probe's, not this host's kTLS answer.
         return Err(KtlsProbe::Broken(format!("SSL_connect returned {rc}")));
     }
     confirm_ktls(fd).map_err(KtlsProbe::NotEngaged)?;
@@ -1072,22 +888,14 @@ fn ktls_client_handshake(fd: RawFd, ctx: &SslContext) -> Result<(), KtlsProbe> {
     Ok(()) // _fd_owner closes the furnished fd
 }
 
-/// Confirm kTLS engaged on `fd` for both directions (the `SOL_TLS` TX/RX
-/// getsockopts succeed only once the ULP is installed each way).
+/// Confirm kTLS engaged on `fd` for both directions (the `SOL_TLS` TX/RX getsockopts succeed only once the ULP is
+/// installed each way).
 fn confirm_ktls(fd: RawFd) -> Result<(), String> {
     for (dir, label) in [(TLS_TX, "TX"), (TLS_RX, "RX")] {
         let mut buf = [0u8; 4];
         let mut len = buf.len() as libc::socklen_t;
         // SAFETY: getsockopt writes up to `len` bytes into `buf`.
-        let r = unsafe {
-            libc::getsockopt(
-                fd,
-                SOL_TLS,
-                dir,
-                buf.as_mut_ptr().cast(),
-                &mut len,
-            )
-        };
+        let r = unsafe { libc::getsockopt(fd, SOL_TLS, dir, buf.as_mut_ptr().cast(), &mut len) };
         if r != 0 {
             return Err(format!("kTLS not engaged for {label}"));
         }
@@ -1095,22 +903,18 @@ fn confirm_ktls(fd: RawFd) -> Result<(), String> {
     Ok(())
 }
 
-/// kTLS installation is best-effort in libssl: a build without `enable-ktls`
-/// (Debian/Ubuntu only enable it from 3.2), a TLS 1.3 RX gap (OpenSSL < 3.2),
-/// or a kernel missing the `tls` module all fall back to userspace records.
-/// The handshake then completes but the acceptor's readback (server side) and
-/// `confirm_ktls` (client side) refuse, every worker rejects, and the
-/// data-path tests would fail rather than skip. Probe once with a loopback
-/// handshake - the same acceptor, client context, and confirmation the tests
+/// kTLS installation is best-effort in libssl: a build without `enable-ktls` (Debian/Ubuntu only enable it from 3.2), a
+/// TLS 1.3 RX gap (OpenSSL < 3.2), or a kernel missing the `tls` module all fall back to userspace records. The
+/// handshake then completes but the acceptor's readback (server side) and `confirm_ktls` (client side) refuse, every
+/// worker rejects, and the data-path tests would fail rather than skip. Probe once with a loopback handshake - the same
+/// acceptor, client context, and confirmation the tests
 /// use - so those tests can skip when this host's OpenSSL cannot engage kTLS.
 fn ktls_engages() -> &'static Result<(), KtlsProbe> {
-    static PROBE: std::sync::OnceLock<Result<(), KtlsProbe>> =
-        std::sync::OnceLock::new();
+    static PROBE: std::sync::OnceLock<Result<(), KtlsProbe>> = std::sync::OnceLock::new();
     PROBE.get_or_init(|| {
-        // The probe's own scaffolding panics at source rather than
-        // returning: a loopback socket it cannot get is not a kTLS verdict,
-        // and `KtlsProbe` exists so nothing downstream has to guess which
-        // it was reading (`test/support/ktls.rs` panics here too).
+        // The probe's own scaffolding panics at source rather than returning: a loopback socket it cannot get is not a
+        // kTLS verdict, and `KtlsProbe` exists so nothing downstream has to guess which it was reading
+        // (`test/support/ktls.rs` panics here too).
         let (cert, key) = self_signed();
         let acceptor = ktls_acceptor(&cert, &key);
         let listener = TcpListener::bind("127.0.0.1:0").expect("probe bind");
@@ -1140,9 +944,8 @@ fn ktls_engages() -> &'static Result<(), KtlsProbe> {
     })
 }
 
-/// The OpenSSL-side skip for the kTLS data-path tests: `false` when this host
-/// engages kTLS end to end, `true` (with a visible note) when it cannot - or
-/// a hard failure when `TRUENAS_ROS_REQUIRE_KTLS` says skipping is forbidden.
+/// The OpenSSL-side skip for the kTLS data-path tests: `false` when this host engages kTLS end to end, `true` (with a
+/// visible note) when it cannot - or a hard failure when `TRUENAS_ROS_REQUIRE_KTLS` says skipping is forbidden.
 fn ktls_openssl_unsupported() -> bool {
     match ktls_engages() {
         Ok(()) => false,
@@ -1158,19 +961,16 @@ fn ktls_openssl_unsupported() -> bool {
             );
             true
         }
-        // Not a verdict about this host's kTLS, so neither skipping nor
-        // blaming OpenSSL for it is honest.
+        // Not a verdict about this host's kTLS, so neither skipping nor blaming OpenSSL for it is honest.
         Err(KtlsProbe::Broken(e)) => {
             panic!("kTLS probe failed before it could measure engagement: {e}")
         }
     }
 }
 
-/// Bind a kTLS `net::server` echo server whose handshake worker drives
-/// `truenas_ktls`, run `client` on a spawned thread against its resolved address,
-/// and propagate the client's result. The kTLS mirror of [`with_server`]; skips
-/// cleanly when io_uring, the kernel TLS ULP, or OpenSSL-side kTLS is
-/// unavailable.
+/// Bind a kTLS `net::server` echo server whose handshake worker drives `truenas_ktls`, run `client` on a spawned thread
+/// against its resolved address, and propagate the client's result. The kTLS mirror of [`with_server`]; skips cleanly
+/// when io_uring, the kernel TLS ULP, or OpenSSL-side kTLS is unavailable.
 fn with_ktls_server<ClientBody>(client: ClientBody)
 where
     ClientBody: FnOnce(SocketAddrV4) -> io::Result<()> + Send + 'static,
@@ -1210,24 +1010,19 @@ where
         r
     });
     server.serve_forever().expect("serve_forever");
-    handle
-        .join()
-        .expect("client thread join")
-        .expect("client body");
+    handle.join().expect("client thread join").expect("client body");
 }
 
-/// Build a `Client` with a `set_tls_handshake` worker that runs `SSL_connect`
-/// (the mirror of the server's `SSL_accept` worker), over the given framer.
+/// Build a `Client` with a `set_tls_handshake` worker that runs `SSL_connect` (the mirror of the server's `SSL_accept`
+/// worker), over the given framer.
 fn ktls_client<U, F>(framer: F) -> io::Result<Client<U, F>>
 where
     F: FnMut(&[u8], &mut U) -> Framing,
 {
     let ctx = Arc::new(ktls_client_ctx());
-    // A kTLS body splice is refused without a response clock
-    // (`CloseReason::SpliceUnbounded`): it blocks an io-wq worker awaiting
-    // the next TLS record, where no linked timeout reaches it, so the
-    // standalone watchdog this maps to is its only bound. Generous - none of
-    // these tests stall.
+    // A kTLS body splice is refused without a response clock (`CloseReason::SpliceUnbounded`): it blocks an io-wq
+    // worker awaiting the next TLS record, where no linked timeout reaches it, so the standalone watchdog this maps to
+    // is its only bound. Generous - none of these tests stall.
     let cfg = ClientConfig {
         response_timeout: Some(Duration::from_secs(10)),
         ..ClientConfig::default()
@@ -1245,15 +1040,13 @@ where
 
 #[test]
 fn ktls_echo_roundtrip() {
-    // End-to-end: a kTLS listener, both sides' OpenSSL handshake workers
-    // (`SSL_accept` server-side, `SSL_connect` in the client's worker), and a
-    // framed echo round-trip over the kernel-TLS transport (each side sees
-    // plaintext; the kernel encrypts/decrypts).
+    // End-to-end: a kTLS listener, both sides' OpenSSL handshake workers (`SSL_accept` server-side, `SSL_connect` in
+    // the client's worker), and a framed echo round-trip over the kernel-TLS transport (each side sees plaintext; the
+    // kernel encrypts/decrypts).
     with_ktls_server(|v4| {
         let mut client = ktls_client(client_framer())?;
         // A blocking connect resolves only once the kTLS handshake completes.
-        let conn = client
-            .connect(ServerAddr::Tcp(v4), ConnectOpts::default().tls())?;
+        let conn = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default().tls())?;
         for msg in [b"tls-hello".as_slice(), b"second", b"third-and-final"] {
             let body = client.request(conn, frame(msg))?;
             assert_eq!(&body[..], msg, "kTLS echo mismatch");
@@ -1269,11 +1062,9 @@ fn ktls_echo_roundtrip() {
 
 #[test]
 fn ktls_rejected_handshake() {
-    // The client's handshake worker calls `reject()` -> `Event::ConnectFailed`.
-    // A raw TCP peer suffices (the reject is client-local): the TCP connect
-    // completes, the fd is furnished, and the worker rejects.
-    let mut client = match Client::new(ClientConfig::default(), client_framer())
-    {
+    // The client's handshake worker calls `reject()` -> `Event::ConnectFailed`. A raw TCP peer suffices (the reject is
+    // client-local): the TCP connect completes, the fd is furnished, and the worker rejects.
+    let mut client = match Client::new(ClientConfig::default(), client_framer()) {
         Ok(c) => c,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("client new: {e}"),
@@ -1298,9 +1089,7 @@ fn ktls_rejected_handshake() {
         drop(listener);
     });
 
-    let conn = match client
-        .connect_start(ServerAddr::Tcp(v4), ConnectOpts::default().tls())
-    {
+    let conn = match client.connect_start(ServerAddr::Tcp(v4), ConnectOpts::default().tls()) {
         Ok(c) => c,
         Err(e) if ktls_connect_unsupported(&e) => {
             // Unblock the helper's accept() so the join below returns.
@@ -1313,11 +1102,7 @@ fn ktls_rejected_handshake() {
     match client.next_event().expect("next_event") {
         Some(Event::ConnectFailed { conn: c, err }) => {
             assert_eq!(c, conn, "ConnectFailed for the wrong connection");
-            assert_eq!(
-                err,
-                Errno::ECONNABORTED,
-                "a rejected handshake fails with ECONNABORTED"
-            );
+            assert_eq!(err, Errno::ECONNABORTED, "a rejected handshake fails with ECONNABORTED");
         }
         other => panic!("expected ConnectFailed, got {other:?}"),
     }
@@ -1325,24 +1110,20 @@ fn ktls_rejected_handshake() {
     server.join().ok();
 }
 
-/// The client-side twin of the server's key readback: a worker's
-/// `ready()` on a socket the kernel never keyed fails the connect rather
-/// than installing a "kTLS" connection the kernel is passing through in
-/// the clear. A raw TCP peer suffices: the TCP connect completes, the fd
-/// is furnished, and the worker claims success without a handshake.
+/// The client-side twin of the server's key readback: a worker's `ready()` on a socket the kernel never keyed fails the
+/// connect rather than installing a "kTLS" connection the kernel is passing through in the clear. A raw TCP peer
+/// suffices: the TCP connect completes, the fd is furnished, and the worker claims success without a handshake.
 #[test]
 fn ktls_ready_without_kernel_keys_fails_the_connect() {
-    let mut client = match Client::new(ClientConfig::default(), client_framer())
-    {
+    let mut client = match Client::new(ClientConfig::default(), client_framer()) {
         Ok(c) => c,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("client new: {e}"),
     };
     client.set_tls_handshake(|fd, _c, deferral| {
         thread::spawn(move || {
-            // SAFETY: close the furnished fd we won't use; the readback
-            // rides the deferral's own dup, not a number that may be
-            // reused.
+            // SAFETY: close the furnished fd we won't use; the readback rides the deferral's own dup, not a number that
+            // may be reused.
             unsafe { libc::close(fd) };
             deferral.ready();
         });
@@ -1360,9 +1141,7 @@ fn ktls_ready_without_kernel_keys_fails_the_connect() {
         drop(listener);
     });
 
-    let conn = match client
-        .connect_start(ServerAddr::Tcp(v4), ConnectOpts::default().tls())
-    {
+    let conn = match client.connect_start(ServerAddr::Tcp(v4), ConnectOpts::default().tls()) {
         Ok(c) => c,
         Err(e) if ktls_connect_unsupported(&e) => {
             // Unblock the helper's accept() so the join below returns.
@@ -1375,15 +1154,9 @@ fn ktls_ready_without_kernel_keys_fails_the_connect() {
     match client.next_event().expect("next_event") {
         Some(Event::ConnectFailed { conn: c, err }) => {
             assert_eq!(c, conn, "ConnectFailed for the wrong connection");
-            assert_eq!(
-                err,
-                Errno::ECONNABORTED,
-                "an unkeyed ready() fails the connect"
-            );
+            assert_eq!(err, Errno::ECONNABORTED, "an unkeyed ready() fails the connect");
         }
-        other => panic!(
-            "a ready() with no kernel keys installed a connection: {other:?}"
-        ),
+        other => panic!("a ready() with no kernel keys installed a connection: {other:?}"),
     }
     assert!(!client.is_open(conn), "an unkeyed connect is not open");
     server.join().ok();
@@ -1391,9 +1164,8 @@ fn ktls_ready_without_kernel_keys_fails_the_connect() {
 
 #[test]
 fn ktls_handshake_timeout() {
-    // The worker never calls back (it holds the deferral): the client's
-    // `tls_handshake_timeout` fires -> `ConnectFailed{ETIMEDOUT}`, and the parked
-    // slot is reclaimed (a later `next_event` finds no work left).
+    // The worker never calls back (it holds the deferral): the client's `tls_handshake_timeout` fires ->
+    // `ConnectFailed{ETIMEDOUT}`, and the parked slot is reclaimed (a later `next_event` finds no work left).
     let cfg = ClientConfig {
         tls_handshake_timeout: Some(Duration::from_millis(250)),
         ..ClientConfig::default()
@@ -1424,9 +1196,7 @@ fn ktls_handshake_timeout() {
         drop(listener);
     });
 
-    let conn = match client
-        .connect_start(ServerAddr::Tcp(v4), ConnectOpts::default().tls())
-    {
+    let conn = match client.connect_start(ServerAddr::Tcp(v4), ConnectOpts::default().tls()) {
         Ok(c) => c,
         Err(e) if ktls_connect_unsupported(&e) => {
             // Unblock the helper's accept() so the join below returns.
@@ -1440,11 +1210,7 @@ fn ktls_handshake_timeout() {
     match client.next_event().expect("next_event") {
         Some(Event::ConnectFailed { conn: c, err }) => {
             assert_eq!(c, conn);
-            assert_eq!(
-                err,
-                Errno::ETIMEDOUT,
-                "a stalled handshake times out with ETIMEDOUT"
-            );
+            assert_eq!(err, Errno::ETIMEDOUT, "a stalled handshake times out with ETIMEDOUT");
         }
         other => panic!("expected ConnectFailed(ETIMEDOUT), got {other:?}"),
     }
@@ -1454,8 +1220,8 @@ fn ktls_handshake_timeout() {
         t0.elapsed()
     );
     assert!(!client.is_open(conn), "the parked slot was reclaimed");
-    // With the parked handshake shed and no connections, the next event is
-    // `None` - the leftover armed wake never wedges it.
+    // With the parked handshake shed and no connections, the next event is `None` - the leftover armed wake never
+    // wedges it.
     assert!(
         client.next_event().expect("drain").is_none(),
         "no work left after the timeout shed"
@@ -1466,9 +1232,8 @@ fn ktls_handshake_timeout() {
 
 #[test]
 fn ktls_splice_body() {
-    // A reply body splices zero-copy off a kTLS socket, in the clear: the kernel
-    // routes the splice through `tls_sw_splice_read`, which decrypts. Same shape
-    // as `tcp_splice_body`, but over the kernel-TLS transport.
+    // A reply body splices zero-copy off a kTLS socket, in the clear: the kernel routes the splice through
+    // `tls_sw_splice_read`, which decrypts. Same shape as `tcp_splice_body`, but over the kernel-TLS transport.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -1479,22 +1244,15 @@ fn ktls_splice_body() {
     let payload: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
     let expected = payload.clone();
 
-    // Drains until BODY arrives or the write end closes - the same reader as
-    // `tcp_splice_body`, and the EOF arm is how a kTLS *skip* (the client
-    // body never runs, nothing is spliced) ends instead of blocking. The
-    // main thread's close below is that EOF; nothing here waits on a clock.
+    // Drains until BODY arrives or the write end closes - the same reader as `tcp_splice_body`, and the EOF arm is how
+    // a kTLS *skip* (the client body never runs, nothing is spliced) ends instead of blocking. The main thread's close
+    // below is that EOF; nothing here waits on a clock.
     let reader = thread::spawn(move || {
         let mut got = vec![0u8; BODY];
         let mut off = 0;
         while off < BODY {
             // SAFETY: read into `got[off..]`, within bounds.
-            let n = unsafe {
-                libc::read(
-                    pipe_rd,
-                    got.as_mut_ptr().add(off).cast(),
-                    (BODY - off) as libc::size_t,
-                )
-            };
+            let n = unsafe { libc::read(pipe_rd, got.as_mut_ptr().add(off).cast(), (BODY - off) as libc::size_t) };
             if n == 0 {
                 break; // write end closed: nothing more is coming
             }
@@ -1506,18 +1264,14 @@ fn ktls_splice_body() {
         (off, got)
     });
 
-    // Skip is decided at the server bind inside `with_ktls_server`; on a skip the
-    // client body never runs, so drain the reader (it will time out) below.
+    // Skip is decided at the server bind inside `with_ktls_server`; on a skip the client body never runs, so drain the
+    // reader (it will time out) below.
     let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ran_in = Arc::clone(&ran);
     with_ktls_server(move |v4| {
         ran_in.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut client = ktls_client(splice_framer())?;
-        let conn = client.connect_with_state(
-            ServerAddr::Tcp(v4),
-            ConnectOpts::default().tls(),
-            pipe_wr,
-        )?;
+        let conn = client.connect_with_state(ServerAddr::Tcp(v4), ConnectOpts::default().tls(), pipe_wr)?;
         let id = client.send(conn, frame(&payload))?;
         match client.next_event()? {
             Some(Event::Splice {
@@ -1531,9 +1285,7 @@ fn ktls_splice_body() {
                 assert_eq!(body_len, BODY, "kTLS spliced body length");
             }
             other => {
-                return Err(io::Error::other(format!(
-                    "expected Splice over kTLS, got {other:?}"
-                )));
+                return Err(io::Error::other(format!("expected Splice over kTLS, got {other:?}")));
             }
         }
         client.close_now(conn);
@@ -1544,20 +1296,18 @@ fn ktls_splice_body() {
     // SAFETY: closing the test-owned write end (read end closed by the reader).
     unsafe { libc::close(pipe_wr) };
     let (off, got) = reader.join().expect("reader join");
-    // On a kTLS skip the client body never ran, so nothing was spliced; on a
-    // real run the transfer is the whole point, so assert it unconditionally.
-    // (`off > 0` does NOT mean the splice happened: one aimed at the wrong
-    // sink completes and reports the declared length with this pipe empty.)
+    // On a kTLS skip the client body never ran, so nothing was spliced; on a real run the transfer is the whole point,
+    // so assert it unconditionally. (`off > 0` does NOT mean the splice happened: one aimed at the wrong sink completes
+    // and reports the declared length with this pipe empty.)
     if ran.load(std::sync::atomic::Ordering::SeqCst) {
         assert_eq!(off, BODY, "kTLS splice moved {off} of {BODY} body bytes");
         assert_eq!(got, expected, "kTLS spliced body content mismatch");
     }
 }
 
-/// `unix_peercred` needs io_uring socket commands on `AF_UNIX` (Linux >=
-/// 6.18.16); on older kernels `with_config`'s startup probe fails with a
-/// validation error. Environmental, like `should_skip` - but force the test
-/// on known-good hosts with `TRUENAS_ROS_REQUIRE_PEERCRED`.
+/// `unix_peercred` needs io_uring socket commands on `AF_UNIX` (Linux >= 6.18.16); on older kernels `with_config`'s
+/// startup probe fails with a validation error. Environmental, like `should_skip` - but force the test on known-good
+/// hosts with `TRUENAS_ROS_REQUIRE_PEERCRED`.
 #[cfg(feature = "uring-fs")]
 fn peercred_unsupported(e: &Error) -> bool {
     let unsupported = matches!(e, Error::Validation(m) if m.contains("unix_peercred requires"));
@@ -1571,10 +1321,9 @@ fn peercred_unsupported(e: &Error) -> bool {
     unsupported
 }
 
-/// The first client-side AF_UNIX coverage: dial a unix `net::server` by
-/// path, run keep-alive echo round-trips, close gracefully. The dial path
-/// (the `sockaddr_un` build, `IORING_OP_CONNECT` on the fixed file) is
-/// otherwise exercised only over TCP.
+/// The first client-side AF_UNIX coverage: dial a unix `net::server` by path, run keep-alive echo round-trips, close
+/// gracefully. The dial path (the `sockaddr_un` build, `IORING_OP_CONNECT` on the fixed file) is otherwise exercised
+/// only over TCP.
 #[test]
 fn unix_echo_roundtrip() {
     let dir = truenas_ros::tempdir().unwrap();
@@ -1590,28 +1339,21 @@ fn unix_echo_roundtrip() {
     let stop = server.shutdown_handle();
     let handle = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
-        let r = echo_client(
-            ServerAddr::Unix(path),
-            &[b"alpha".as_slice(), b"beta", b"gamma"],
-        );
+        let r = echo_client(ServerAddr::Unix(path), &[b"alpha".as_slice(), b"beta", b"gamma"]);
         stop.shutdown();
         r
     });
     server.serve_forever().expect("serve_forever");
     let got = handle.join().expect("client thread join").expect("client");
-    let want: Vec<Vec<u8>> = [b"alpha".as_slice(), b"beta", b"gamma"]
-        .map(<[u8]>::to_vec)
-        .into();
+    let want: Vec<Vec<u8>> = [b"alpha".as_slice(), b"beta", b"gamma"].map(<[u8]>::to_vec).into();
     assert_eq!(got, want);
 }
 
-/// Unsolicited pushes arrive on a connection with nothing awaiting: after
-/// its one "sub" round-trip the subscriber connection has zero requests in
-/// flight, so every pushed frame needs a reply recv the client re-armed on
-/// its own. That is the read-gate liveness a JSON-RPC-style consumer leans
-/// on (`expect_server_push` sessions park for notifications); if the core
-/// ever starts charging client deliveries against the in-flight gate, this
-/// stops receiving and fails on the pump timeout instead of shipping.
+/// Unsolicited pushes arrive on a connection with nothing awaiting: after its one "sub" round-trip the subscriber
+/// connection has zero requests in flight, so every pushed frame needs a reply recv the client re-armed on its own.
+/// That is the read-gate liveness a JSON-RPC-style consumer leans on (`expect_server_push` sessions park for
+/// notifications); if the core ever starts charging client deliveries against the in-flight gate, this stops receiving
+/// and fails on the pump timeout instead of shipping.
 #[test]
 fn push_without_requests() {
     use std::sync::Mutex;
@@ -1619,17 +1361,11 @@ fn push_without_requests() {
     let sub_handle: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: {
             let sub_handle = Arc::clone(&sub_handle);
             move |req: Request<'_, ()>| {
-                let Request {
-                    body, responder, ..
-                } = req;
+                let Request { body, responder, .. } = req;
                 if &body[..] == b"sub" {
                     *sub_handle.lock().unwrap() = Some(responder.push_handle());
                     Response::Reply(frame(b"subscribed"))
@@ -1661,20 +1397,15 @@ fn push_without_requests() {
             ..ClientConfig::default()
         };
         let mut client = Client::new(cfg, client_framer()).map_err(to_io)?;
-        let sub =
-            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        let sub = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
         assert_eq!(client.request(sub, frame(b"sub"))?.to_vec(), b"subscribed");
 
-        // From here the subscriber has nothing in flight; the publisher
-        // triggers pushes toward it from a second connection.
-        let publisher =
-            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        // From here the subscriber has nothing in flight; the publisher triggers pushes toward it from a second
+        // connection.
+        let publisher = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
         for i in 0..PUSHES {
             let m = format!("pub:{i}");
-            assert_eq!(
-                client.request(publisher, frame(m.as_bytes()))?.to_vec(),
-                b"published"
-            );
+            assert_eq!(client.request(publisher, frame(m.as_bytes()))?.to_vec(), b"published");
         }
 
         let mut got = Vec::new();
@@ -1691,9 +1422,7 @@ fn push_without_requests() {
                     )));
                 }
                 None => {
-                    return Err(io::Error::other(
-                        "pump ran dry before every push arrived",
-                    ));
+                    return Err(io::Error::other("pump ran dry before every push arrived"));
                 }
             }
         }
@@ -1706,15 +1435,11 @@ fn push_without_requests() {
         Ok(())
     });
     server.serve_forever().expect("serve_forever");
-    handle
-        .join()
-        .expect("client thread join")
-        .expect("client body");
+    handle.join().expect("client thread join").expect("client body");
 }
 
-/// `with_ring` refuses a ring sized for a smaller configuration instead of
-/// running a submission queue that forces mid-batch flushes (which would
-/// split linked op+timeout pairs).
+/// `with_ring` refuses a ring sized for a smaller configuration instead of running a submission queue that forces
+/// mid-batch flushes (which would split linked op+timeout pairs).
 #[test]
 fn with_ring_refuses_shallow_ring() {
     let small = ClientConfig {
@@ -1736,12 +1461,10 @@ fn with_ring_refuses_shallow_ring() {
     }
 }
 
-/// End to end: a broker-minted personality stamped on the client's unix
-/// CONNECT is what the server's `SO_PEERCRED` reports - the minted euid/egid
-/// with this process's pid - while an unstamped dial on the same client
-/// reports the ambient identity. The ambient arm is the negative control
-/// that keeps the minted one honest: drop the `.personality(..)` and the two
-/// connections become indistinguishable.
+/// End to end: a broker-minted personality stamped on the client's unix CONNECT is what the server's `SO_PEERCRED`
+/// reports - the minted euid/egid with this process's pid - while an unstamped dial on the same client reports the
+/// ambient identity. The ambient arm is the negative control that keeps the minted one honest: drop the
+/// `.personality(..)` and the two connections become indistinguishable.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn unix_personality_peercred() {
@@ -1764,9 +1487,8 @@ fn unix_personality_peercred() {
     let dir = truenas_ros::tempdir().unwrap();
     let path = dir.path().join("pers.sock");
 
-    // The client ring first, on this thread: the broker inherits the fd at
-    // its fork and registers the peer identity on it before the client maps
-    // it (`Client::with_ring` below, on the client thread).
+    // The client ring first, on this thread: the broker inherits the fd at its fork and registers the peer identity on
+    // it before the client maps it (`Client::with_ring` below, on the client thread).
     let ccfg = ClientConfig {
         pool_size: 4,
         ..ClientConfig::default()
@@ -1787,8 +1509,8 @@ fn unix_personality_peercred() {
         .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
         .expect("register nobody on the client ring");
 
-    // A unix server fetching each peer's SO_PEERCRED at accept and echoing
-    // it from the body handler (the `unix_peercred_auth` shape).
+    // A unix server fetching each peer's SO_PEERCRED at accept and echoing it from the body handler (the
+    // `unix_peercred_auth` shape).
     let scfg = ServerConfig {
         unix_peercred: true,
         ..ServerConfig::default()
@@ -1798,57 +1520,37 @@ fn unix_personality_peercred() {
             ClientAddr::Unix { cred: Some(c) } => Some(*c),
             _ => None,
         },
-        header: length_prefix_header::<PeerCred>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<PeerCred>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, PeerCred>| {
             let Request { state: cred, .. } = req;
-            Response::Reply(frame(
-                format!("{}:{}:{}", cred.pid, cred.uid, cred.gid).as_bytes(),
-            ))
+            Response::Reply(frame(format!("{}:{}:{}", cred.pid, cred.uid, cred.gid).as_bytes()))
         },
     };
-    let mut server = match Server::with_config(
-        [ServerAddr::Unix(path.clone())],
-        scfg,
-        proto,
-    ) {
+    let mut server = match Server::with_config([ServerAddr::Unix(path.clone())], scfg, proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || peercred_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
     };
     let stop = server.shutdown_handle();
 
-    // The minted identity must be able to *reach* the socket: connect(2)
-    // checks MAY_WRITE on the socket inode and search on every ancestor
-    // under the personality's credentials (unix_find_bsd ->
-    // path_permission), and the tempdir is 0700 root. Open both up the way
-    // a real local-API daemon does its own socket (middlewared: 0666).
+    // The minted identity must be able to *reach* the socket: connect(2) checks MAY_WRITE on the socket inode and
+    // search on every ancestor under the personality's credentials (unix_find_bsd -> path_permission), and the tempdir
+    // is 0700 root. Open both up the way a real local-API daemon does its own socket (middlewared: 0666).
     for (p, mode) in [(dir.path(), 0o755), (path.as_path(), 0o666)] {
-        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
-            .expect("no interior NUL in a tempdir path");
-        // SAFETY: valid NUL-terminated path; chmod reads it and touches no
-        // other memory.
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).expect("no interior NUL in a tempdir path");
+        // SAFETY: valid NUL-terminated path; chmod reads it and touches no other memory.
         assert_eq!(unsafe { libc::chmod(c.as_ptr(), mode) }, 0, "chmod {p:?}");
     }
 
     let handle = thread::spawn(move || -> io::Result<()> {
         let _stop = ShutdownOnDrop(stop.clone());
-        let mut client =
-            Client::with_ring(ccfg, client_framer(), ring).map_err(to_io)?;
+        let mut client = Client::with_ring(ccfg, client_framer(), ring).map_err(to_io)?;
         // SAFETY: getpid/geteuid/getegid are trivially safe.
-        let (me, euid, egid) =
-            unsafe { (libc::getpid(), libc::geteuid(), libc::getegid()) };
+        let (me, euid, egid) = unsafe { (libc::getpid(), libc::geteuid(), libc::getegid()) };
 
-        // The minted identity on the dial: the peer sees nobody/nobody, and
-        // the pid stays this process's (io-wq workers share the tgid; the
-        // personality overrides credentials, never the task).
-        let minted = client.connect(
-            ServerAddr::Unix(path.clone()),
-            ConnectOpts::default().personality(who),
-        )?;
+        // The minted identity on the dial: the peer sees nobody/nobody, and the pid stays this process's (io-wq workers
+        // share the tgid; the personality overrides credentials, never the task).
+        let minted = client.connect(ServerAddr::Unix(path.clone()), ConnectOpts::default().personality(who))?;
         let seen = client.request(minted, frame(b"who am i"))?.to_vec();
         assert_eq!(
             String::from_utf8(seen).expect("utf8"),
@@ -1856,10 +1558,8 @@ fn unix_personality_peercred() {
             "SO_PEERCRED must report the minted identity under this pid"
         );
 
-        // The ambient control on the same client: an unstamped dial is the
-        // daemon itself.
-        let ambient =
-            client.connect(ServerAddr::Unix(path), ConnectOpts::default())?;
+        // The ambient control on the same client: an unstamped dial is the daemon itself.
+        let ambient = client.connect(ServerAddr::Unix(path), ConnectOpts::default())?;
         let seen = client.request(ambient, frame(b"who am i"))?.to_vec();
         assert_eq!(
             String::from_utf8(seen).expect("utf8"),
@@ -1873,8 +1573,5 @@ fn unix_personality_peercred() {
         Ok(())
     });
     server.serve_forever().expect("serve_forever");
-    handle
-        .join()
-        .expect("client thread join")
-        .expect("client body");
+    handle.join().expect("client thread join").expect("client body");
 }

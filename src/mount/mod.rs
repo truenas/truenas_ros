@@ -1,13 +1,11 @@
 //! Mount topology and idmapped-mount support - the `mount` umbrella.
 //!
-//! Feature `mount` (this module's root): `statmount`, `listmount`,
-//! `iter_mount`, `open_tree`, `move_mount`, `mount_setattr`,
-//! `fsopen`/`fsconfig`/`fsmount`, `umount2`. Feature `idmap` ([`idmap`]): the
-//! user-namespace builder whose fd [`MountSetattr::idmap`] consumes.
+//! Feature `mount` (this module's root): `statmount`, `listmount`, `iter_mount`, `open_tree`, `move_mount`,
+//! `mount_setattr`, `fsopen`/`fsconfig`/`fsmount`, `umount2`. Feature `idmap` ([`idmap`]): the user-namespace builder
+//! whose fd [`MountSetattr::idmap`] consumes.
 //!
-//! Targets Linux 6.18: [`Statmount`] mirrors the full 6.18 `struct statmount`
-//! (through the uid/gid maps). On older kernels the newer field groups (such as
-//! `sb_source`) are simply not populated, and callers that request them fall
+//! Targets Linux 6.18: [`Statmount`] mirrors the full 6.18 `struct statmount` (through the uid/gid maps). On older
+//! kernels the newer field groups (such as `sb_source`) are simply not populated, and callers that request them fall
 //! back gracefully.
 
 #[cfg(feature = "idmap")]
@@ -33,9 +31,7 @@ mod umount;
 mod util;
 
 #[cfg(feature = "mount")]
-pub use fsmount::{
-    FsConfig, FsConfigCmd, FsmountFlags, FsopenFlags, fsconfig, fsmount, fsopen,
-};
+pub use fsmount::{FsConfig, FsConfigCmd, FsmountFlags, FsopenFlags, fsconfig, fsmount, fsopen};
 #[cfg(feature = "mount")]
 pub use iter::{MountIter, iter_mount, open_mount_by_id};
 #[cfg(feature = "mount")]
@@ -46,8 +42,8 @@ pub use move_mount::{MoveMountFlags, move_mount};
 pub use open_tree::{OpenTreeFlags, open_tree};
 #[cfg(feature = "mount")]
 pub use setattr::{MountSetattr, mount_setattr};
-/// The reply decoder, for the fuzz crate only - `statmount` is a private
-/// module, so its `__fuzz` seam needs lifting to `mount::fuzz` to be reachable.
+/// The reply decoder, for the fuzz crate only - `statmount` is a private module, so its `__fuzz` seam needs lifting to
+/// `mount::fuzz` to be reachable.
 #[cfg(all(feature = "mount", feature = "__fuzz"))]
 pub use statmount::fuzz;
 #[cfg(feature = "mount")]
@@ -55,14 +51,11 @@ pub use statmount::{SbFlags, Statmount, StatmountMask, statmount};
 #[cfg(feature = "mount")]
 pub use umount::{MntFlags, umount2};
 #[cfg(feature = "mount")]
-pub use util::{
-    UmountOptions, is_zfs_snapshot, iter_mountinfo, statmount_path, umount,
-};
+pub use util::{UmountOptions, is_zfs_snapshot, iter_mountinfo, statmount_path, umount};
 
 #[cfg(feature = "mount")]
 tn_bitflags! {
-    /// Per-mount attribute flags (`MOUNT_ATTR_*`) reported by `statmount` and
-    /// set via [`mount_setattr`] / [`fsmount`].
+    /// Per-mount attribute flags (`MOUNT_ATTR_*`) reported by `statmount` and set via [`mount_setattr`] / [`fsmount`].
     pub struct MountAttr: u64 {
         /// Mount read-only.
         RDONLY = 0x0000_0001;
@@ -72,9 +65,8 @@ tn_bitflags! {
         NODEV = 0x0000_0004;
         /// Disallow program execution.
         NOEXEC = 0x0000_0008;
-        /// Mask of the atime attributes, which hold an [`Atime`] policy rather
-        /// than independent bits. Relatime is the zero value, so it is named
-        /// by [`Atime`] rather than by a flag here.
+        /// Mask of the atime attributes, which hold an [`Atime`] policy rather than independent bits. Relatime is the
+        /// zero value, so it is named by [`Atime`] rather than by a flag here.
         __ATIME = 0x0000_0070;
         /// Do not update access times.
         NOATIME = 0x0000_0010;
@@ -91,9 +83,8 @@ tn_bitflags! {
 
 #[cfg(feature = "mount")]
 tn_enum! {
-    /// A mount's atime update policy - the value the
-    /// [`MountAttr::__ATIME`] bits hold. Exactly one applies at a time, so
-    /// [`MountSetattr::atime`] takes this rather than a flag.
+    /// A mount's atime update policy - the value the [`MountAttr::__ATIME`] bits hold. Exactly one applies at a time,
+    /// so [`MountSetattr::atime`] takes this rather than a flag.
     pub enum Atime: u64 {
         /// Update access times relative to mtime/ctime.
         Relatime = 0x0000_0000,
@@ -138,9 +129,8 @@ pub(crate) const MNT_ID_REQ_SIZE_VER1: u32 = 32;
 const _: () = assert!(core::mem::size_of::<MntIdReq>() == 32);
 
 #[cfg(feature = "mount")]
-// libc 0.2.186 lacks these; they are on the arch-independent "common" syscall
-// line (identical on x86_64/aarch64), verified against
-// arch/*/entry/syscalls/*.tbl.
+// libc 0.2.186 lacks these; they are on the arch-independent "common" syscall line (identical on x86_64/aarch64),
+// verified against arch/*/entry/syscalls/*.tbl.
 pub(crate) const SYS_STATMOUNT: libc::c_long = 457;
 #[cfg(feature = "mount")]
 pub(crate) const SYS_LISTMOUNT: libc::c_long = 458;

@@ -1,37 +1,26 @@
 //! `configparser`-compatible basic (`%(name)s`) interpolation.
 //!
-//! A port of `BasicInterpolation` (`Lib/configparser.py:396-465`): `%%` is a
-//! literal `%`, `%(name)s` expands to another option's value (looked up in the
-//! merged DEFAULT+section map and interpolated recursively up to
-//! [`MAX_INTERPOLATION_DEPTH`](super::MAX_INTERPOLATION_DEPTH)), and any other
-//! `%` sequence is a syntax error.
+//! A port of `BasicInterpolation` (`Lib/configparser.py:396-465`): `%%` is a literal `%`, `%(name)s` expands to another
+//! option's value (looked up in the merged DEFAULT+section map and interpolated recursively up to
+//! [`MAX_INTERPOLATION_DEPTH`](super::MAX_INTERPOLATION_DEPTH)), and any other `%` sequence is a syntax error.
 
 use super::{MAX_INTERPOLATION_DEPTH, MergedView, optionxform};
 use crate::error::{Error, Result};
 
-/// Cap on the total interpolated output for one value. [`MAX_INTERPOLATION_DEPTH`]
-/// bounds nesting depth but not the branching factor: B references per level
-/// over D levels expand to B^D bytes (ten options each referencing the prior
-/// ten blow ~800 bytes up to 10^1^0), so the depth limit alone does not stop an
-/// untrusted config from exhausting memory. Bounding the accumulated output
-/// does - 1 MiB is far beyond any real interpolated value.
+/// Cap on the total interpolated output for one value. [`MAX_INTERPOLATION_DEPTH`] bounds nesting depth but not the
+/// branching factor: B references per level over D levels expand to B^D bytes (ten options each referencing the prior
+/// ten blow ~800 bytes up to 10^1^0), so the depth limit alone does not stop an untrusted config from exhausting
+/// memory. Bounding the accumulated output does - 1 MiB is far beyond any real interpolated value.
 ///
-/// CPython caps only the recursion depth, so a document `configparser`
-/// resolves can be rejected here.
+/// CPython caps only the recursion depth, so a document `configparser` resolves can be rejected here.
 const MAX_INTERPOLATION_OUTPUT: usize = 1 << 20;
 
-/// Interpolate `value` for `option`, resolving `%(name)s` against `map` (the
-/// merged section-over-DEFAULT raw values). Mirrors `before_get`.
+/// Interpolate `value` for `option`, resolving `%(name)s` against `map` (the merged section-over-DEFAULT raw values).
+/// Mirrors `before_get`.
 ///
-/// Under `scrub`, error messages withhold the value fragment and the option
-/// names they would otherwise quote: an interpolation error from a secrets
-/// configuration may reach a log, and the fragment is the secret.
-pub(super) fn before_get(
-    option: &str,
-    value: &str,
-    map: &MergedView<'_>,
-    scrub: bool,
-) -> Result<String> {
+/// Under `scrub`, error messages withhold the value fragment and the option names they would otherwise quote: an
+/// interpolation error from a secrets configuration may reach a log, and the fragment is the secret.
+pub(super) fn before_get(option: &str, value: &str, map: &MergedView<'_>, scrub: bool) -> Result<String> {
     let mut out = String::new();
     interpolate(option, value, map, 1, &mut out, scrub)?;
     Ok(out)
@@ -54,9 +43,8 @@ fn interpolate(
     }
     let mut rest = rest;
     while !rest.is_empty() {
-        // `out` is shared across the whole recursion and grows monotonically, so
-        // checking here bounds the total expansion regardless of which nested
-        // reference is currently being resolved.
+        // `out` is shared across the whole recursion and grows monotonically, so checking here bounds the total
+        // expansion regardless of which nested reference is currently being resolved.
         if out.len() > MAX_INTERPOLATION_OUTPUT {
             return Err(Error::Parse(if scrub {
                 format!(
@@ -89,9 +77,7 @@ fn interpolate(
                     Error::Parse(if scrub {
                         "bad interpolation variable reference".into()
                     } else {
-                        format!(
-                            "bad interpolation variable reference: {rest:?}"
-                        )
+                        format!("bad interpolation variable reference: {rest:?}")
                     })
                 })?;
                 let var = optionxform(name);
@@ -127,16 +113,14 @@ fn interpolate(
     Ok(())
 }
 
-/// Validate that `value` is safe to store under basic interpolation, matching
-/// `BasicInterpolation.before_set`: with escaped `%%` and every valid
-/// `%(name)s` removed, no stray `%` may remain. Under `scrub` the rejected
-/// value is withheld from the error, as in [`before_get`].
+/// Validate that `value` is safe to store under basic interpolation, matching `BasicInterpolation.before_set`: with
+/// escaped `%%` and every valid `%(name)s` removed, no stray `%` may remain. Under `scrub` the rejected value is
+/// withheld from the error, as in [`before_get`].
 ///
-/// The `%%` removal is global before the scan (a `%%` inside a reference name
-/// is stripped too), so it is done with `replace`, not scanned in place - the
-/// left-to-right equivalent disagrees with `configparser` on inputs like
-/// `%(%%)s`. `replace` copies `value`; under `scrub` that copy holds the
-/// secret, so it is burned before returning rather than freed in the clear.
+/// The `%%` removal is global before the scan (a `%%` inside a reference name is stripped too), so it is done with
+/// `replace`, not scanned in place - the left-to-right equivalent disagrees with `configparser` on inputs like
+/// `%(%%)s`. `replace` copies `value`; under `scrub` that copy holds the secret, so it is burned before returning
+/// rather than freed in the clear.
 pub(super) fn validate_set(value: &str, scrub: bool) -> Result<()> {
     let mut stripped = value.replace("%%", "");
     let outcome = {
@@ -165,9 +149,8 @@ pub(super) fn validate_set(value: &str, scrub: bool) -> Result<()> {
     outcome
 }
 
-/// Parse a `%(name)s` reference at the start of `s` (which begins with `%(`),
-/// returning `(name, end_byte_index)`, or `None` if malformed. Mirrors
-/// `_KEYCRE = %\(([^)]+)\)s`.
+/// Parse a `%(name)s` reference at the start of `s` (which begins with `%(`), returning `(name, end_byte_index)`, or
+/// `None` if malformed. Mirrors `_KEYCRE = %\(([^)]+)\)s`.
 fn key_ref(s: &str) -> Option<(&str, usize)> {
     let bytes = s.as_bytes();
     let close = s[2..].find(')')? + 2;
@@ -184,9 +167,8 @@ fn key_ref(s: &str) -> Option<(&str, usize)> {
 mod tests {
     use super::*;
 
-    // The stored value must, after escaped `%%` and every `%(name)s`, hold no
-    // stray `%`. Each `Some` accepts (returns Ok), each None-shaped input
-    // rejects; `%%` neighbouring a reference must not change the verdict.
+    // The stored value must, after escaped `%%` and every `%(name)s`, hold no stray `%`. Each `Some` accepts (returns
+    // Ok), each None-shaped input rejects; `%%` neighbouring a reference must not change the verdict.
     #[test]
     fn validate_set_accepts_and_rejects() {
         for ok in [

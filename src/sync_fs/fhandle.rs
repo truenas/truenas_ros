@@ -1,10 +1,8 @@
 //! File handles: `name_to_handle_at(2)` / `open_by_handle_at(2)`.
 //!
-//! A [`FileHandle`] is an opaque, filesystem-issued reference to an inode that
-//! survives across renames. It is paired with a *mount id* (carried
-//! out-of-band, not in the serialized bytes) identifying the filesystem it
-//! belongs to; [`FileHandle::open`] re-opens the inode given any fd on that
-//! same mount.
+//! A [`FileHandle`] is an opaque, filesystem-issued reference to an inode that survives across renames. It is paired
+//! with a *mount id* (carried out-of-band, not in the serialized bytes) identifying the filesystem it belongs to;
+//! [`FileHandle::open`] re-opens the inode given any fd on that same mount.
 
 use crate::errno::{self, retry_on_eintr};
 use crate::error::{Error, Result};
@@ -15,8 +13,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
 /// Maximum size of the opaque handle data (`MAX_HANDLE_SZ`).
 const MAX_HANDLE_SZ: usize = 128;
-/// `offsetof(struct file_handle, f_handle)` - the `handle_bytes` + `handle_type`
-/// header.
+/// `offsetof(struct file_handle, f_handle)` - the `handle_bytes` + `handle_type` header.
 const HEADER_SZ: usize = 8;
 /// Sentinel mount id for an uninitialised handle.
 const MOUNT_ID_NONE: u64 = u64::MAX;
@@ -46,8 +43,7 @@ struct RawFileHandle {
     f_handle: [u8; MAX_HANDLE_SZ],
 }
 
-const _: () =
-    assert!(core::mem::size_of::<RawFileHandle>() == HEADER_SZ + MAX_HANDLE_SZ);
+const _: () = assert!(core::mem::size_of::<RawFileHandle>() == HEADER_SZ + MAX_HANDLE_SZ);
 
 /// An opaque handle to a file plus the mount it lives on.
 #[derive(Clone)]
@@ -74,8 +70,7 @@ impl FileHandle {
         self.mount_id
     }
 
-    /// Whether [`FileHandle::mount_id`] is the 64-bit unique mount id (as
-    /// opposed to the legacy 32-bit id).
+    /// Whether [`FileHandle::mount_id`] is the 64-bit unique mount id (as opposed to the legacy 32-bit id).
     pub fn unique_mount_id(&self) -> bool {
         self.unique_mount_id
     }
@@ -84,9 +79,8 @@ impl FileHandle {
         self.raw.handle_bytes as usize
     }
 
-    /// Serialize the raw `struct file_handle` (host-endian header +
-    /// `handle_bytes` of opaque data). The mount id is **not** included; keep
-    /// it alongside and pass it back to [`FileHandle::from_bytes`].
+    /// Serialize the raw `struct file_handle` (host-endian header + `handle_bytes` of opaque data). The mount id is
+    /// **not** included; keep it alongside and pass it back to [`FileHandle::from_bytes`].
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = self.handle_data_len();
         let mut out = Vec::with_capacity(HEADER_SZ + n);
@@ -96,13 +90,8 @@ impl FileHandle {
         out
     }
 
-    /// Reconstruct a handle from [`FileHandle::to_bytes`] output plus the mount
-    /// id it was captured with.
-    pub fn from_bytes(
-        data: &[u8],
-        mount_id: u64,
-        unique_mount_id: bool,
-    ) -> Result<Self> {
+    /// Reconstruct a handle from [`FileHandle::to_bytes`] output plus the mount id it was captured with.
+    pub fn from_bytes(data: &[u8], mount_id: u64, unique_mount_id: bool) -> Result<Self> {
         if data.len() < HEADER_SZ {
             return Err(Error::Validation(format!(
                 "file handle too small: {} bytes (min {HEADER_SZ})",
@@ -138,23 +127,15 @@ impl FileHandle {
         })
     }
 
-    /// Re-open the file this handle refers to, given any fd (`mount_fd`) on the
-    /// same mount.
+    /// Re-open the file this handle refers to, given any fd (`mount_fd`) on the same mount.
     ///
-    /// The mount id of `mount_fd` is verified against the handle's before the
-    /// `open_by_handle_at` call, so a handle cannot be used against the wrong
-    /// filesystem.
+    /// The mount id of `mount_fd` is verified against the handle's before the `open_by_handle_at` call, so a handle
+    /// cannot be used against the wrong filesystem.
     ///
     /// Requires `CAP_DAC_READ_SEARCH`.
-    pub fn open<Fd: AsFd>(
-        &self,
-        mount_fd: Fd,
-        flags: OFlag,
-    ) -> Result<OwnedFd> {
+    pub fn open<Fd: AsFd>(&self, mount_fd: Fd, flags: OFlag) -> Result<OwnedFd> {
         if self.mount_id == MOUNT_ID_NONE {
-            return Err(Error::Validation(
-                "file handle is uninitialised".into(),
-            ));
+            return Err(Error::Validation("file handle is uninitialised".into()));
         }
         let mount_fd = mount_fd.as_fd();
         let mask = if self.unique_mount_id {
@@ -186,15 +167,10 @@ impl FileHandle {
 
 /// Obtain a [`FileHandle`] for the file named by `path` relative to `dirfd`.
 ///
-/// `ENOTDIR` means `dirfd` is not a directory; `EOPNOTSUPP` means the
-/// filesystem cannot encode handles.
+/// `ENOTDIR` means `dirfd` is not a directory; `EOPNOTSUPP` means the filesystem cannot encode handles.
 ///
 /// See [`name_to_handle_at(2)`](https://man7.org/linux/man-pages/man2/name_to_handle_at.2.html).
-pub fn name_to_handle_at<P, Fd>(
-    dirfd: Fd,
-    path: &P,
-    flags: FhFlags,
-) -> Result<FileHandle>
+pub fn name_to_handle_at<P, Fd>(dirfd: Fd, path: &P, flags: FhFlags) -> Result<FileHandle>
 where
     P: ?Sized + TnPath,
     Fd: AsFd,
@@ -204,8 +180,8 @@ where
         handle_type: 0,
         f_handle: [0u8; MAX_HANDLE_SZ],
     };
-    // Zero-initialised so the high half is clean when the kernel writes only
-    // the legacy 32-bit id (without AT_HANDLE_MNT_ID_UNIQUE).
+    // Zero-initialised so the high half is clean when the kernel writes only the legacy 32-bit id (without
+    // AT_HANDLE_MNT_ID_UNIQUE).
     let mut mnt_id: u64 = 0;
     let dfd = dirfd.as_fd().as_raw_fd();
     let res: errno::Result<libc::c_long> = path.with_tn_path(|c| {

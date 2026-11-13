@@ -1,16 +1,13 @@
 //! Does a streamed upload allocate per window?
 //!
-//! Its own test binary, and it has to be: the measurement is a process-wide
-//! allocation count, so anything else running in the same process is noise.
-//! One test, one server, one client.
+//! Its own test binary, and it has to be: the measurement is a process-wide allocation count, so anything else running
+//! in the same process is noise. One test, one server, one client.
 //!
-//! The property is the reason the recv buffer pool exists. A pool that only
-//! covered request heads would leave the upload path minting a buffer per
-//! window - at a 128 KiB window that is one allocation per 128 KiB of
-//! payload, tens of thousands of them on a multi-gigabyte PUT - and would be
-//! decorative. Measured rather than reasoned about, because the code path
-//! that decides it (`body_placement_threshold` vs the pool buffer's size)
-//! is three modules away from the allocation.
+//! The property is the reason the recv buffer pool exists. A pool that only covered request heads would leave the
+//! upload path minting a buffer per window - at a 128 KiB window that is one allocation per 128 KiB of payload, tens of
+//! thousands of them on a multi-gigabyte PUT - and would be decorative. Measured rather than reasoned about, because
+//! the code path that decides it (`body_placement_threshold` vs the pool buffer's size) is three modules away from the
+//! allocation.
 #![cfg(all(target_os = "linux", feature = "http", feature = "net-server"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -19,46 +16,36 @@ use std::net::{SocketAddrV4, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
-use truenas_ros::http::{
-    HttpConfig, HttpRequest, HttpResponse, HttpVerdict, Stage,
-    protocol_streaming,
-};
-use truenas_ros::net::server::{
-    Incoming, Server, ServerAddr, ServerConfig, ShutdownHandle,
-};
+use truenas_ros::http::{HttpConfig, HttpRequest, HttpResponse, HttpVerdict, Stage, protocol_streaming};
+use truenas_ros::net::server::{Incoming, Server, ServerAddr, ServerConfig, ShutdownHandle};
 use truenas_ros::{Errno, Error};
 
 /// Allocations of at least this size are counted.
 ///
-/// Body buffers are the only thing on this path that reaches it: the window
-/// is 128 KiB and the placement threshold is 64 KiB, so a placed window
-/// lands here and nothing else does. Counting every allocation instead would
-/// drown the signal in the reply-building and framing traffic that is not
-/// what this measures.
+/// Body buffers are the only thing on this path that reaches it: the window is 128 KiB and the placement threshold is
+/// 64 KiB, so a placed window lands here and nothing else does. Counting every allocation instead would drown the
+/// signal in the reply-building and framing traffic that is not what this measures.
 const BIG: usize = 64 * 1024;
 
 static BIG_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 /// The second threshold, for costs whose unit is smaller than [`BIG`].
 ///
-/// A copy or fallback need not move a full window at a time to matter -
-/// anything from a chunk read up scales with the payload all the same.
-/// Counting from half a `RECV_CHUNK` keeps such costs visible while
-/// staying above the framing and reply-building traffic, which is what a
-/// lower bar would drown the signal in.
+/// A copy or fallback need not move a full window at a time to matter - anything from a chunk read up scales with the
+/// payload all the same. Counting from half a `RECV_CHUNK` keeps such costs visible while staying above the framing and
+/// reply-building traffic, which is what a lower bar would drown the signal in.
 const MED: usize = 2 * 1024;
 
 static MED_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
-/// The counter is process-global, so two measurements running at once
-/// report each other's allocations. Cargo runs a binary's tests as threads,
-/// so they have to take turns.
+/// The counter is process-global, so two measurements running at once report each other's allocations. Cargo runs a
+/// binary's tests as threads, so they have to take turns.
 static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Counting;
 
-// SAFETY: every method delegates to `System` unchanged; the counter is the
-// only addition and it touches no allocator state.
+// SAFETY: every method delegates to `System` unchanged; the counter is the only addition and it touches no allocator
+// state.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if l.size() >= BIG {
@@ -89,13 +76,9 @@ static A: Counting = Counting;
 fn is_unavailable(e: &Error) -> bool {
     matches!(
         e,
-        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded
-        // box exhausts it and ring creation fails - environmental, and
-        // the REQUIRE variable turns the skip red where it must not
-        // happen.
-        Error::Errno(
-            Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM
-        )
+        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded box exhausts it and ring creation fails -
+        // environmental, and the REQUIRE variable turns the skip red where it must not happen.
+        Error::Errno(Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM)
     )
 }
 
@@ -159,13 +142,11 @@ fn read_status(s: &mut TcpStream) -> io::Result<u16> {
         .ok_or_else(|| io::Error::other(format!("no status in {head:?}")))
 }
 
-/// Upload `mib` MiB in 128 KiB chunks and answer how many large
-/// allocations the whole exchange cost.
+/// Upload `mib` MiB in 128 KiB chunks and answer how many large allocations the whole exchange cost.
 fn upload_cost(mib: usize) -> Option<usize> {
     let cfg = ServerConfig {
         pool_size: 8,
-        // A head cap, which is the configuration streaming creates: no
-        // single message is a whole body.
+        // A head cap, which is the configuration streaming creates: no single message is a whole body.
         max_request_bytes: 512 * 1024,
         ..ServerConfig::default()
     };
@@ -178,15 +159,13 @@ fn upload_cost(mib: usize) -> Option<usize> {
                 *seen = 0;
                 HttpVerdict::Continue
             }
-            // Consume the window without keeping it - what a handler
-            // writing to a file does, and what makes the buffer reusable.
+            // Consume the window without keeping it - what a handler writing to a file does, and what makes the buffer
+            // reusable.
             Stage::Window => {
                 *seen += req.body.len();
                 HttpVerdict::Continue
             }
-            Stage::End => HttpVerdict::Respond(
-                HttpResponse::new(200).header("x-bytes", seen.to_string()),
-            ),
+            Stage::End => HttpVerdict::Respond(HttpResponse::new(200).header("x-bytes", seen.to_string())),
             Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
         },
     )
@@ -212,8 +191,8 @@ fn upload_cost(mib: usize) -> Option<usize> {
         let _stop = ShutdownOnDrop(stop.clone());
         let mut s = TcpStream::connect(v4).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        // Count only the exchange: everything before this is setup, and
-        // the wire buffer above is one allocation either way.
+        // Count only the exchange: everything before this is setup, and the wire buffer above is one allocation either
+        // way.
         let before = BIG_ALLOCS.load(Ordering::Relaxed);
         s.write_all(&wire).expect("write");
         let status = read_status(&mut s).expect("status");
@@ -237,10 +216,9 @@ fn upload_cost(mib: usize) -> Option<usize> {
 
 /// The cost of an upload must not scale with its size.
 ///
-/// Doubling the payload doubles the windows, so a per-window allocation
-/// shows up as a doubled count. Comparing two runs rather than asserting an
-/// absolute number keeps the test honest about the fixed setup cost, which
-/// is neither zero nor interesting.
+/// Doubling the payload doubles the windows, so a per-window allocation shows up as a doubled count. Comparing two runs
+/// rather than asserting an absolute number keeps the test honest about the fixed setup cost, which is neither zero nor
+/// interesting.
 #[test]
 fn a_streamed_upload_does_not_allocate_per_window() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
@@ -250,8 +228,7 @@ fn a_streamed_upload_does_not_allocate_per_window() {
     let Some(large) = upload_cost(16) else {
         return;
     };
-    // 4 MiB is 32 windows, 16 MiB is 128 - so a per-window allocation would
-    // put 96 between them.
+    // 4 MiB is 32 windows, 16 MiB is 128 - so a per-window allocation would put 96 between them.
     assert!(
         large <= small + 8,
         "upload cost scales with payload: 4 MiB cost {small} large \
@@ -262,19 +239,14 @@ fn a_streamed_upload_does_not_allocate_per_window() {
 
 // ---- the download side ----------------------------------------------------
 
-/// Serve one file body per connection and answer how many large allocations
-/// `conns` connections cost.
+/// Serve one file body per connection and answer how many large allocations `conns` connections cost.
 ///
-/// Connections, not requests, is the axis that matters: chunk buffers used
-/// to be minted per connection and held until it closed, so the cost scaled
-/// with the connection table rather than with how many bodies were actually
-/// moving.
+/// Connections, not requests, is the axis that matters: chunk buffers used to be minted per connection and held until
+/// it closed, so the cost scaled with the connection table rather than with how many bodies were actually moving.
 #[cfg(feature = "uring-fs")]
 fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
     use std::io::Read as _;
-    use truenas_ros::net::server::{
-        Endian, PrefixWidth, Protocol, Request, Response, length_prefix_header,
-    };
+    use truenas_ros::net::server::{Endian, PrefixWidth, Protocol, Request, Response, length_prefix_header};
 
     const CHUNK: usize = 64 * 1024;
     const SIZE: usize = 4 * CHUNK; // four chunk reads per body
@@ -290,9 +262,8 @@ fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
         fs_body_chunk: CHUNK,
         ..ServerConfig::default()
     };
-    // One open through a standalone fs host, cloned per request: only an
-    // fs reactor can mint a `File`, but the fd is host-independent once
-    // open and `File` is an `Arc<OwnedFd>`.
+    // One open through a standalone fs host, cloned per request: only an fs reactor can mint a `File`, but the fd is
+    // host-independent once open and `File` is an `Arc<OwnedFd>`.
     let file = {
         use truenas_ros::sync_fs::{OFlag, OpenHow};
         use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
@@ -308,12 +279,7 @@ fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
         let (ftx, frx) = std::sync::mpsc::channel();
         thread::scope(|sc| {
             sc.spawn(move || {
-                let r = handle.open(
-                    who,
-                    &anchor,
-                    c"obj",
-                    OpenHow::new().flags(OFlag::O_RDONLY),
-                );
+                let r = handle.open(who, &anchor, c"obj", OpenHow::new().flags(OFlag::O_RDONLY));
                 let _ = ftx.send(r);
                 stop_fs.shutdown();
             });
@@ -323,11 +289,7 @@ fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |_req: Request<'_, ()>| Response::ReplyFile {
             head: Vec::new(),
             file: file.clone(),
@@ -351,9 +313,8 @@ fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
 
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
-        // Sized once, outside the measurement: a growing client buffer
-        // reallocates past the counting threshold several times per body and
-        // would be indistinguishable from the server allocating per read.
+        // Sized once, outside the measurement: a growing client buffer reallocates past the counting threshold several
+        // times per body and would be indistinguishable from the server allocating per read.
         let mut got = vec![0u8; SIZE];
         let one = |got: &mut [u8]| {
             let mut s = TcpStream::connect(v4).expect("connect");
@@ -383,17 +344,14 @@ fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
 
 /// Serving file bodies must not allocate per connection.
 ///
-/// Chunk buffers came off a per-connection pool minted on the first file
-/// reply and held until close, so N connections cost N x FILE_TAIL_BUFS
-/// buffers of `fs_body_chunk` - `pool_size` x 2 x a megabyte in a real
-/// deployment, held whether or not anything was streaming. Drawn from the
-/// reactor's ring instead, the cost is flat in the connection count.
+/// Chunk buffers came off a per-connection pool minted on the first file reply and held until close, so N connections
+/// cost N x FILE_TAIL_BUFS buffers of `fs_body_chunk` - `pool_size` x 2 x a megabyte in a real deployment, held whether
+/// or not anything was streaming. Drawn from the reactor's ring instead, the cost is flat in the connection count.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn serving_file_bodies_does_not_allocate_per_connection() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
-    // Warm the pool first, then measure: growing the ring allocates, once,
-    // and that is not what this is about.
+    // Warm the pool first, then measure: growing the ring allocates, once, and that is not what this is about.
     let Some(few) = download_cost(8, 4) else {
         return; // io_uring unavailable
     };
@@ -410,32 +368,22 @@ fn serving_file_bodies_does_not_allocate_per_connection() {
 
 // ---- the write side: PUT windows straight to a file ------------------------
 
-/// Upload `mib` MiB as a streamed PUT whose handler writes every window to a
-/// real file with `pwritev2_from` + `defer_stream`, and answer (large
-/// allocations, file bytes matched).
+/// Upload `mib` MiB as a streamed PUT whose handler writes every window to a real file with `pwritev2_from` +
+/// `defer_stream`, and answer (large allocations, file bytes matched).
 ///
-/// This is the whole ingest path at once: kernel picks the recv buffer, the
-/// framer scans it in place, the handler's write borrows it, the claim is
-/// surrendered to the op, and the pool gets it back at the write's CQE. Any
-/// copy or allocation snuck back into that chain shows up in the count.
+/// This is the whole ingest path at once: kernel picks the recv buffer, the framer scans it in place, the handler's
+/// write borrows it, the claim is surrendered to the op, and the pool gets it back at the write's CQE. Any copy or
+/// allocation snuck back into that chain shows up in the count.
 #[cfg(feature = "uring-fs")]
-fn put_to_file_cost(
-    mib: usize,
-    wire_of: fn(&[u8]) -> Vec<u8>,
-) -> Option<(usize, usize, bool)> {
+fn put_to_file_cost(mib: usize, wire_of: fn(&[u8]) -> Vec<u8>) -> Option<(usize, usize, bool)> {
     put_to_file_cost_ranged(mib, wire_of, false)
 }
 
-/// [`put_to_file_cost`], optionally writing every window as **two** leased
-/// ranges - the shape a verifier that emits payload extents produces. Both
-/// ranges borrow the same claim, so the second must share the first's
-/// hold rather than fall to the copy path.
+/// [`put_to_file_cost`], optionally writing every window as **two** leased ranges - the shape a verifier that emits
+/// payload extents produces. Both ranges borrow the same claim, so the second must share the first's hold rather than
+/// fall to the copy path.
 #[cfg(feature = "uring-fs")]
-fn put_to_file_cost_ranged(
-    mib: usize,
-    wire_of: fn(&[u8]) -> Vec<u8>,
-    split: bool,
-) -> Option<(usize, usize, bool)> {
+fn put_to_file_cost_ranged(mib: usize, wire_of: fn(&[u8]) -> Vec<u8>, split: bool) -> Option<(usize, usize, bool)> {
     use truenas_ros::http::HttpStreamDeferred;
     use truenas_ros::uring_fs::RwFlags;
 
@@ -469,8 +417,7 @@ fn put_to_file_cost_ranged(
                         vec![(0, half), (half, body.len())]
                     };
                     let d = std::rc::Rc::new(std::cell::RefCell::new(Some(d)));
-                    let left =
-                        std::rc::Rc::new(std::cell::Cell::new(ranges.len()));
+                    let left = std::rc::Rc::new(std::cell::Cell::new(ranges.len()));
                     let failed = std::rc::Rc::new(std::cell::Cell::new(false));
                     for (start, end) in ranges {
                         let (d, left, failed) = (
@@ -490,10 +437,7 @@ fn put_to_file_cost_ranged(
                                 }
                                 left.set(left.get() - 1);
                                 if left.get() == 0 {
-                                    let d = d
-                                        .borrow_mut()
-                                        .take()
-                                        .expect("one taker");
+                                    let d = d.borrow_mut().take().expect("one taker");
                                     if failed.get() {
                                         d.fail(HttpResponse::new(500));
                                     } else {
@@ -505,9 +449,7 @@ fn put_to_file_cost_ranged(
                     }
                     HttpVerdict::Defer(permit)
                 }
-                Stage::End => HttpVerdict::Respond(
-                    HttpResponse::new(200).header("x-bytes", off.to_string()),
-                ),
+                Stage::End => HttpVerdict::Respond(HttpResponse::new(200).header("x-bytes", off.to_string())),
                 Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
             },
         )
@@ -543,17 +485,13 @@ impl Landed {
     }
 }
 
-/// One streamed PUT of `mib` MiB of varied bytes, framed by `wire_of`,
-/// into a server running the protocol `proto_of` builds over a
-/// pre-opened destination and the reactor's own personality (set once the
-/// server exists, before the first connection). The upload's large
-/// allocations are counted, every receive buffer is checked back home,
-/// and the destination is read back. `None` where this box has no
-/// io_uring.
+/// One streamed PUT of `mib` MiB of varied bytes, framed by `wire_of`, into a server running the protocol `proto_of`
+/// builds over a pre-opened destination and the reactor's own personality (set once the server exists, before the first
+/// connection). The upload's large allocations are counted, every receive buffer is checked back home, and the
+/// destination is read back. `None` where this box has no io_uring.
 ///
-/// The destination is opened through a throwaway [`UringFs`] host, not
-/// the server's own reactor: the open path is not what any caller
-/// measures, and the file is cloned into every request from here.
+/// The destination is opened through a throwaway [`UringFs`] host, not the server's own reactor: the open path is not
+/// what any caller measures, and the file is cloned into every request from here.
 #[cfg(feature = "uring-fs")]
 fn streamed_put<U, A, H, B>(
     mib: usize,
@@ -566,9 +504,7 @@ fn streamed_put<U, A, H, B>(
 where
     A: FnMut(Incoming<'_>) -> Option<U>,
     H: FnMut(&[u8], &mut U) -> truenas_ros::net::Framing,
-    B: FnMut(
-        truenas_ros::net::server::Request<'_, U>,
-    ) -> truenas_ros::net::server::Response,
+    B: FnMut(truenas_ros::net::server::Request<'_, U>) -> truenas_ros::net::server::Response,
 {
     use std::sync::OnceLock;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
@@ -592,12 +528,7 @@ where
         let (ftx, frx) = std::sync::mpsc::channel();
         thread::scope(|sc| {
             sc.spawn(move || {
-                let r = handle.open(
-                    who,
-                    &anchor,
-                    c"obj",
-                    OpenHow::new().flags(OFlag::O_WRONLY),
-                );
+                let r = handle.open(who, &anchor, c"obj", OpenHow::new().flags(OFlag::O_WRONLY));
                 let _ = ftx.send(r);
                 stop_fs.shutdown();
             });
@@ -606,8 +537,7 @@ where
         frx.recv().expect("open outcome").expect("open")
     };
 
-    let pers: std::sync::Arc<OnceLock<Personality>> =
-        std::sync::Arc::new(OnceLock::new());
+    let pers: std::sync::Arc<OnceLock<Personality>> = std::sync::Arc::new(OnceLock::new());
     let proto = proto_of(file, std::sync::Arc::clone(&pers));
 
     let cfg = ServerConfig {
@@ -630,10 +560,9 @@ where
     let stats = server.stats_handle();
     let stop = server.shutdown_handle();
 
-    // Varied bytes, so a window digested out of order or over a recycled
-    // buffer shows up; a constant fill would hash the same either way.
-    let payload: Vec<u8> =
-        (0..mib * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    // Varied bytes, so a window digested out of order or over a recycled buffer shows up; a constant fill would hash
+    // the same either way.
+    let payload: Vec<u8> = (0..mib * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let wire = wire_of(&payload);
 
     let client = thread::spawn(move || {
@@ -659,10 +588,7 @@ where
         s.recv_bufs_total > 0,
         "no recv ring registered - the lease path was never exercised: {s:?}"
     );
-    assert_eq!(
-        s.recv_bufs_lent, 0,
-        "a leased buffer was never returned: {s:?}"
-    );
+    assert_eq!(s.recv_bufs_lent, 0, "a leased buffer was never returned: {s:?}");
     let written = std::fs::read(&path).expect("read back");
     Some(Landed {
         cost,
@@ -673,23 +599,21 @@ where
     })
 }
 
-/// The digest the two digesting handlers compute: order-sensitive, so a
-/// window hashed over the wrong bytes or a recycled buffer shows up.
+/// The digest the two digesting handlers compute: order-sensitive, so a window hashed over the wrong bytes or a
+/// recycled buffer shows up.
 #[cfg(feature = "uring-fs")]
 fn fold(acc: u64, bytes: &[u8]) -> u64 {
-    bytes.iter().fold(acc, |h, &b| {
-        h.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(b)
-    })
+    bytes
+        .iter()
+        .fold(acc, |h, &b| h.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(b))
 }
 
 #[cfg(feature = "uring-fs")]
 const FOLD_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 
-/// [`put_to_file_cost`] with every window also *digested* on the pool from
-/// the same leased buffer (`offload_from`): the write and the job share
-/// the window's claim, the stream resumes when both have landed, and
-/// `End` answers the running digest. Returns the allocation costs, whether
-/// the file matched, and whether the digest the handler accumulated is
+/// [`put_to_file_cost`] with every window also *digested* on the pool from the same leased buffer (`offload_from`): the
+/// write and the job share the window's claim, the stream resumes when both have landed, and `End` answers the running
+/// digest. Returns the allocation costs, whether the file matched, and whether the digest the handler accumulated is
 /// the payload's.
 #[cfg(feature = "uring-fs")]
 fn put_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
@@ -698,9 +622,8 @@ fn put_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
     use truenas_ros::http::HttpStreamDeferred;
     use truenas_ros::uring_fs::RwFlags;
 
-    /// One connection's upload: the payload offset and the digest so
-    /// far. Each window parks until its job is back, so the next window
-    /// starts from the digest its predecessor's completion stored.
+    /// One connection's upload: the payload offset and the digest so far. Each window parks until its job is back, so
+    /// the next window starts from the digest its predecessor's completion stored.
     struct Digesting {
         off: u64,
         acc: u64,
@@ -713,22 +636,13 @@ fn put_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
             truenas_ros::http::protocol_streaming_fs(
                 HttpConfig::default(),
                 1 << 30,
-                |_i: Incoming<'_>| {
-                    Some(Rc::new(RefCell::new(Digesting {
-                        off: 0,
-                        acc: FOLD_SEED,
-                    })))
-                },
-                move |req: HttpRequest<'_>,
-                      st: &mut Rc<RefCell<Digesting>>,
-                      fs| {
+                |_i: Incoming<'_>| Some(Rc::new(RefCell::new(Digesting { off: 0, acc: FOLD_SEED }))),
+                move |req: HttpRequest<'_>, st: &mut Rc<RefCell<Digesting>>, fs| {
                     match req.stage {
                         Stage::Open => HttpVerdict::Continue,
                         Stage::Window => {
                             let Some(mut fs) = fs else {
-                                return HttpVerdict::Respond(
-                                    HttpResponse::new(500),
-                                );
+                                return HttpVerdict::Respond(HttpResponse::new(500));
                             };
                             let who = *pc.get().expect("personality set");
                             let (at, acc) = {
@@ -740,27 +654,19 @@ fn put_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
                             let (d, permit, body) = req.defer_stream();
                             let d: HttpStreamDeferred = d;
                             let d = Rc::new(RefCell::new(Some(d)));
-                            // Two landings per window: the write's CQE and
-                            // the job's delivery. The last one resumes the
+                            // Two landings per window: the write's CQE and the job's delivery. The last one resumes the
                             // stream.
                             let left = Rc::new(Cell::new(2u8));
                             let failed = Rc::new(Cell::new(false));
                             let finish = {
-                                let (d, left, failed) = (
-                                    Rc::clone(&d),
-                                    Rc::clone(&left),
-                                    Rc::clone(&failed),
-                                );
+                                let (d, left, failed) = (Rc::clone(&d), Rc::clone(&left), Rc::clone(&failed));
                                 move |ok: bool| {
                                     if !ok {
                                         failed.set(true);
                                     }
                                     left.set(left.get() - 1);
                                     if left.get() == 0 {
-                                        let d = d
-                                            .borrow_mut()
-                                            .take()
-                                            .expect("one taker");
+                                        let d = d.borrow_mut().take().expect("one taker");
                                         if failed.get() {
                                             d.fail(HttpResponse::new(500));
                                         } else {
@@ -770,22 +676,16 @@ fn put_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
                                 }
                             };
                             let f1 = finish.clone();
-                            fs.pwritev2_from(
-                                who,
-                                file.clone(),
-                                &body,
-                                at,
-                                RwFlags::empty(),
-                                move |done, _fs| f1(done.result().is_ok()),
-                            );
+                            fs.pwritev2_from(who, file.clone(), &body, at, RwFlags::empty(), move |done, _fs| {
+                                f1(done.result().is_ok())
+                            });
                             let st = Rc::clone(st);
                             fs.offload_from(
                                 &body,
                                 move |view| Ok(fold(acc, view)),
                                 move |r, _fs| match r {
                                     Ok(h) => {
-                                        // Stored before the resume, so the
-                                        // next window and `End` both read it.
+                                        // Stored before the resume, so the next window and `End` both read it.
                                         st.borrow_mut().acc = h;
                                         finish(true);
                                     }
@@ -799,15 +699,10 @@ fn put_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
                             HttpVerdict::Respond(
                                 HttpResponse::new(200)
                                     .header("x-bytes", p.off.to_string())
-                                    .header(
-                                        "x-digest",
-                                        format!("{:016x}", p.acc),
-                                    ),
+                                    .header("x-digest", format!("{:016x}", p.acc)),
                             )
                         }
-                        Stage::Whole => {
-                            HttpVerdict::Respond(HttpResponse::new(500))
-                        }
+                        Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
                     }
                 },
             )
@@ -819,13 +714,10 @@ fn put_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
     Some((landed.cost, landed.cost_med, landed.matches, digested))
 }
 
-/// [`put_digest_cost`] with the digest *pipelined*: a window is never
-/// parked on its own job. Each window is written and leased
-/// (`lease_window`); the lease is spent on the pool at once when no job is
-/// running, else it waits in a backlog and the running job's completion
-/// spends it - `offload_leased` from a completion facade. The stream
-/// brakes only past two waiting windows, and `End` answers from the
-/// completion that drains the last of them. Returns what
+/// [`put_digest_cost`] with the digest *pipelined*: a window is never parked on its own job. Each window is written and
+/// leased (`lease_window`); the lease is spent on the pool at once when no job is running, else it waits in a backlog
+/// and the running job's completion spends it - `offload_leased` from a completion facade. The stream brakes only past
+/// two waiting windows, and `End` answers from the completion that drains the last of them. Returns what
 /// [`put_digest_cost`] does.
 #[cfg(feature = "uring-fs")]
 fn put_pipelined_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
@@ -835,9 +727,8 @@ fn put_pipelined_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
     use truenas_ros::http::{HttpDeferred, HttpStreamDeferred};
     use truenas_ros::uring_fs::{FsConn, LeasedWindow, RwFlags};
 
-    /// A window waiting for the digest: leased where the delivery could
-    /// lease it, copied where it could not (never, on this path - the
-    /// flat allocation count is what proves it).
+    /// A window waiting for the digest: leased where the delivery could lease it, copied where it could not (never, on
+    /// this path - the flat allocation count is what proves it).
     enum Window {
         Leased(LeasedWindow),
         Owned(Vec<u8>),
@@ -910,12 +801,8 @@ fn put_pipelined_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
             }
         };
         match w {
-            Window::Leased(w) => {
-                conn.offload_leased(w, move |view| Ok(fold(acc, view)), done)
-            }
-            Window::Owned(bytes) => {
-                conn.offload_result(move || Ok(fold(acc, &bytes)), done)
-            }
+            Window::Leased(w) => conn.offload_leased(w, move |view| Ok(fold(acc, view)), done),
+            Window::Owned(bytes) => conn.offload_result(move || Ok(fold(acc, &bytes)), done),
         }
     }
 
@@ -938,71 +825,55 @@ fn put_pipelined_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
                         end: None,
                     })))
                 },
-                move |req: HttpRequest<'_>, st: &mut Rc<RefCell<Pipe>>, fs| {
-                    match req.stage {
-                        Stage::Open => HttpVerdict::Continue,
-                        Stage::Window => {
-                            let Some(mut fs) = fs else {
-                                return HttpVerdict::Respond(
-                                    HttpResponse::new(500),
-                                );
-                            };
-                            let who = *pc.get().expect("personality set");
-                            let at = {
-                                let mut p = st.borrow_mut();
-                                let at = p.off;
-                                p.off += req.body.len() as u64;
-                                p.writes += 1;
-                                at
-                            };
-                            let wst = Rc::clone(st);
-                            fs.pwritev2_from(
-                                who,
-                                file.clone(),
-                                &req.body,
-                                at,
-                                RwFlags::empty(),
-                                move |done, _fs| {
-                                    let mut p = wst.borrow_mut();
-                                    if done.result().is_err() {
-                                        p.write_failed = true;
-                                    }
-                                    p.writes -= 1;
-                                    p.answer();
-                                },
-                            );
-                            let window = match fs.lease_window(&req.body) {
-                                Some(w) => Window::Leased(w),
-                                None => Window::Owned(req.body.to_vec()),
-                            };
-                            let busy = std::mem::replace(
-                                &mut st.borrow_mut().busy,
-                                true,
-                            );
-                            if busy {
-                                st.borrow_mut().backlog.push_back(window);
-                            } else {
-                                submit(&mut fs, Rc::clone(st), window);
-                            }
-                            if st.borrow().backlog.len() >= BACKLOG {
-                                let (d, permit, _body) = req.defer_stream();
-                                st.borrow_mut().parked = Some(d);
-                                HttpVerdict::Defer(permit)
-                            } else {
-                                HttpVerdict::Continue
-                            }
-                        }
-                        Stage::End => {
-                            let (d, permit) = req.defer();
+                move |req: HttpRequest<'_>, st: &mut Rc<RefCell<Pipe>>, fs| match req.stage {
+                    Stage::Open => HttpVerdict::Continue,
+                    Stage::Window => {
+                        let Some(mut fs) = fs else {
+                            return HttpVerdict::Respond(HttpResponse::new(500));
+                        };
+                        let who = *pc.get().expect("personality set");
+                        let at = {
                             let mut p = st.borrow_mut();
-                            p.end = Some(d);
+                            let at = p.off;
+                            p.off += req.body.len() as u64;
+                            p.writes += 1;
+                            at
+                        };
+                        let wst = Rc::clone(st);
+                        fs.pwritev2_from(who, file.clone(), &req.body, at, RwFlags::empty(), move |done, _fs| {
+                            let mut p = wst.borrow_mut();
+                            if done.result().is_err() {
+                                p.write_failed = true;
+                            }
+                            p.writes -= 1;
                             p.answer();
-                            HttpVerdict::Defer(permit)
+                        });
+                        let window = match fs.lease_window(&req.body) {
+                            Some(w) => Window::Leased(w),
+                            None => Window::Owned(req.body.to_vec()),
+                        };
+                        let busy = std::mem::replace(&mut st.borrow_mut().busy, true);
+                        if busy {
+                            st.borrow_mut().backlog.push_back(window);
+                        } else {
+                            submit(&mut fs, Rc::clone(st), window);
                         }
-                        Stage::Whole => {
-                            HttpVerdict::Respond(HttpResponse::new(500))
+                        if st.borrow().backlog.len() >= BACKLOG {
+                            let (d, permit, _body) = req.defer_stream();
+                            st.borrow_mut().parked = Some(d);
+                            HttpVerdict::Defer(permit)
+                        } else {
+                            HttpVerdict::Continue
                         }
                     }
+                    Stage::End => {
+                        let (d, permit) = req.defer();
+                        let mut p = st.borrow_mut();
+                        p.end = Some(d);
+                        p.answer();
+                        HttpVerdict::Defer(permit)
+                    }
+                    Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
                 },
             )
             .expect("codec config")
@@ -1013,26 +884,20 @@ fn put_pipelined_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
     Some((landed.cost, landed.cost_med, landed.matches, digested))
 }
 
-/// A window held past its delivery and spent from an earlier job's
-/// completion costs no copy and returns its lease.
+/// A window held past its delivery and spent from an earlier job's completion costs no copy and returns its lease.
 ///
-/// The pipelined shape: the stream flows while the digest runs behind
-/// it, windows waiting their turn as leases rather than copies, every
-/// one spent by `offload_leased` from a completion facade that holds no
-/// lease of its own. Flat allocation count, every buffer back, and the
-/// digest is the payload's - so the windows were read in order and none
+/// The pipelined shape: the stream flows while the digest runs behind it, windows waiting their turn as leases rather
+/// than copies, every one spent by `offload_leased` from a completion facade that holds no lease of its own. Flat
+/// allocation count, every buffer back, and the digest is the payload's - so the windows were read in order and none
 /// was recycled under a waiting job.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_held_window_is_digested_from_the_previous_jobs_completion() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((small, _, ok_small, digest_small)) = put_pipelined_digest_cost(4)
-    else {
+    let Some((small, _, ok_small, digest_small)) = put_pipelined_digest_cost(4) else {
         return; // io_uring unavailable
     };
-    let Some((large, _, ok_large, digest_large)) =
-        put_pipelined_digest_cost(16)
-    else {
+    let Some((large, _, ok_large, digest_large)) = put_pipelined_digest_cost(16) else {
         return;
     };
     assert!(ok_small && ok_large, "file bytes differ from the upload");
@@ -1060,21 +925,15 @@ fn read_response_head(s: &mut TcpStream) -> io::Result<(u16, String)> {
         buf.push(byte[0]);
     }
     let text = String::from_utf8_lossy(&buf).into_owned();
-    let status = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(0);
+    let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     Ok((status, text))
 }
 
-/// A window digested on the pool from the receive buffer it arrived in
-/// costs no copy and returns its lease.
+/// A window digested on the pool from the receive buffer it arrived in costs no copy and returns its lease.
 ///
-/// `offload_from` shares the write's claim: the write and the job read
-/// the same buffer, the buffer returns when the last of them is over, and
-/// neither falls to the copy path - so the allocation count is flat in
-/// the payload, every lease comes back, and the digest is the payload's.
+/// `offload_from` shares the write's claim: the write and the job read the same buffer, the buffer returns when the
+/// last of them is over, and neither falls to the copy path - so the allocation count is flat in the payload, every
+/// lease comes back, and the digest is the payload's.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_leased_window_is_digested_in_place() {
@@ -1090,8 +949,7 @@ fn a_leased_window_is_digested_in_place() {
         digest_small && digest_large,
         "the pool job digested other bytes than the payload's"
     );
-    // 4 MiB is 32 windows, 16 MiB is 128: a per-window copy shows up as
-    // ~96 between them.
+    // 4 MiB is 32 windows, 16 MiB is 128: a per-window copy shows up as ~96 between them.
     assert!(
         large <= small + 8,
         "digesting cost scales with payload: 4 MiB cost {small} large \
@@ -1100,14 +958,11 @@ fn a_leased_window_is_digested_in_place() {
     );
 }
 
-/// Writing a streamed PUT to a file must neither corrupt it nor allocate
-/// per window.
+/// Writing a streamed PUT to a file must neither corrupt it nor allocate per window.
 ///
-/// The windows are written from the receive buffer itself - the claim is
-/// surrendered to the write op and comes back to the pool at its CQE - and
-/// the stream park retains no copy. Byte-identical content proves the
-/// buffer was never recycled under the DMA; a flat allocation count proves
-/// neither the write nor the park fell back to copying.
+/// The windows are written from the receive buffer itself - the claim is surrendered to the write op and comes back to
+/// the pool at its CQE - and the stream park retains no copy. Byte-identical content proves the buffer was never
+/// recycled under the DMA; a flat allocation count proves neither the write nor the park fell back to copying.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_streamed_put_writes_windows_without_copying_them() {
@@ -1120,8 +975,7 @@ fn a_streamed_put_writes_windows_without_copying_them() {
         return;
     };
     assert!(ok_small && ok_large, "file bytes differ from the upload");
-    // 4 MiB is 32 windows, 16 MiB is 128: a per-window copy or park shows
-    // up as ~96 between them.
+    // 4 MiB is 32 windows, 16 MiB is 128: a per-window copy or park shows up as ~96 between them.
     assert!(
         large <= small + 8,
         "PUT-to-file cost scales with payload: 4 MiB cost {small} large \
@@ -1132,11 +986,9 @@ fn a_streamed_put_writes_windows_without_copying_them() {
 
 /// Two ranges of one window both write from the claim.
 ///
-/// A verifier that emits payload extents hands the handler several ranges
-/// of the same window; each borrows the same claim, so all of them must
-/// share its hold - the buffer goes back when the last completes. A
-/// single-shot lease sends every range after the first to the copy path,
-/// which at two ranges per window is one ~64 KiB allocation-and-copy per
+/// A verifier that emits payload extents hands the handler several ranges of the same window; each borrows the same
+/// claim, so all of them must share its hold - the buffer goes back when the last completes. A single-shot lease sends
+/// every range after the first to the copy path, which at two ranges per window is one ~64 KiB allocation-and-copy per
 /// window, scaling with the payload.
 #[cfg(feature = "uring-fs")]
 #[test]
@@ -1145,12 +997,10 @@ fn a_multi_range_window_writes_every_range_from_the_claim() {
     fn wire(p: &[u8]) -> Vec<u8> {
         chunked_put(p, 1024 * 1024)
     }
-    let Some((small, _, ok_small)) = put_to_file_cost_ranged(4, wire, true)
-    else {
+    let Some((small, _, ok_small)) = put_to_file_cost_ranged(4, wire, true) else {
         return; // io_uring unavailable
     };
-    let Some((large, _, ok_large)) = put_to_file_cost_ranged(16, wire, true)
-    else {
+    let Some((large, _, ok_large)) = put_to_file_cost_ranged(16, wire, true) else {
         return;
     };
     assert!(ok_small && ok_large, "file bytes differ from the upload");
@@ -1164,19 +1014,15 @@ fn a_multi_range_window_writes_every_range_from_the_claim() {
 
 /// The same guarantee when a peer's HTTP chunks are larger than a window.
 ///
-/// A chunk of exactly one window is the single size at which every window
-/// carries its chunk header, so the connection always holds a recv claim
-/// and the cost of the no-claim arm is invisible. Fixtures framed at that
-/// size therefore prove nothing about it - which is how a copy of seven
-/// windows in eight went unnoticed.
+/// A chunk of exactly one window is the single size at which every window carries its chunk header, so the connection
+/// always holds a recv claim and the cost of the no-claim arm is invisible. Fixtures framed at that size therefore
+/// prove nothing about it - which is how a copy of seven windows in eight went unnoticed.
 ///
-/// 1 MiB here is not botocore: botocore's HTTP chunks are 128 KiB (see
-/// `STREAM_WINDOW`), and its 1 MiB `_DEFAULT_CHUNK_SIZE` frames an inner
-/// aws-chunked payload this layer never frames. 1 MiB is chosen as a peer
-/// that chunks eight windows at a time, so seven in eight are mid-chunk
-/// with the claim already leased to the previous window's write. Those must
-/// draw a fresh buffer from the ring, not be placed into an allocation
-/// `pwritev2_from` then copies.
+/// 1 MiB here is not botocore: botocore's HTTP chunks are 128 KiB (see `STREAM_WINDOW`), and its 1 MiB
+/// `_DEFAULT_CHUNK_SIZE` frames an inner aws-chunked payload this layer never frames. 1 MiB is chosen as a peer that
+/// chunks eight windows at a time, so seven in eight are mid-chunk with the claim already leased to the previous
+/// window's write. Those must draw a fresh buffer from the ring, not be placed into an allocation `pwritev2_from` then
+/// copies.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_streamed_put_at_oversized_http_chunks_still_does_not_copy() {
@@ -1191,9 +1037,8 @@ fn a_streamed_put_at_oversized_http_chunks_still_does_not_copy() {
         return;
     };
     assert!(ok_small && ok_large, "file bytes differ from the upload");
-    // Placed-and-copied mid-chunk windows cost exactly 14 large
-    // allocations per MiB (measured: 56 and 224 here before the no-claim
-    // suppression); flat means every window drew from the ring.
+    // Placed-and-copied mid-chunk windows cost exactly 14 large allocations per MiB (measured: 56 and 224 here before
+    // the no-claim suppression); flat means every window drew from the ring.
     assert!(
         large <= small + 8,
         "PUT-to-file cost scales with payload at 1 MiB chunks: 4 MiB cost \
@@ -1202,16 +1047,13 @@ fn a_streamed_put_at_oversized_http_chunks_still_does_not_copy() {
     );
 }
 
-/// A `Content-Length` body above one window streams exactly as a chunked
-/// one: windows from the receive ring, leased writes, no copy and no
-/// per-window allocation. The harness's `Whole` arm answers 500, so a
-/// body this size that fails to stream fails the test outright — the
-/// regression this exists to catch is precisely a silent fall back to
+/// A `Content-Length` body above one window streams exactly as a chunked one: windows from the receive ring, leased
+/// writes, no copy and no per-window allocation. The harness's `Whole` arm answers 500, so a body this size that fails
+/// to stream fails the test outright — the regression this exists to catch is precisely a silent fall back to
 /// buffering.
 ///
-/// Counted from [`MED`], the tighter of the allocator's two thresholds,
-/// so a fallback whose unit is smaller than a full window still registers
-/// rather than sliding under a 64 KiB bar.
+/// Counted from [`MED`], the tighter of the allocator's two thresholds, so a fallback whose unit is smaller than a full
+/// window still registers rather than sliding under a 64 KiB bar.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_known_length_put_streams_without_copying() {
@@ -1233,20 +1075,17 @@ fn a_known_length_put_streams_without_copying() {
 
 /// Two known-length streamed PUTs pipelined on one connection.
 ///
-/// The End handoff consumes zero bytes, so the second request's head —
-/// already buffered behind the first body — must frame cleanly rather
-/// than be eaten as a trailer section. Answered wrong, the connection
-/// desyncs and the second status never arrives.
+/// The End handoff consumes zero bytes, so the second request's head — already buffered behind the first body — must
+/// frame cleanly rather than be eaten as a trailer section. Answered wrong, the connection desyncs and the second
+/// status never arrives.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn pipelined_known_length_streams_do_not_desync() {
     use std::sync::atomic::AtomicUsize;
 
-    // Allocates ~20 buffers over `BIG` through a live server. The counter
-    // is process-global and this binary's tests run as parallel threads,
-    // so without the turn those land inside another test's measurement
-    // window - reddening a correct suite, or raising a differential's
-    // baseline arm enough to admit the regression it exists to catch.
+    // Allocates ~20 buffers over `BIG` through a live server. The counter is process-global and this binary's tests run
+    // as parallel threads, so without the turn those land inside another test's measurement window - reddening a
+    // correct suite, or raising a differential's baseline arm enough to admit the regression it exists to catch.
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
 
     let opens = std::sync::Arc::new(AtomicUsize::new(0));
@@ -1268,9 +1107,7 @@ fn pipelined_known_length_streams_do_not_desync() {
             }
             Stage::End => {
                 e.fetch_add(1, Ordering::Relaxed);
-                HttpVerdict::Respond(
-                    HttpResponse::new(200).header("x-bytes", got.to_string()),
-                )
+                HttpVerdict::Respond(HttpResponse::new(200).header("x-bytes", got.to_string()))
             }
             Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
         },
@@ -1297,8 +1134,8 @@ fn pipelined_known_length_streams_do_not_desync() {
         let _stop = ShutdownOnDrop(stop.clone());
         let mut s = TcpStream::connect(v4).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        // Both requests in one write: the second head sits in the buffer
-        // behind the first body when the End handoff runs.
+        // Both requests in one write: the second head sits in the buffer behind the first body when the End handoff
+        // runs.
         let first = cl_put(&vec![0x51u8; 300 * 1024]);
         let second = cl_put(&vec![0x52u8; 200 * 1024]);
         let mut wire = first;
@@ -1335,30 +1172,21 @@ struct PipeCtl {
     end: std::sync::Mutex<Option<truenas_ros::http::HttpDeferred>>,
 }
 
-/// Upload `mib` MiB on `conns` connections at write depth `k`, every window
-/// written to its connection's file with `pwritev2_from` and `Continue` --
-/// parking only at the cap. Answers (large allocations, all files matched,
-/// peak writes in flight observed).
+/// Upload `mib` MiB on `conns` connections at write depth `k`, every window written to its connection's file with
+/// `pwritev2_from` and `Continue` -- parking only at the cap. Answers (large allocations, all files matched, peak
+/// writes in flight observed).
 #[cfg(feature = "uring-fs")]
 #[allow(clippy::too_many_lines)]
-fn pipelined_put_cost(
-    mib: usize,
-    conns: usize,
-    k: usize,
-) -> Option<(usize, bool, usize)> {
+fn pipelined_put_cost(mib: usize, conns: usize, k: usize) -> Option<(usize, bool, usize)> {
     use std::sync::OnceLock;
     use truenas_ros::http::HttpDeferred;
     use truenas_ros::uring_fs::{File, Personality, RwFlags};
 
-    // `truenas_ros::tempdir()` (mkdtemp) rather than a parameter-named
-    // directory, and the drop guard rather than a trailing
-    // `remove_dir_all`, for two measured reasons: parameter-named
-    // fixtures were shared by two `recv_alloc` binaries running at
-    // once - `MEASURING` serializes only within a process - and the
-    // pre-clean deleted the other's objects mid-upload, reading as a
-    // lost write at the verify; and a hand-rolled teardown sits behind
-    // every assert, so one failing run left its RAM-backed fixtures on
-    // tmpfs. The guard cleans up on the unwind too.
+    // `truenas_ros::tempdir()` (mkdtemp) rather than a parameter-named directory, and the drop guard rather than a
+    // trailing `remove_dir_all`, for two measured reasons: parameter-named fixtures were shared by two `recv_alloc`
+    // binaries running at once - `MEASURING` serializes only within a process - and the pre-clean deleted the other's
+    // objects mid-upload, reading as a lost write at the verify; and a hand-rolled teardown sits behind every assert,
+    // so one failing run left its RAM-backed fixtures on tmpfs. The guard cleans up on the unwind too.
     let tmp = truenas_ros::tempdir().expect("tempdir");
     let dir = tmp.path().to_owned();
     for i in 0..conns {
@@ -1382,14 +1210,8 @@ fn pipelined_put_cost(
         thread::scope(|sc| {
             sc.spawn(move || {
                 for i in 0..conns {
-                    let name =
-                        std::ffi::CString::new(format!("obj{i}")).unwrap();
-                    let r = handle.open(
-                        who,
-                        &anchor,
-                        name.as_c_str(),
-                        OpenHow::new().flags(OFlag::O_WRONLY),
-                    );
+                    let name = std::ffi::CString::new(format!("obj{i}")).unwrap();
+                    let r = handle.open(who, &anchor, name.as_c_str(), OpenHow::new().flags(OFlag::O_WRONLY));
                     let _ = ftx.send(r);
                 }
                 stop_fs.shutdown();
@@ -1401,8 +1223,7 @@ fn pipelined_put_cost(
             .collect()
     };
 
-    let pers: std::sync::Arc<OnceLock<Personality>> =
-        std::sync::Arc::new(OnceLock::new());
+    let pers: std::sync::Arc<OnceLock<Personality>> = std::sync::Arc::new(OnceLock::new());
     let pc = std::sync::Arc::clone(&pers);
     let peak_seen = std::sync::Arc::new(AtomicUsize::new(0));
     let peak_out = std::sync::Arc::clone(&peak_seen);
@@ -1444,73 +1265,46 @@ fn pipelined_put_cost(
                     let now = ctl.inflight.fetch_add(1, Ordering::Relaxed) + 1;
                     ctl.peak.fetch_max(now, Ordering::Relaxed);
                     peak_out.fetch_max(now, Ordering::Relaxed);
-                    // The completion: release the depth slot, wake whoever
-                    // the cap parked, and settle End once everything landed.
+                    // The completion: release the depth slot, wake whoever the cap parked, and settle End once
+                    // everything landed.
                     let done_ctl = std::sync::Arc::clone(ctl);
-                    let cont =
-                        move |done: truenas_ros::uring_fs::FsDone,
-                              _fs: &mut truenas_ros::uring_fs::FsConn<'_>| {
-                            if done.result().is_err() {
-                                done_ctl
-                                    .failed
-                                    .store(true, Ordering::Relaxed);
-                            }
-                            let left = done_ctl
-                                .inflight
-                                .fetch_sub(1, Ordering::Relaxed)
-                                - 1;
-                            if let Some(d) =
-                                done_ctl.parked.lock().unwrap().take()
-                            {
-                                d.resume();
-                            }
-                            let end: Option<HttpDeferred> = if left == 0 {
-                                done_ctl.end.lock().unwrap().take()
-                            } else {
-                                None
-                            };
-                            if let Some(d) = end {
-                                if done_ctl.failed.load(Ordering::Relaxed) {
-                                    d.reply(HttpResponse::new(500));
-                                } else {
-                                    d.reply(HttpResponse::new(200));
-                                }
-                            }
+                    let cont = move |done: truenas_ros::uring_fs::FsDone,
+                                     _fs: &mut truenas_ros::uring_fs::FsConn<'_>| {
+                        if done.result().is_err() {
+                            done_ctl.failed.store(true, Ordering::Relaxed);
+                        }
+                        let left = done_ctl.inflight.fetch_sub(1, Ordering::Relaxed) - 1;
+                        if let Some(d) = done_ctl.parked.lock().unwrap().take() {
+                            d.resume();
+                        }
+                        let end: Option<HttpDeferred> = if left == 0 {
+                            done_ctl.end.lock().unwrap().take()
+                        } else {
+                            None
                         };
+                        if let Some(d) = end {
+                            if done_ctl.failed.load(Ordering::Relaxed) {
+                                d.reply(HttpResponse::new(500));
+                            } else {
+                                d.reply(HttpResponse::new(200));
+                            }
+                        }
+                    };
                     if now < k {
                         // Below depth: float the write, keep reading.
-                        fs.pwritev2_from(
-                            who,
-                            file.clone(),
-                            &req.body,
-                            at,
-                            RwFlags::empty(),
-                            cont,
-                        );
+                        fs.pwritev2_from(who, file.clone(), &req.body, at, RwFlags::empty(), cont);
                         HttpVerdict::Continue
                     } else {
-                        // At depth: same write, but brake the stream until
-                        // a completion frees a slot.
+                        // At depth: same write, but brake the stream until a completion frees a slot.
                         let (d, permit, body) = req.defer_stream();
                         *ctl.parked.lock().unwrap() = Some(d);
-                        fs.pwritev2_from(
-                            who,
-                            file.clone(),
-                            &body,
-                            at,
-                            RwFlags::empty(),
-                            cont,
-                        );
+                        fs.pwritev2_from(who, file.clone(), &body, at, RwFlags::empty(), cont);
                         HttpVerdict::Defer(permit)
                     }
                 }
                 Stage::End => {
                     if ctl.inflight.load(Ordering::Relaxed) == 0 {
-                        let code = if ctl.failed.load(Ordering::Relaxed) {
-                            500
-                        } else {
-                            200
-                        };
+                        let code = if ctl.failed.load(Ordering::Relaxed) { 500 } else { 200 };
                         return HttpVerdict::Respond(HttpResponse::new(code));
                     }
                     let (deferred, permit) = req.defer();
@@ -1527,8 +1321,7 @@ fn pipelined_put_cost(
         pool_size: conns as u32,
         fs_ops: 64,
         max_request_bytes: 512 * 1024,
-        // `None`, so an undersized ring shows as allocations; parking
-        // would hide it.
+        // `None`, so an undersized ring shows as allocations; parking would hide it.
         recv_lease_depth: PIPE_LEASE_DEPTH,
         recv_shortage_retry: None,
         ..ServerConfig::default()
@@ -1580,24 +1373,18 @@ fn pipelined_put_cost(
     assert!(s.recv_bufs_total > 0, "no ring: {s:?}");
     assert_eq!(s.recv_bufs_lent, 0, "leases not returned: {s:?}");
     let want = vec![0xc3u8; mib * 1024 * 1024];
-    let ok = (0..conns).all(|i| {
-        std::fs::read(dir.join(format!("obj{i}"))).expect("read back") == want
-    });
+    let ok = (0..conns).all(|i| std::fs::read(dir.join(format!("obj{i}"))).expect("read back") == want);
     let peak = peak_seen.load(Ordering::Relaxed);
     Some((cost, ok, peak))
 }
 
-/// A depth-2 pipelined PUT overlaps a window's write with the next window's
-/// arrival, copies nothing, allocates nothing per window, and the files
-/// come back byte-identical.
+/// A depth-2 pipelined PUT overlaps a window's write with the next window's arrival, copies nothing, allocates nothing
+/// per window, and the files come back byte-identical.
 ///
-/// The peak-in-flight watermark is what proves the overlap is real: at
-/// depth 1 it cannot exceed one, at depth 2 the loopback client outruns the
-/// io-wq write punt and the watermark reaches two. The allocation scaling
-/// run is what proves the ring covered the depth - past the registration
-/// wall connections degrade to owned buffers and every window costs a
-/// copy, which is exactly what the depth-sized registration exists to
-/// prevent.
+/// The peak-in-flight watermark is what proves the overlap is real: at depth 1 it cannot exceed one, at depth 2 the
+/// loopback client outruns the io-wq write punt and the watermark reaches two. The allocation scaling run is what
+/// proves the ring covered the depth - past the registration wall connections degrade to owned buffers and every window
+/// costs a copy, which is exactly what the depth-sized registration exists to prevent.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_pipelined_put_overlaps_writes_with_arrivals() {
@@ -1634,19 +1421,12 @@ struct GatherCtl {
     end: std::sync::Mutex<Option<truenas_ros::http::HttpDeferred>>,
 }
 
-/// Upload `mib` MiB on `conns` connections, every window held with
-/// `lease_window` and written `g` at a time with one `pwritev2_leased`,
-/// braking the stream once held and in-flight windows reach `cap`.
-/// Answers (large allocations, all files matched, gathered writes,
-/// windows that could not be leased).
+/// Upload `mib` MiB on `conns` connections, every window held with `lease_window` and written `g` at a time with one
+/// `pwritev2_leased`, braking the stream once held and in-flight windows reach `cap`. Answers (large allocations, all
+/// files matched, gathered writes, windows that could not be leased).
 #[cfg(feature = "uring-fs")]
 #[allow(clippy::too_many_lines)]
-fn gathered_put_cost(
-    mib: usize,
-    conns: usize,
-    g: usize,
-    cap: usize,
-) -> Option<(usize, bool, usize, usize)> {
+fn gathered_put_cost(mib: usize, conns: usize, g: usize, cap: usize) -> Option<(usize, bool, usize, usize)> {
     use std::sync::OnceLock;
     use truenas_ros::http::HttpDeferred;
     use truenas_ros::uring_fs::{File, LeasedWindow, Personality, RwFlags};
@@ -1672,14 +1452,8 @@ fn gathered_put_cost(
         thread::scope(|sc| {
             sc.spawn(move || {
                 for i in 0..conns {
-                    let name =
-                        std::ffi::CString::new(format!("obj{i}")).unwrap();
-                    let r = handle.open(
-                        who,
-                        &anchor,
-                        name.as_c_str(),
-                        OpenHow::new().flags(OFlag::O_WRONLY),
-                    );
+                    let name = std::ffi::CString::new(format!("obj{i}")).unwrap();
+                    let r = handle.open(who, &anchor, name.as_c_str(), OpenHow::new().flags(OFlag::O_WRONLY));
                     let _ = ftx.send(r);
                 }
                 stop_fs.shutdown();
@@ -1691,8 +1465,7 @@ fn gathered_put_cost(
             .collect()
     };
 
-    let pers: std::sync::Arc<OnceLock<Personality>> =
-        std::sync::Arc::new(OnceLock::new());
+    let pers: std::sync::Arc<OnceLock<Personality>> = std::sync::Arc::new(OnceLock::new());
     let pc = std::sync::Arc::clone(&pers);
     let gathers = std::sync::Arc::new(AtomicUsize::new(0));
     let gathers_out = std::sync::Arc::clone(&gathers);
@@ -1702,15 +1475,12 @@ fn gathered_put_cost(
 
     // (next window's offset, first held window's offset, held, ctl, file)
     type St = (u64, u64, Vec<LeasedWindow>, std::sync::Arc<GatherCtl>, File);
-    // One completion per gathered write of `n` windows: give their claims
-    // back, wake the brake, and settle End once the last write landed.
+    // One completion per gathered write of `n` windows: give their claims back, wake the brake, and settle End once the
+    // last write landed.
     fn landed(
         ctl: std::sync::Arc<GatherCtl>,
         n: usize,
-    ) -> impl FnOnce(
-        truenas_ros::uring_fs::FsDone,
-        &mut truenas_ros::uring_fs::FsConn<'_>,
-    ) + 'static {
+    ) -> impl FnOnce(truenas_ros::uring_fs::FsDone, &mut truenas_ros::uring_fs::FsConn<'_>) + 'static {
         move |done, _fs| {
             if done.result().is_err() {
                 ctl.failed.store(true, Ordering::Relaxed);
@@ -1725,11 +1495,7 @@ fn gathered_put_cost(
                 None
             };
             if let Some(d) = end {
-                let code = if ctl.failed.load(Ordering::Relaxed) {
-                    500
-                } else {
-                    200
-                };
+                let code = if ctl.failed.load(Ordering::Relaxed) { 500 } else { 200 };
                 d.reply(HttpResponse::new(code));
             }
         }
@@ -1769,8 +1535,7 @@ fn gathered_put_cost(
                     // Decide the brake before `defer_stream` takes `req`.
                     let full = held.len() + 1 == g;
                     let held_next = if full { 0 } else { held.len() + 1 };
-                    let flying_next = ctl.flying.load(Ordering::Relaxed)
-                        + if full { g } else { 0 };
+                    let flying_next = ctl.flying.load(Ordering::Relaxed) + if full { g } else { 0 };
                     let (body, verdict) = if held_next + flying_next >= cap {
                         let (d, permit, body) = req.defer_stream();
                         *ctl.parked.lock().unwrap() = Some(d);
@@ -1781,8 +1546,8 @@ fn gathered_put_cost(
                     let at = *off;
                     *off += body.len() as u64;
                     let Some(window) = fs.lease_window(&body) else {
-                        // Not leasable: write the held run and this window
-                        // on copies, so the file still comes out whole.
+                        // Not leasable: write the held run and this window on copies, so the file still comes out
+                        // whole.
                         copied.fetch_add(1, Ordering::Relaxed);
                         if !held.is_empty() {
                             let n = held.len();
@@ -1828,9 +1593,7 @@ fn gathered_put_cost(
                 Stage::End => {
                     if !held.is_empty() {
                         let Some(mut fs) = fs else {
-                            return HttpVerdict::Respond(HttpResponse::new(
-                                500,
-                            ));
+                            return HttpVerdict::Respond(HttpResponse::new(500));
                         };
                         let who = *pc.get().expect("personality set");
                         let n = held.len();
@@ -1846,11 +1609,7 @@ fn gathered_put_cost(
                         );
                     }
                     if ctl.flying.load(Ordering::Relaxed) == 0 {
-                        let code = if ctl.failed.load(Ordering::Relaxed) {
-                            500
-                        } else {
-                            200
-                        };
+                        let code = if ctl.failed.load(Ordering::Relaxed) { 500 } else { 200 };
                         return HttpVerdict::Respond(HttpResponse::new(code));
                     }
                     let (deferred, permit) = req.defer();
@@ -1919,9 +1678,7 @@ fn gathered_put_cost(
     assert!(s.recv_bufs_total > 0, "no ring: {s:?}");
     assert_eq!(s.recv_bufs_lent, 0, "leases not returned: {s:?}");
     let want = vec![0x5au8; mib * 1024 * 1024];
-    let ok = (0..conns).all(|i| {
-        std::fs::read(dir.join(format!("obj{i}"))).expect("read back") == want
-    });
+    let ok = (0..conns).all(|i| std::fs::read(dir.join(format!("obj{i}"))).expect("read back") == want);
     Some((
         cost,
         ok,
@@ -1930,23 +1687,17 @@ fn gathered_put_cost(
     ))
 }
 
-/// Windows held across deliveries and written `g` at a time copy nothing,
-/// allocate nothing per window, and return every buffer. That each gather
-/// is one `WRITEV` is the unit test's
-/// (`a_gathered_write_returns_each_buffer_once`).
+/// Windows held across deliveries and written `g` at a time copy nothing, allocate nothing per window, and return every
+/// buffer. That each gather is one `WRITEV` is the unit test's (`a_gathered_write_returns_each_buffer_once`).
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_gathered_put_writes_held_windows_without_copying_them() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
     let (conns, g, cap) = (2, 2, 4);
-    let Some((small, ok_small, _, copied_small)) =
-        gathered_put_cost(4, conns, g, cap)
-    else {
+    let Some((small, ok_small, _, copied_small)) = gathered_put_cost(4, conns, g, cap) else {
         return; // io_uring unavailable
     };
-    let Some((large, ok_large, gathers, copied_large)) =
-        gathered_put_cost(16, conns, g, cap)
-    else {
+    let Some((large, ok_large, gathers, copied_large)) = gathered_put_cost(16, conns, g, cap) else {
         return;
     };
     assert!(ok_small && ok_large, "file bytes differ");
@@ -1963,8 +1714,7 @@ fn a_gathered_put_writes_held_windows_without_copying_them() {
     );
 }
 
-/// The exhaustion runs' lease depth, stated so their wall does not move
-/// with the default.
+/// The exhaustion runs' lease depth, stated so their wall does not move with the default.
 #[cfg(feature = "uring-fs")]
 const EXHAUSTION_LEASE_DEPTH: u32 = 4;
 
@@ -1976,8 +1726,8 @@ const ROOMY_FS_OPS: u32 = 64;
 #[cfg(feature = "uring-fs")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Gate {
-    /// The recv ring at its bound: reads parked on the retry backoff, or,
-    /// with the knob off, every buffer the ring can hold lent.
+    /// The recv ring at its bound: reads parked on the retry backoff, or, with the knob off, every buffer the ring can
+    /// hold lent.
     RingBound,
     /// A leased write refused for the full op table.
     Refusal,
@@ -1994,28 +1744,20 @@ struct Exhaustion {
     cost: usize,
     /// Bytes the FIFO drained.
     got: u64,
-    /// Every upload answered - 200, unless the run refuses writes - and
-    /// every written byte drained.
+    /// Every upload answered - 200, unless the run refuses writes - and every written byte drained.
     ok: bool,
 }
 
-/// Upload on `conns` connections into ONE FIFO, floating every window's
-/// write with `Continue` and never braking - so leases pile until the pipe
-/// blocks the writes and the recv ring hits its registered bound. What
-/// happens next is `recv_shortage_retry`'s to decide, and this measures it:
-/// returns (shortage parks, large allocations, bytes drained, all 200s).
+/// Upload on `conns` connections into ONE FIFO, floating every window's write with `Continue` and never braking - so
+/// leases pile until the pipe blocks the writes and the recv ring hits its registered bound. What happens next is
+/// `recv_shortage_retry`'s to decide, and this measures it: returns (shortage parks, large allocations, bytes drained,
+/// all 200s).
 ///
-/// The test thread holds the FIFO's read end and does NOT drain until the
-/// run reaches its gate (parks observed, or every client byte written), so
-/// exhaustion is a phase the run provably enters, not a race it may dodge.
+/// The test thread holds the FIFO's read end and does NOT drain until the run reaches its gate (parks observed, or
+/// every client byte written), so exhaustion is a phase the run provably enters, not a race it may dodge.
 #[cfg(feature = "uring-fs")]
 #[allow(clippy::too_many_lines)]
-fn exhaustion_run(
-    retry: Option<Duration>,
-    per_conn: usize,
-    fs_ops: u32,
-    gate: Gate,
-) -> Option<Exhaustion> {
+fn exhaustion_run(retry: Option<Duration>, per_conn: usize, fs_ops: u32, gate: Gate) -> Option<Exhaustion> {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::sync::OnceLock;
     use std::sync::atomic::AtomicBool;
@@ -2025,32 +1767,26 @@ fn exhaustion_run(
     let tmp = truenas_ros::tempdir().expect("tempdir");
     let dir = tmp.path().to_owned();
     let fifo = dir.join("sink");
-    let cpath =
-        std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
     // SAFETY: a plain mkfifo(3) on a path this test owns.
     assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
-    // Hold the read end (nonblocking, so this open never waits and the
-    // drain loop can poll a stop flag) BEFORE the server opens the write
-    // end - a FIFO O_WRONLY open blocks until a reader exists.
+    // Hold the read end (nonblocking, so this open never waits and the drain loop can poll a stop flag) BEFORE the
+    // server opens the write end - a FIFO O_WRONLY open blocks until a reader exists.
     // SAFETY: open(3) of the fifo just created; the fd is owned below.
-    let rfd = unsafe {
-        libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK)
-    };
+    let rfd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
     assert!(rfd >= 0, "open fifo read end");
     // SAFETY: `rfd` was just returned by open and is owned by nothing else.
     let read_end = unsafe { OwnedFd::from_raw_fd(rfd) };
-    // One page of capacity: the first probe write fills it and every write
-    // after that BLOCKS in io-wq, holding its window's lease, until the
-    // drain makes room - which is the pinning this whole fixture exists
-    // for. SAFETY: fcntl(2) on the fd owned just above.
+    // One page of capacity: the first probe write fills it and every write after that BLOCKS in io-wq, holding its
+    // window's lease, until the drain makes room - which is the pinning this whole fixture exists for. SAFETY: fcntl(2)
+    // on the fd owned just above.
     assert!(
         unsafe { libc::fcntl(rfd, libc::F_SETPIPE_SZ, 4096) } >= 4096,
         "shrink fifo"
     );
 
     let conns = 2usize;
-    // Pre-open the FIFO's write end through a standalone host, exactly as
-    // a handler's destination file would be.
+    // Pre-open the FIFO's write end through a standalone host, exactly as a handler's destination file would be.
     let sink: File = {
         use truenas_ros::sync_fs::{OFlag, OpenHow};
         use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
@@ -2067,12 +1803,7 @@ fn exhaustion_run(
         thread::scope(|sc| {
             sc.spawn(move || {
                 let name = std::ffi::CString::new("sink").unwrap();
-                let r = handle.open(
-                    who,
-                    &anchor,
-                    name.as_c_str(),
-                    OpenHow::new().flags(OFlag::O_WRONLY),
-                );
+                let r = handle.open(who, &anchor, name.as_c_str(), OpenHow::new().flags(OFlag::O_WRONLY));
                 let _ = ftx.send(r);
                 stop_fs.shutdown();
             });
@@ -2081,8 +1812,7 @@ fn exhaustion_run(
         frx.recv().expect("open outcome").expect("open fifo")
     };
 
-    let pers: std::sync::Arc<OnceLock<Personality>> =
-        std::sync::Arc::new(OnceLock::new());
+    let pers: std::sync::Arc<OnceLock<Personality>> = std::sync::Arc::new(OnceLock::new());
     let pc = std::sync::Arc::clone(&pers);
 
     type St = (std::sync::Arc<PipeCtl>, File);
@@ -2119,71 +1849,46 @@ fn exhaustion_run(
                     let done_ctl = std::sync::Arc::clone(ctl);
                     let done_written = std::sync::Arc::clone(&written_in);
                     let done_refused = std::sync::Arc::clone(&refused_in);
-                    let cont =
-                        move |done: truenas_ros::uring_fs::FsDone,
-                              _fs: &mut truenas_ros::uring_fs::FsConn<
-                                  '_,
-                              >| {
-                            if done.was_refused() {
-                                done_refused.fetch_add(1, Ordering::Relaxed);
+                    let cont = move |done: truenas_ros::uring_fs::FsDone,
+                                     _fs: &mut truenas_ros::uring_fs::FsConn<'_>| {
+                        if done.was_refused() {
+                            done_refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        match done.result() {
+                            Err(_) => done_ctl.failed.store(true, Ordering::Relaxed),
+                            Ok(n) => {
+                                done_written.fetch_add(n as u64, Ordering::Relaxed);
                             }
-                            match done.result() {
-                                Err(_) => done_ctl
-                                    .failed
-                                    .store(true, Ordering::Relaxed),
-                                Ok(n) => {
-                                    done_written.fetch_add(
-                                        n as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                }
-                            }
-                            let left = done_ctl
-                                .inflight
-                                .fetch_sub(1, Ordering::Relaxed)
-                                - 1;
-                            let end: Option<HttpDeferred> = if left == 0 {
-                                done_ctl.end.lock().unwrap().take()
-                            } else {
-                                None
-                            };
-                            if let Some(d) = end {
-                                if done_ctl.failed.load(Ordering::Relaxed) {
-                                    d.reply(HttpResponse::new(500));
-                                } else {
-                                    d.reply(HttpResponse::new(200));
-                                }
-                            }
+                        }
+                        let left = done_ctl.inflight.fetch_sub(1, Ordering::Relaxed) - 1;
+                        let end: Option<HttpDeferred> = if left == 0 {
+                            done_ctl.end.lock().unwrap().take()
+                        } else {
+                            None
                         };
-                    // Float EVERY window - no depth cap - and write only
-                    // its first page: a pipe write of at most PIPE_BUF is
-                    // atomic (all-or-block, pipe(7)), so it can never
-                    // complete short and trip the leased-write EIO rule,
-                    // while an in-bounds subrange still holds the WHOLE
-                    // window's lease until the pipe makes room. The FIFO
-                    // blocks the writes, the leases pile up: exactly the
-                    // pipelined-ingest shape that can reach the ring's
+                        if let Some(d) = end {
+                            if done_ctl.failed.load(Ordering::Relaxed) {
+                                d.reply(HttpResponse::new(500));
+                            } else {
+                                d.reply(HttpResponse::new(200));
+                            }
+                        }
+                    };
+                    // Float EVERY window - no depth cap - and write only its first page: a pipe write of at most
+                    // PIPE_BUF is atomic (all-or-block, pipe(7)), so it can never complete short and trip the
+                    // leased-write EIO rule, while an in-bounds subrange still holds the WHOLE window's lease until the
+                    // pipe makes room. The FIFO blocks the writes, the leases pile up: exactly the pipelined-ingest
+                    // shape that can reach the ring's
                     // registered bound. A stream write has no position;
-                    // `u64::MAX` is the no-offset sentinel the kernel
-                    // maps to f_pos (`io_kiocb_update_pos`, io_uring/rw.c).
+                    // `u64::MAX` is the no-offset sentinel the kernel maps to f_pos (`io_kiocb_update_pos`,
+                    // io_uring/rw.c).
                     let probe = 4096.min(req.body.len());
-                    fs.pwritev2_from(
-                        who,
-                        file.clone(),
-                        &req.body[..probe],
-                        u64::MAX,
-                        RwFlags::empty(),
-                        cont,
-                    );
+                    fs.pwritev2_from(who, file.clone(), &req.body[..probe], u64::MAX, RwFlags::empty(), cont);
                     HttpVerdict::Continue
                 }
                 Stage::End => {
                     if ctl.inflight.load(Ordering::Relaxed) == 0 {
-                        let code = if ctl.failed.load(Ordering::Relaxed) {
-                            500
-                        } else {
-                            200
-                        };
+                        let code = if ctl.failed.load(Ordering::Relaxed) { 500 } else { 200 };
                         return HttpVerdict::Respond(HttpResponse::new(code));
                     }
                     let (deferred, permit) = req.defer();
@@ -2226,14 +1931,11 @@ fn exhaustion_run(
     let drained = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stop_drain = std::sync::Arc::new(AtomicBool::new(false));
 
-    // The drain: parked until the run PROVABLY exhausts the ring - parks
-    // observed when the knob is on, the lent gauge pinned at the ring's
-    // registered bound when it is off, a write refused for the full table
-    // in a refusal run - then empties the FIFO so the
-    // writes, and with them the leases, come home. Without the gate a fast
-    // drain lets the leases cycle and the run never enters the phase under
-    // test, so its assertions would hold vacuously. The bound is the pool's
-    // demand: the lease depth plus the arriving message, per connection.
+    // The drain: parked until the run PROVABLY exhausts the ring - parks observed when the knob is on, the lent gauge
+    // pinned at the ring's registered bound when it is off, a write refused for the full table in a refusal run - then
+    // empties the FIFO so the writes, and with them the leases, come home. Without the gate a fast drain lets the
+    // leases cycle and the run never enters the phase under test, so its assertions would hold vacuously. The bound is
+    // the pool's demand: the lease depth plus the arriving message, per connection.
     let ring_bound = conns as u32 * (EXHAUSTION_LEASE_DEPTH + 1);
     let gate_on_parks = retry.is_some();
     let d_count = std::sync::Arc::clone(&drained);
@@ -2256,8 +1958,7 @@ fn exhaustion_run(
         let mut buf = vec![0u8; 64 * 1024];
         while !d_stop.load(Ordering::Relaxed) {
             // SAFETY: reading the owned nonblocking fd into a live buffer.
-            let n =
-                unsafe { libc::read(rfd, buf.as_mut_ptr().cast(), buf.len()) };
+            let n = unsafe { libc::read(rfd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 d_count.fetch_add(n as u64, Ordering::Relaxed);
             } else {
@@ -2283,8 +1984,7 @@ fn exhaustion_run(
                 thread::spawn(move || upload(&wire))
             })
             .collect();
-        // A refused window fails its upload, answered from its last
-        // completion.
+        // A refused window fails its upload, answered from its last completion.
         let ok = uploads.into_iter().all(|u| {
             let status = u.join().expect("upload thread");
             status == 200 || (gate == Gate::Refusal && status == 500)
@@ -2296,13 +1996,11 @@ fn exhaustion_run(
 
     server.serve_forever().expect("serve_forever");
     let (cost, ok) = client.join().expect("client thread");
-    // Every page the handler's writes reported must come out of the FIFO
-    // before the drain stops (the responses settled, so the writes did).
+    // Every page the handler's writes reported must come out of the FIFO before the drain stops (the responses settled,
+    // so the writes did).
     let total = written.load(Ordering::Relaxed);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while drained.load(Ordering::Relaxed) < total
-        && std::time::Instant::now() < deadline
-    {
+    while drained.load(Ordering::Relaxed) < total && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
     stop_drain.store(true, Ordering::Relaxed);
@@ -2324,30 +2022,22 @@ fn exhaustion_run(
     })
 }
 
-/// Genuine pool exhaustion with `recv_shortage_retry` set parks the reads
-/// instead of falling back to owned buffers: the uploads stall against TCP
-/// until the FIFO drains, then complete intact - and the cost stays FLAT
-/// when the upload doubles, because a parked read allocates nothing while
-/// it waits and resumes against pool buffers when they come home. (An
-/// absolute zero is not the law here: the run's baseline - the pool
-/// growing to its registered bound, the fixture's own buffers - is a
-/// constant, and the feature's claim is the absence of per-window cost on
-/// top of it.) The parks counter is the proof each run actually entered
-/// exhaustion rather than dodging it.
+/// Genuine pool exhaustion with `recv_shortage_retry` set parks the reads instead of falling back to owned buffers: the
+/// uploads stall against TCP until the FIFO drains, then complete intact - and the cost stays FLAT when the upload
+/// doubles, because a parked read allocates nothing while it waits and resumes against pool buffers when they come
+/// home. (An absolute zero is not the law here: the run's baseline - the pool growing to its registered bound, the
+/// fixture's own buffers - is a constant, and the feature's claim is the absence of per-window cost on top of it.) The
+/// parks counter is the proof each run actually entered exhaustion rather than dodging it.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn exhaustion_parks_reads_instead_of_allocating() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
     let retry = Some(Duration::from_millis(2));
-    // 12 and 24 windows a connection, both past the wall of 10 two
-    // connections hold between them.
-    let Some(one) =
-        exhaustion_run(retry, 1536 * 1024, ROOMY_FS_OPS, Gate::RingBound)
-    else {
+    // 12 and 24 windows a connection, both past the wall of 10 two connections hold between them.
+    let Some(one) = exhaustion_run(retry, 1536 * 1024, ROOMY_FS_OPS, Gate::RingBound) else {
         return; // io_uring unavailable here
     };
-    let two = exhaustion_run(retry, 3072 * 1024, ROOMY_FS_OPS, Gate::RingBound)
-        .expect("second run");
+    let two = exhaustion_run(retry, 3072 * 1024, ROOMY_FS_OPS, Gate::RingBound).expect("second run");
     assert!(
         one.ok && two.ok,
         "uploads failed or bytes lost ({}, {})",
@@ -2369,26 +2059,21 @@ fn exhaustion_parks_reads_instead_of_allocating() {
     );
 }
 
-/// The configurable control: `None` keeps the old answer - fall back to
-/// owned buffers and keep every connection moving - so the same uploads
-/// complete without a single park.
+/// The configurable control: `None` keeps the old answer - fall back to owned buffers and keep every connection
+/// moving - so the same uploads complete without a single park.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn exhaustion_without_the_knob_completes_without_parking() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(run) =
-        exhaustion_run(None, 1536 * 1024, ROOMY_FS_OPS, Gate::RingBound)
-    else {
+    let Some(run) = exhaustion_run(None, 1536 * 1024, ROOMY_FS_OPS, Gate::RingBound) else {
         return; // io_uring unavailable here
     };
     assert!(run.ok, "uploads failed or bytes lost (drained {})", run.got);
     assert_eq!(run.parks, 0, "None must never park");
 }
 
-/// With room in the op table for one handler op, a pipelined upload's
-/// leased writes are refused once the table fills: every upload is still
-/// answered, every byte a write reported lands, and every buffer comes
-/// home once.
+/// With room in the op table for one handler op, a pipelined upload's leased writes are refused once the table fills:
+/// every upload is still answered, every byte a write reported lands, and every buffer comes home once.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_full_op_table_refuses_leased_writes_and_returns_their_buffers() {
@@ -2407,9 +2092,8 @@ fn a_full_op_table_refuses_leased_writes_and_returns_their_buffers() {
 
 // ---- the buffered side: placed bodies cycle through the recycler ----------
 
-/// N large buffered bodies on one connection, the handler recycling each
-/// delivered `Vec`, or with `take` false reading each where it lies. The
-/// count of large allocations is the return value.
+/// N large buffered bodies on one connection, the handler recycling each delivered `Vec`, or with `take` false reading
+/// each where it lies. The count of large allocations is the return value.
 fn buffered_cost(messages: usize, take: bool) -> Option<usize> {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -2422,22 +2106,20 @@ fn buffered_cost(messages: usize, take: bool) -> Option<usize> {
     };
     let cfg = ServerConfig {
         pool_size: 8,
-        // The reactor must admit what the codec admits, or an over-cap
-        // body dies on a raw close with no HTTP response.
+        // The reactor must admit what the codec admits, or an over-cap body dies on a raw close with no HTTP response.
         max_request_bytes: http.min_request_bytes(),
         ..ServerConfig::default()
     };
-    // Filled after the server exists; the handler runs on this same
-    // thread, so the cell is never read before serve_forever fills it.
+    // Filled after the server exists; the handler runs on this same thread, so the cell is never read before
+    // serve_forever fills it.
     let seam: Rc<RefCell<Option<BodyRecycler>>> = Rc::new(RefCell::new(None));
     let handler_seam = Rc::clone(&seam);
     let proto = protocol_deferrable(
         http,
         |_i: Incoming<'_>| Some(0usize),
         move |mut req: HttpRequest<'_>, _: &mut usize| {
-            // What a consumer does: own the body for its parse, then hand
-            // the storage home. Or read it where it lies, and leave the
-            // storage to go home as the body drops.
+            // What a consumer does: own the body for its parse, then hand the storage home. Or read it where it lies,
+            // and leave the storage to go home as the body drops.
             let n = req.body.len();
             if take {
                 let body = req.body.take();
@@ -2445,9 +2127,7 @@ fn buffered_cost(messages: usize, take: bool) -> Option<usize> {
                     r.recycle(body);
                 }
             }
-            HttpVerdict::Respond(
-                HttpResponse::new(200).header("x-bytes", n.to_string()),
-            )
+            HttpVerdict::Respond(HttpResponse::new(200).header("x-bytes", n.to_string()))
         },
     )
     .expect("codec config is valid");
@@ -2459,17 +2139,13 @@ fn buffered_cost(messages: usize, take: bool) -> Option<usize> {
         Err(e) => panic!("bind: {e}"),
     };
     *seam.borrow_mut() = server.body_recycler();
-    assert!(
-        seam.borrow().is_some(),
-        "a server always carries a body pool"
-    );
+    assert!(seam.borrow().is_some(), "a server always carries a body pool");
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
     let stop = server.shutdown_handle();
 
-    // Over one pool buffer, so every body takes the placement path the
-    // pool serves; under max_body, so none is refused.
+    // Over one pool buffer, so every body takes the placement path the pool serves; under max_body, so none is refused.
     let payload = vec![0x5au8; 1024 * 1024];
     let mut one = format!(
         "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
@@ -2499,13 +2175,10 @@ fn buffered_cost(messages: usize, take: bool) -> Option<usize> {
     Some(client.join().expect("client thread"))
 }
 
-/// The first recycle already licenses reuse: the licence is potted
-/// before the handler runs, so message 2 serves from message 1's
-/// recycled storage. Potted after the handler instead, message 1's
-/// recycle found an empty pot and freed, and message 2 allocated
-/// afresh - the pool bootstrapped one message late in the fast case,
-/// and never at all for bodies spaced past a maintenance window,
-/// where the zeroed pot ate the licence between messages every time.
+/// The first recycle already licenses reuse: the licence is potted before the handler runs, so message 2 serves from
+/// message 1's recycled storage. Potted after the handler instead, message 1's recycle found an empty pot and freed,
+/// and message 2 allocated afresh - the pool bootstrapped one message late in the fast case, and never at all for
+/// bodies spaced past a maintenance window, where the zeroed pot ate the licence between messages every time.
 #[test]
 fn the_first_recycle_licenses_the_second_message() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
@@ -2528,12 +2201,10 @@ fn the_first_recycle_licenses_the_second_message() {
 
 /// A recycled buffered body must not cost an allocation per message.
 ///
-/// The first body is a miss and allocates; every later one on the
-/// connection reuses that storage through the ring's body pool. Comparing
-/// two run lengths rather than asserting an absolute keeps the fixed setup
-/// cost out of the verdict, as the streaming twin above does. Before the
-/// pool, each message minted its `Vec` afresh and the difference read as
-/// the message count.
+/// The first body is a miss and allocates; every later one on the connection reuses that storage through the ring's
+/// body pool. Comparing two run lengths rather than asserting an absolute keeps the fixed setup cost out of the
+/// verdict, as the streaming twin above does. Before the pool, each message minted its `Vec` afresh and the difference
+/// read as the message count.
 #[test]
 fn a_recycled_buffered_body_does_not_allocate_per_message() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
@@ -2543,8 +2214,8 @@ fn a_recycled_buffered_body_does_not_allocate_per_message() {
     let Some(large) = buffered_cost(16, true) else {
         return;
     };
-    // Twelve more messages: a per-message allocation puts ~12 between the
-    // runs; reuse leaves the two within slack of each other.
+    // Twelve more messages: a per-message allocation puts ~12 between the runs; reuse leaves the two within slack of
+    // each other.
     assert!(
         large <= small + 4,
         "buffered-body cost scales with the message count: 4 messages cost \
@@ -2553,10 +2224,9 @@ fn a_recycled_buffered_body_does_not_allocate_per_message() {
     );
 }
 
-/// A buffered body the handler reads where it lies and never takes must
-/// not cost an allocation per message either. Its storage goes back to the
-/// ring's body pool as the body drops, and the next one is placed in it.
-/// Freed instead, every message placed into fresh storage.
+/// A buffered body the handler reads where it lies and never takes must not cost an allocation per message either. Its
+/// storage goes back to the ring's body pool as the body drops, and the next one is placed in it. Freed instead, every
+/// message placed into fresh storage.
 #[test]
 fn an_untaken_buffered_body_does_not_allocate_per_message() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
@@ -2587,32 +2257,26 @@ enum Sent {
     Plain,
 }
 
-/// Answer `warmup` then `measured` requests on one connection, each reply
-/// built in storage claimed from the ring's body pool and sent as `sent`
-/// says, and return how many large allocations the measured replies cost.
+/// Answer `warmup` then `measured` requests on one connection, each reply built in storage claimed from the ring's body
+/// pool and sent as `sent` says, and return how many large allocations the measured replies cost.
 fn reply_cost(warmup: usize, measured: usize, sent: Sent) -> Option<usize> {
     use std::cell::RefCell;
     use std::rc::Rc;
     use truenas_ros::net::server::{
-        BodyRecycler, Endian, PrefixWidth, Protocol, Request, Response,
-        SendBuf, length_prefix_header,
+        BodyRecycler, Endian, PrefixWidth, Protocol, Request, Response, SendBuf, length_prefix_header,
     };
 
     // Past `MED`, so each claim the pool cannot serve is counted.
     const ROOM: usize = 4 * 1024;
     const ANSWER: &[u8] = b"answered";
 
-    // Filled after the server exists. The handler runs on this same
-    // thread, so the cell is never read before serve_forever fills it.
+    // Filled after the server exists. The handler runs on this same thread, so the cell is never read before
+    // serve_forever fills it.
     let seam: Rc<RefCell<Option<BodyRecycler>>> = Rc::new(RefCell::new(None));
     let handler_seam = Rc::clone(&seam);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
             let mut reply = handler_seam
                 .borrow()
@@ -2647,10 +2311,7 @@ fn reply_cost(warmup: usize, measured: usize, sent: Sent) -> Option<usize> {
         Err(e) => panic!("bind: {e}"),
     };
     *seam.borrow_mut() = server.body_recycler();
-    assert!(
-        seam.borrow().is_some(),
-        "a server always carries a body pool"
-    );
+    assert!(seam.borrow().is_some(), "a server always carries a body pool");
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -2683,14 +2344,12 @@ fn reply_cost(warmup: usize, measured: usize, sent: Sent) -> Option<usize> {
     Some(client.join().expect("client thread"))
 }
 
-/// A reply built in storage claimed from the ring's body pool, and marked as
-/// the pool's, must not cost an allocation per reply, whether it is given
-/// inline or through a `Deferred`.
+/// A reply built in storage claimed from the ring's body pool, and marked as the pool's, must not cost an allocation
+/// per reply, whether it is given inline or through a `Deferred`.
 ///
-/// Its storage goes home once sent, and the next claim reuses it. The same
-/// replies sent plain are freed once sent, so every claim allocates again.
-/// That shows the count sees a reply's storage, and that storage no one
-/// marked never reaches the pool.
+/// Its storage goes home once sent, and the next claim reuses it. The same replies sent plain are freed once sent, so
+/// every claim allocates again. That shows the count sees a reply's storage, and that storage no one marked never
+/// reaches the pool.
 #[test]
 fn a_reply_claimed_from_the_pool_does_not_allocate_per_reply() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
@@ -2701,8 +2360,7 @@ fn a_reply_claimed_from_the_pool_does_not_allocate_per_reply() {
         let Some(many) = reply_cost(8, 64, sent) else {
             return;
         };
-        // Sixty more replies, so one allocation a reply puts about sixty
-        // between the runs.
+        // Sixty more replies, so one allocation a reply puts about sixty between the runs.
         assert!(
             many <= few + 4,
             "reply cost scales with the replies: 4 cost {few} large \
@@ -2722,33 +2380,26 @@ fn a_reply_claimed_from_the_pool_does_not_allocate_per_reply() {
 
 // ---- storage that reaches no request goes home ----------------------------
 
-/// `rounds` connections, one after another, each claiming a reply's
-/// storage from the ring's body pool, closing itself through a push handle
-/// and only then replying, so the reply marked recycled reaches no request.
-/// The count of large allocations is the return value.
+/// `rounds` connections, one after another, each claiming a reply's storage from the ring's body pool, closing itself
+/// through a push handle and only then replying, so the reply marked recycled reaches no request. The count of large
+/// allocations is the return value.
 fn spilled_cost(rounds: usize) -> Option<usize> {
     use std::cell::RefCell;
     use std::rc::Rc;
     use truenas_ros::net::server::{
-        BodyRecycler, Endian, PrefixWidth, Protocol, Request, Response,
-        length_prefix_header,
+        BodyRecycler, Endian, PrefixWidth, Protocol, Request, Response, length_prefix_header,
     };
 
-    // Past `BIG`, so a claim the pool cannot serve is counted and the
-    // little a connection costs is not.
+    // Past `BIG`, so a claim the pool cannot serve is counted and the little a connection costs is not.
     const ROOM: usize = 256 * 1024;
 
-    // Filled after the server exists. The handler runs on this same
-    // thread, so the cell is never read before serve_forever fills it.
+    // Filled after the server exists. The handler runs on this same thread, so the cell is never read before
+    // serve_forever fills it.
     let seam: Rc<RefCell<Option<BodyRecycler>>> = Rc::new(RefCell::new(None));
     let handler_seam = Rc::clone(&seam);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
             let mut reply = handler_seam
                 .borrow()
@@ -2774,10 +2425,7 @@ fn spilled_cost(rounds: usize) -> Option<usize> {
         Err(e) => panic!("bind: {e}"),
     };
     *seam.borrow_mut() = server.body_recycler();
-    assert!(
-        seam.borrow().is_some(),
-        "a server always carries a body pool"
-    );
+    assert!(seam.borrow().is_some(), "a server always carries a body pool");
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -2803,9 +2451,8 @@ fn spilled_cost(rounds: usize) -> Option<usize> {
     Some(client.join().expect("client thread"))
 }
 
-/// A reply marked recycled whose connection closed before it arrived goes
-/// home as the server drops it, so the next connection's claim reuses its
-/// storage. Freed instead, every round claims fresh storage.
+/// A reply marked recycled whose connection closed before it arrived goes home as the server drops it, so the next
+/// connection's claim reuses its storage. Freed instead, every round claims fresh storage.
 #[test]
 fn a_recycled_reply_that_reaches_no_request_goes_home() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());

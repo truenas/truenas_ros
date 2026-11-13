@@ -17,12 +17,10 @@ struct RawMountAttr {
 }
 
 const MOUNT_ATTR_SIZE_VER0: usize = 32;
-const _: () =
-    assert!(core::mem::size_of::<RawMountAttr>() == MOUNT_ATTR_SIZE_VER0);
+const _: () = assert!(core::mem::size_of::<RawMountAttr>() == MOUNT_ATTR_SIZE_VER0);
 
-/// `MOUNT_ATTR__ATIME` when `attrs` names part of the atime mask, else 0. The
-/// kernel takes an atime change only when the whole mask is in `attr_clr`, and
-/// rejects an atime bit in `attr_set` without it.
+/// `MOUNT_ATTR__ATIME` when `attrs` names part of the atime mask, else 0. The kernel takes an atime change only when
+/// the whole mask is in `attr_clr`, and rejects an atime bit in `attr_set` without it.
 fn atime_mask(attrs: MountAttr) -> u64 {
     if attrs.intersects(MountAttr::__ATIME) {
         MountAttr::__ATIME.bits()
@@ -46,27 +44,24 @@ impl<'fd> MountSetattr<'fd> {
         Self::default()
     }
 
-    /// Set the given attributes. An atime attribute also clears
-    /// [`MountAttr::__ATIME`], which the kernel requires when any atime bit
-    /// appears in `attr_set`; [`Self::atime`] says the same thing plainly.
+    /// Set the given attributes. An atime attribute also clears [`MountAttr::__ATIME`], which the kernel requires when
+    /// any atime bit appears in `attr_set`; [`Self::atime`] says the same thing plainly.
     pub fn set(mut self, attrs: MountAttr) -> Self {
         self.attr_set |= attrs.bits();
         self.attr_clr |= atime_mask(attrs);
         self
     }
 
-    /// Clear the given attributes. Clearing any atime attribute clears the
-    /// whole [`MountAttr::__ATIME`] mask, leaving [`Atime::Relatime`] unless
-    /// an atime attribute is also set.
+    /// Clear the given attributes. Clearing any atime attribute clears the whole [`MountAttr::__ATIME`] mask, leaving
+    /// [`Atime::Relatime`] unless an atime attribute is also set.
     pub fn clear(mut self, attrs: MountAttr) -> Self {
         self.attr_clr |= attrs.bits() | atime_mask(attrs);
         self
     }
 
-    /// Select the atime policy, replacing any already requested. Clears
-    /// [`MountAttr::__ATIME`] and sets just this policy's bits, which is the
-    /// only encoding the kernel accepts - including for [`Atime::Relatime`],
-    /// whose bits are none.
+    /// Select the atime policy, replacing any already requested. Clears [`MountAttr::__ATIME`] and sets just this
+    /// policy's bits, which is the only encoding the kernel accepts - including for [`Atime::Relatime`], whose bits are
+    /// none.
     pub fn atime(mut self, atime: Atime) -> Self {
         self.attr_set &= !MountAttr::__ATIME.bits();
         self.attr_set |= atime as u64;
@@ -80,8 +75,7 @@ impl<'fd> MountSetattr<'fd> {
         self
     }
 
-    /// Idmap the mount to the user namespace `userns` (sets
-    /// [`MountAttr::IDMAP`]).
+    /// Idmap the mount to the user namespace `userns` (sets [`MountAttr::IDMAP`]).
     pub fn idmap(mut self, userns: BorrowedFd<'fd>) -> Self {
         self.attr_set |= MountAttr::IDMAP.bits();
         self.userns = Some(userns);
@@ -91,16 +85,10 @@ impl<'fd> MountSetattr<'fd> {
 
 /// Change the attributes of the mount (or subtree) at (`dirfd`, `path`).
 ///
-/// `flags` accepts `AT_EMPTY_PATH`, `AT_RECURSIVE`, `AT_SYMLINK_NOFOLLOW`, and
-/// `AT_NO_AUTOMOUNT`.
+/// `flags` accepts `AT_EMPTY_PATH`, `AT_RECURSIVE`, `AT_SYMLINK_NOFOLLOW`, and `AT_NO_AUTOMOUNT`.
 ///
 /// See [`mount_setattr(2)`](https://man7.org/linux/man-pages/man2/mount_setattr.2.html).
-pub fn mount_setattr<P, Fd>(
-    dirfd: Fd,
-    path: &P,
-    flags: AtFlags,
-    attr: &MountSetattr<'_>,
-) -> errno::Result<()>
+pub fn mount_setattr<P, Fd>(dirfd: Fd, path: &P, flags: AtFlags, attr: &MountSetattr<'_>) -> errno::Result<()>
 where
     P: ?Sized + TnPath,
     Fd: AsFd,
@@ -144,12 +132,10 @@ mod tests {
         }
         // The mask has a bit no policy uses, so not every value decodes.
         assert!(Atime::try_from(MASK).is_err());
-        assert!(!MountAttr::__ATIME.intersects(
-            MountAttr::RDONLY
-                | MountAttr::NODIRATIME
-                | MountAttr::IDMAP
-                | MountAttr::NOSYMFOLLOW
-        ));
+        assert!(
+            !MountAttr::__ATIME
+                .intersects(MountAttr::RDONLY | MountAttr::NODIRATIME | MountAttr::IDMAP | MountAttr::NOSYMFOLLOW)
+        );
     }
 
     #[test]
@@ -163,19 +149,14 @@ mod tests {
 
     #[test]
     fn atime_replaces_an_earlier_policy() {
-        let a = MountSetattr::new()
-            .atime(Atime::Noatime)
-            .atime(Atime::Relatime);
+        let a = MountSetattr::new().atime(Atime::Noatime).atime(Atime::Relatime);
         assert_eq!(a.attr_set, Atime::Relatime as u64);
         assert_eq!(a.attr_clr, MASK);
 
         let a = MountSetattr::new()
             .set(MountAttr::RDONLY | MountAttr::STRICTATIME)
             .atime(Atime::Noatime);
-        assert_eq!(
-            a.attr_set,
-            MountAttr::RDONLY.bits() | Atime::Noatime as u64
-        );
+        assert_eq!(a.attr_set, MountAttr::RDONLY.bits() | Atime::Noatime as u64);
         assert_eq!(a.attr_clr, MASK);
     }
 

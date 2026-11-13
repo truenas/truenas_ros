@@ -20,12 +20,7 @@ tn_bitflags! {
 /// Unmount the filesystem mounted at `target`.
 ///
 /// See [`umount2(2)`](https://man7.org/linux/man-pages/man2/umount2.2.html).
-pub fn umount2<P: ?Sized + TnPath>(
-    target: &P,
-    flags: MntFlags,
-) -> errno::Result<()> {
-    target.with_tn_path(|c| {
-        retry_on_eintr(|| unsafe { libc::umount2(c.as_ptr(), flags.bits()) })
-    })??;
+pub fn umount2<P: ?Sized + TnPath>(target: &P, flags: MntFlags) -> errno::Result<()> {
+    target.with_tn_path(|c| retry_on_eintr(|| unsafe { libc::umount2(c.as_ptr(), flags.bits()) }))??;
     Ok(())
 }

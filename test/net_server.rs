@@ -1,17 +1,14 @@
-//! Integration tests for the `net::server` module - live loopback echo over
-//! TCP and AF_UNIX with a 4-byte big-endian length-prefix framing, exercising
-//! the full ring path (multishot accept -> recv-header -> frame -> recv-body ->
+//! Integration tests for the `net::server` module - live loopback echo over TCP and AF_UNIX with a 4-byte big-endian
+//! length-prefix framing, exercising the full ring path (multishot accept -> recv-header -> frame -> recv-body ->
 //! handler -> send -> keep-alive).
 //!
-//! Like `test/zfs.rs` and `test/configparser_compat.rs`, these **skip** (return
-//! early) when io_uring is unavailable - the CI/dev sandbox blocks the io_uring
-//! syscalls (ENOSYS/EPERM/EACCES), so `cargo test` stays green in a bare
-//! sandbox. Set `TRUENAS_ROS_REQUIRE_IO_URING=1` (as CI on a real kernel does)
-//! to turn a skip into a hard failure so coverage can't silently vanish.
+//! Like `test/zfs.rs` and `test/configparser_compat.rs`, these **skip** (return early) when io_uring is unavailable -
+//! the CI/dev sandbox blocks the io_uring syscalls (ENOSYS/EPERM/EACCES), so `cargo test` stays green in a bare
+//! sandbox. Set `TRUENAS_ROS_REQUIRE_IO_URING=1` (as CI on a real kernel does) to turn a skip into a hard failure so
+//! coverage can't silently vanish.
 //!
-//! `Server` is `!Send` (its ring is single-thread-owned), so it stays on the
-//! test thread running `serve_forever`; each client runs on a spawned thread and
-//! stops the server via the `Send` [`ShutdownHandle`] when done.
+//! `Server` is `!Send` (its ring is single-thread-owned), so it stays on the test thread running `serve_forever`; each
+//! client runs on a spawned thread and stops the server via the `Send` [`ShutdownHandle`] when done.
 #![cfg(all(target_os = "linux", feature = "net-server"))]
 
 use std::io::{self, Read, Write};
@@ -24,28 +21,22 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use truenas_ros::net::server::{
-    Body, ClientAddr, CloseReason, ControlHandle, DeferPermit, Deferred,
-    Endian, Framing, Incoming, PeerCred, PrefixWidth, Protocol, PushHandle,
-    Request, Responder, Response, Server, ServerAddr, ServerConfig,
-    ShutdownHandle, Spread, StatsHandle, length_prefix_header, length_prefixed,
-    setup_ring,
+    Body, ClientAddr, CloseReason, ControlHandle, DeferPermit, Deferred, Endian, Framing, Incoming, PeerCred,
+    PrefixWidth, Protocol, PushHandle, Request, Responder, Response, Server, ServerAddr, ServerConfig, ShutdownHandle,
+    Spread, StatsHandle, length_prefix_header, length_prefixed, setup_ring,
 };
 use truenas_ros::{Errno, Error};
 
 /// Errors that mean "io_uring is unavailable here" - an environmental skip.
 ///
-/// Deliberately *excludes* `EINVAL`: for io_uring that means the kernel rejected
-/// our setup arguments - a real bug we want to fail on, not skip.
+/// Deliberately *excludes* `EINVAL`: for io_uring that means the kernel rejected our setup arguments - a real bug we
+/// want to fail on, not skip.
 fn is_unavailable(e: &Error) -> bool {
     matches!(
         e,
-        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded
-        // box exhausts it and ring creation fails - environmental, and
-        // the REQUIRE variable turns the skip red where it must not
-        // happen.
-        Error::Errno(
-            Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM
-        )
+        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded box exhausts it and ring creation fails -
+        // environmental, and the REQUIRE variable turns the skip red where it must not happen.
+        Error::Errno(Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM)
     )
 }
 
@@ -60,10 +51,9 @@ fn should_skip(e: &Error) -> bool {
     false
 }
 
-/// `unix_peercred` needs io_uring socket commands on `AF_UNIX` (Linux >=
-/// 6.18.16); on older kernels `with_config`'s startup probe fails with a
-/// validation error. Environmental, like `should_skip` - but force the test
-/// on known-good hosts with `TRUENAS_ROS_REQUIRE_PEERCRED`.
+/// `unix_peercred` needs io_uring socket commands on `AF_UNIX` (Linux >= 6.18.16); on older kernels `with_config`'s
+/// startup probe fails with a validation error. Environmental, like `should_skip` - but force the test on known-good
+/// hosts with `TRUENAS_ROS_REQUIRE_PEERCRED`.
 fn peercred_unsupported(e: &Error) -> bool {
     let unsupported = matches!(e, Error::Validation(m) if m.contains("unix_peercred requires"));
     if unsupported {
@@ -76,8 +66,7 @@ fn peercred_unsupported(e: &Error) -> bool {
     unsupported
 }
 
-/// Frame a payload with a 4-byte BE length prefix so the client can
-/// length-delimit the reply (matches `recv_framed`).
+/// Frame a payload with a 4-byte BE length prefix so the client can length-delimit the reply (matches `recv_framed`).
 fn echo_frame(payload: &[u8]) -> Vec<u8> {
     let mut pdu = (payload.len() as u32).to_be_bytes().to_vec();
     pdu.extend_from_slice(payload);
@@ -89,9 +78,8 @@ fn echo(_header: &[u8], body: &[u8], _peer: &ClientAddr) -> Option<Vec<u8>> {
     Some(echo_frame(body))
 }
 
-/// Consumer-side LSP framer: `Framing::More` until the `\r\n\r\n` header
-/// terminator, then parse the `Content-Length` body length. This is the kind of
-/// variable-length-header framer a caller writes - the server ships no such
+/// Consumer-side LSP framer: `Framing::More` until the `\r\n\r\n` header terminator, then parse the `Content-Length`
+/// body length. This is the kind of variable-length-header framer a caller writes - the server ships no such
 /// protocol-specific (text) parser.
 fn lsp_header(buf: &[u8], _state: &mut ()) -> Framing {
     let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
@@ -132,12 +120,9 @@ fn recv_framed<R: Read>(s: &mut R) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Send each message and read its echo on one connection (keep-alive), then
-/// close so the server's next recv-header sees EOF.
-fn framed_roundtrips<S: Read + Write>(
-    mut s: S,
-    msgs: &[&[u8]],
-) -> io::Result<Vec<Vec<u8>>> {
+/// Send each message and read its echo on one connection (keep-alive), then close so the server's next recv-header sees
+/// EOF.
+fn framed_roundtrips<S: Read + Write>(mut s: S, msgs: &[&[u8]]) -> io::Result<Vec<Vec<u8>>> {
     let mut echoes = Vec::with_capacity(msgs.len());
     for m in msgs {
         send_framed(&mut s, m)?;
@@ -152,10 +137,7 @@ fn framed_roundtrips<S: Read + Write>(
 #[test]
 fn tcp_echo() {
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::bind(
-        [addr],
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::bind([addr], length_prefixed(PrefixWidth::U32, Endian::Big, false, echo)) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -167,8 +149,7 @@ fn tcp_echo() {
 
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        let r = connect_tcp(v4)
-            .and_then(|s| framed_roundtrips(s, &[b"hello io_uring" as &[u8]]));
+        let r = connect_tcp(v4).and_then(|s| framed_roundtrips(s, &[b"hello io_uring" as &[u8]]));
         stop.shutdown();
         r
     });
@@ -180,19 +161,14 @@ fn tcp_echo() {
 
 #[test]
 fn tcp_vectored_reply() {
-    // A `ReplyVectored`'s segments reach the client concatenated in order (one
-    // vectored write), and the reply retires its `outstanding` count exactly
-    // once - only the last segment is `is_reply` - so keep-alive keeps
-    // serving: three sequential roundtrips are not stranded behind the
-    // read-ahead cap. A wrong `is_reply` count would wedge the second.
+    // A `ReplyVectored`'s segments reach the client concatenated in order (one vectored write), and the reply retires
+    // its `outstanding` count exactly once - only the last segment is `is_reply` - so keep-alive keeps serving: three
+    // sequential roundtrips are not stranded behind the read-ahead cap. A wrong `is_reply` count would wedge the
+    // second.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request { body, .. } = req;
             // Echo as two segments: the length prefix, then the payload.
@@ -216,12 +192,7 @@ fn tcp_vectored_reply() {
 
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
-        let r = connect_tcp(v4).and_then(|s| {
-            framed_roundtrips(
-                s,
-                &[b"one" as &[u8], b"two", b"the third message"],
-            )
-        });
+        let r = connect_tcp(v4).and_then(|s| framed_roundtrips(s, &[b"one" as &[u8], b"two", b"the third message"]));
         stop.shutdown();
         r
     });
@@ -230,11 +201,7 @@ fn tcp_vectored_reply() {
     let echoes = client.join().expect("thread join").expect("client io");
     assert_eq!(
         echoes,
-        vec![
-            b"one".to_vec(),
-            b"two".to_vec(),
-            b"the third message".to_vec(),
-        ]
+        vec![b"one".to_vec(), b"two".to_vec(), b"the third message".to_vec(),]
     );
 }
 
@@ -243,10 +210,7 @@ fn unix_echo() {
     let dir = truenas_ros::tempdir().unwrap();
     let path = dir.path().join("echo.sock");
     let addr = ServerAddr::Unix(path.clone());
-    let mut server = match Server::bind(
-        [addr],
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::bind([addr], length_prefixed(PrefixWidth::U32, Endian::Big, false, echo)) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -256,8 +220,7 @@ fn unix_echo() {
     let cpath = path;
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        let r = connect_unix(&cpath)
-            .and_then(|s| framed_roundtrips(s, &[b"unix ping" as &[u8]]));
+        let r = connect_unix(&cpath).and_then(|s| framed_roundtrips(s, &[b"unix ping" as &[u8]]));
         stop.shutdown();
         r
     });
@@ -271,10 +234,7 @@ fn unix_echo() {
 fn tcp_keepalive() {
     // Several messages on ONE connection - proves the connection is reused.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::bind(
-        [addr],
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::bind([addr], length_prefixed(PrefixWidth::U32, Endian::Big, false, echo)) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -296,26 +256,17 @@ fn tcp_keepalive() {
     let echoes = client.join().expect("thread join").expect("client io");
     assert_eq!(
         echoes,
-        vec![
-            b"one".to_vec(),
-            b"two".to_vec(),
-            b"three".to_vec(),
-            b"four".to_vec()
-        ]
+        vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec(), b"four".to_vec()]
     );
 }
 
 #[test]
 fn tcp_split_segments() {
-    // Send the length prefix one byte at a time and the body in two halves,
-    // each write flushed with a gap - so recv-header and recv-body each span
-    // multiple TCP segments. This passes only if MSG_WAITALL accumulates the
-    // short reads in-kernel (without it, recv-header returns 1 < 4 -> close).
+    // Send the length prefix one byte at a time and the body in two halves, each write flushed with a gap - so
+    // recv-header and recv-body each span multiple TCP segments. This passes only if MSG_WAITALL accumulates the short
+    // reads in-kernel (without it, recv-header returns 1 < 4 -> close).
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::bind(
-        [addr],
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::bind([addr], length_prefixed(PrefixWidth::U32, Endian::Big, false, echo)) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -354,19 +305,16 @@ fn tcp_split_segments() {
 
 #[test]
 fn tcp_many_concurrent() {
-    // N concurrent clients, pool sized above N so none are shed. N > the
-    // kernel's MULTISHOT_MAX_RETRY (32) so the multishot accept re-arms mid-run.
+    // N concurrent clients, pool sized above N so none are shed. N > the kernel's MULTISHOT_MAX_RETRY (32) so the
+    // multishot accept re-arms mid-run.
     const N: usize = 40;
     let cfg = ServerConfig {
         pool_size: 64,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -378,11 +326,8 @@ fn tcp_many_concurrent() {
 
     let coordinator = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        let clients: Vec<_> = (0..N)
-            .map(|i| thread::spawn(move || one_shot(v4, i)))
-            .collect();
-        let results: Vec<io::Result<Vec<u8>>> =
-            clients.into_iter().map(|c| c.join().unwrap()).collect();
+        let clients: Vec<_> = (0..N).map(|i| thread::spawn(move || one_shot(v4, i))).collect();
+        let results: Vec<io::Result<Vec<u8>>> = clients.into_iter().map(|c| c.join().unwrap()).collect();
         stop.shutdown();
         results
     });
@@ -396,19 +341,16 @@ fn tcp_many_concurrent() {
 
 #[test]
 fn tcp_sequential_slot_reuse() {
-    // Tiny pool, connections opened one at a time (never exceeding capacity) --
-    // forces slot recycling and the per-slot generation bump.
+    // Tiny pool, connections opened one at a time (never exceeding capacity) -- forces slot recycling and the per-slot
+    // generation bump.
     const N: usize = 20;
     let cfg = ServerConfig {
         pool_size: 4,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -434,24 +376,19 @@ fn tcp_sequential_slot_reuse() {
 
 #[test]
 fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
-    // SECURITY regression - fixed-slot reuse use-after-free / cross-connection
-    // corruption. When a connection is torn down on a bare-CLOSE path while an
-    // op is still in flight on its descriptor, that op pins the kernel resource
-    // node: the CLOSE frees the table slot and bitmap bit at issue and biases
-    // the next accept to that same index, but the pinned op keeps the old
-    // socket and its buffers alive. A reuse-accept then reaches
-    // `accept_connection` and overwrites the still-`Serving` slot (freed only
-    // at ops==0) - dropping the live connection under the in-flight op, and,
-    // because the generation never bumps on reuse-without-free, later steering
-    // that op's completion onto whatever connection now holds the slot. The fix
-    // cancels the in-flight op and defers the CLOSE until it reaps, so the slot
+    // SECURITY regression - fixed-slot reuse use-after-free / cross-connection corruption. When a connection is torn
+    // down on a bare-CLOSE path while an op is still in flight on its descriptor, that op pins the kernel resource
+    // node: the CLOSE frees the table slot and bitmap bit at issue and biases the next accept to that same index, but
+    // the pinned op keeps the old socket and its buffers alive. A reuse-accept then reaches `accept_connection` and
+    // overwrites the still-`Serving` slot (freed only at ops==0) - dropping the live connection under the in-flight op,
+    // and, because the generation never bumps on reuse-without-free, later steering that op's completion onto whatever
+    // connection now holds the slot. The fix cancels the in-flight op and defers the CLOSE until it reaps, so the slot
     // frees cleanly before any reuse-accept can land.
     //
-    // Repro with a wide, deterministic window: a subscriber triggers a large
-    // push to itself, then half-closes its WRITE side (the server's idle recv
-    // sees EOF -> PeerClosed, a bare close) while keeping its READ side open
-    // and never reading - so the push send stalls in flight, pinning the slot
-    // indefinitely. A fresh echo then reuses the freed index. Without the fix
+    // Repro with a wide, deterministic window: a subscriber triggers a large push to itself, then half-closes its WRITE
+    // side (the server's idle recv sees EOF -> PeerClosed, a bare close) while keeping its READ side open and never
+    // reading - so the push send stalls in flight, pinning the slot indefinitely. A fresh echo then reuses the freed
+    // index. Without the fix
     // the reuse corrupts the connection (wrong reply, a loop panic, or a hang);
     // with it, every echo gets its own correct reply and the server stays live.
     use std::net::Shutdown;
@@ -460,23 +397,17 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
     const PUSH: usize = 16 * 1024 * 1024; // stalls in flight (peer never reads it)
     let sub_handle: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let cfg = ServerConfig {
-        pool_size: 4, // small -> the freed index is reused
+        pool_size: 4,                       // small -> the freed index is reused
         max_send_backlog: 64 * 1024 * 1024, // keep the push queued, don't evict it
         ..ServerConfig::default()
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: {
             let sub_handle = Arc::clone(&sub_handle);
             move |req: Request<'_, ()>| {
-                let Request {
-                    body, responder, ..
-                } = req;
+                let Request { body, responder, .. } = req;
                 if &body[..] == b"sub" {
                     *sub_handle.lock().unwrap() = Some(responder.push_handle());
                     Response::Reply(echo_frame(b"ok"))
@@ -492,9 +423,7 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
         },
     };
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto,
     ) {
@@ -511,21 +440,20 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
             for i in 0..ROUNDS {
-                // Subscribe, then push a large payload to ourselves; the server
-                // starts sending it and (keep-alive) arms an idle recv.
+                // Subscribe, then push a large payload to ourselves; the server starts sending it and (keep-alive) arms
+                // an idle recv.
                 let mut sub = connect_tcp(v4)?;
                 send_framed(&mut sub, b"sub")?;
                 assert_eq!(recv_framed(&mut sub)?, b"ok");
                 send_framed(&mut sub, b"push")?;
                 assert_eq!(recv_framed(&mut sub)?, b"ok");
-                // Half-close our WRITE side: the server's idle recv sees EOF ->
-                // PeerClosed, a bare close - but the large push to us is still
-                // draining into our socket and we never read it, so its send
-                // stays in flight and pins the descriptor.
+                // Half-close our WRITE side: the server's idle recv sees EOF -> PeerClosed, a bare close - but the
+                // large push to us is still draining into our socket and we never read it, so its send stays in flight
+                // and pins the descriptor.
                 sub.shutdown(Shutdown::Write)?;
                 thread::sleep(Duration::from_millis(15)); // let the bare close land
-                // Reuse the just-freed index with a fresh echo; the reply must
-                // be its own, and the server must stay healthy.
+                // Reuse the just-freed index with a fresh echo; the reply must be its own, and the server must stay
+                // healthy.
                 let want = format!("echo-{i}");
                 let mut c = connect_tcp(v4)?;
                 send_framed(&mut c, want.as_bytes())?;
@@ -544,10 +472,9 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
 
 #[test]
 fn tcp_lsp_framing() {
-    // LSP-style variable header: `Content-Length: N\r\n\r\n<body>`. The caller's
-    // `lsp_header` framer scans for `\r\n\r\n` (via Framing::More chunk reads)
-    // then reads exactly N body bytes - a header the old fixed-size model can't
-    // express. The body handler re-frames its reply the same way.
+    // LSP-style variable header: `Content-Length: N\r\n\r\n<body>`. The caller's `lsp_header` framer scans for
+    // `\r\n\r\n` (via Framing::More chunk reads) then reads exactly N body bytes - a header the old fixed-size model
+    // can't express. The body handler re-frames its reply the same way.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
@@ -594,17 +521,12 @@ fn tcp_lsp_framing() {
 
 #[test]
 fn tcp_stateful_counter() {
-    // Per-connection state: `accept` creates a counter; the body handler bumps
-    // it and echoes its value, proving `&mut U` reaches the handler and persists
-    // across keep-alive requests on the same connection.
+    // Per-connection state: `accept` creates a counter; the body handler bumps it and echoes its value, proving `&mut
+    // U` reaches the handler and persists across keep-alive requests on the same connection.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(0u32),
-        header: length_prefix_header::<u32>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<u32>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, u32>| {
             let Request { state: count, .. } = req;
             *count += 1;
@@ -647,25 +569,18 @@ fn tcp_stateful_counter() {
 
 #[test]
 fn tcp_deferred_offload() {
-    // The body handler offloads work to another thread (standing in for a real
-    // pool) and returns `Response::Defer`, freeing the server thread to keep
-    // polling. The worker computes the reply and hands it back via the
-    // `Deferred`; the server sends it on the next wake, and keep-alive resumes --
-    // proven by a second round-trip on the same connection.
+    // The body handler offloads work to another thread (standing in for a real pool) and returns `Response::Defer`,
+    // freeing the server thread to keep polling. The worker computes the reply and hands it back via the `Deferred`;
+    // the server sends it on the next wake, and keep-alive resumes -- proven by a second round-trip on the same
+    // connection.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
-            // Move OWNED inputs to the worker - never a borrow of connection
-            // state - then detach the reply handle and return to the loop.
+            let Request { body, responder, .. } = req;
+            // Move OWNED inputs to the worker - never a borrow of connection state - then detach the reply handle and
+            // return to the loop.
             let input = body.to_vec();
             let (deferred, permit) = responder.defer();
             thread::spawn(move || {
@@ -702,17 +617,12 @@ fn tcp_deferred_offload() {
 
 #[test]
 fn tcp_deferred_drop_closes() {
-    // A lost/panicked worker: the handler detaches a `Deferred` and drops it
-    // without replying. Its Drop must close the parked connection rather than
-    // leak the pool slot, so the client sees a clean EOF.
+    // A lost/panicked worker: the handler detaches a `Deferred` and drops it without replying. Its Drop must close the
+    // parked connection rather than leak the pool slot, so the client sees a clean EOF.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request { responder, .. } = req;
             // Detached then dropped without replying (the lost worker).
@@ -752,33 +662,22 @@ fn tcp_deferred_drop_closes() {
 
 #[test]
 fn tcp_redelivered_request() {
-    // A body handler stashes the request in its connection state, defers, and
-    // the worker asks for a SECOND delivery via `Deferred::redeliver` instead
-    // of supplying bytes - the pattern protocol glue (http) uses to complete a
-    // parked request on the server thread. The rerun sees the stash, replies,
-    // and keep-alive continues: two messages each make the full
-    // park-and-redeliver round trip on one connection.
+    // A body handler stashes the request in its connection state, defers, and the worker asks for a SECOND delivery via
+    // `Deferred::redeliver` instead of supplying bytes - the pattern protocol glue (http) uses to complete a parked
+    // request on the server thread. The rerun sees the stash, replies, and keep-alive continues: two messages each make
+    // the full park-and-redeliver round trip on one connection.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     type Stash = Option<Vec<u8>>;
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(None::<Vec<u8>>),
-        header: length_prefix_header::<Stash>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<Stash>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, Stash>| {
             let Request {
-                body,
-                responder,
-                state,
-                ..
+                body, responder, state, ..
             } = req;
             match state.take() {
                 // Second delivery: the frame is empty; answer from the stash.
-                Some(stashed) => {
-                    Response::Reply(echo_frame(&stashed.to_ascii_uppercase()))
-                }
+                Some(stashed) => Response::Reply(echo_frame(&stashed.to_ascii_uppercase())),
                 // First delivery: retain the request, park, redeliver later.
                 None => {
                     *state = Some(body.to_vec());
@@ -814,8 +713,7 @@ fn tcp_redelivered_request() {
     server.serve_forever().expect("serve_forever");
     let replies = client.join().expect("thread join").expect("client io");
     assert_eq!(replies, vec![b"HELLO".to_vec(), b"WORLD".to_vec()]);
-    // Each message was delivered twice (park, then redelivery) and answered
-    // exactly once.
+    // Each message was delivered twice (park, then redelivery) and answered exactly once.
     let s = stats.snapshot();
     assert_eq!(s.requests, 4, "two deliveries per message");
     assert_eq!(s.deferred, 2, "one park per message");
@@ -824,22 +722,15 @@ fn tcp_redelivered_request() {
 
 #[test]
 fn tcp_stale_redeliver_dropped() {
-    // A handler answers INLINE while leaking a `Deferred` whose worker later
-    // calls `redeliver()`. The request was never opened as deferred, so the
-    // late redelivery must be inert - no extra handler run, no extra reply --
-    // and the connection stays healthy for a second round trip.
+    // A handler answers INLINE while leaking a `Deferred` whose worker later calls `redeliver()`. The request was never
+    // opened as deferred, so the late redelivery must be inert - no extra handler run, no extra reply -- and the
+    // connection stays healthy for a second round trip.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             let reply = echo_frame(&body);
             let (deferred, permit) = responder.defer();
             let _ = permit; // answered inline: the Deferred goes stale
@@ -884,10 +775,9 @@ fn tcp_stale_redeliver_dropped() {
     assert_eq!(s.replies, 2);
 }
 
-/// Borrow a furnished detach fd as a BLOCKING stream WITHOUT owning it - the
-/// `Detached` handle owns and closes it, so this must not (hence `ManuallyDrop`,
-/// whose drop is a no-op). The fd inherits the pool socket's non-blocking mode,
-/// so a blocking op must clear it first.
+/// Borrow a furnished detach fd as a BLOCKING stream WITHOUT owning it - the `Detached` handle owns and closes it, so
+/// this must not (hence `ManuallyDrop`, whose drop is a no-op). The fd inherits the pool socket's non-blocking mode, so
+/// a blocking op must clear it first.
 fn detach_stream(fd: std::os::fd::RawFd) -> ManuallyDrop<TcpStream> {
     // SAFETY: `fd` aliases a live socket; wrapped non-owningly (ManuallyDrop).
     let s = ManuallyDrop::new(unsafe { TcpStream::from_raw_fd(fd) });
@@ -897,25 +787,17 @@ fn detach_stream(fd: std::os::fd::RawFd) -> ManuallyDrop<TcpStream> {
 
 #[test]
 fn tcp_detach_resume() {
-    // A body handler DETACHES the connection: the server furnishes a real fd to
-    // a worker that does blocking I/O on the socket, then RESUMES serving. The
-    // worker echoes 5 raw bytes off the fd (proving the fd is usable); after
-    // resume the connection keeps serving with its per-connection state intact
-    // (the request counter), proven by a framed round-trip returning `2:ping`.
+    // A body handler DETACHES the connection: the server furnishes a real fd to a worker that does blocking I/O on the
+    // socket, then RESUMES serving. The worker echoes 5 raw bytes off the fd (proving the fd is usable); after resume
+    // the connection keeps serving with its per-connection state intact (the request counter), proven by a framed
+    // round-trip returning `2:ping`.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(0u32),
-        header: length_prefix_header::<u32>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<u32>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, u32>| {
             let Request {
-                body,
-                state,
-                responder,
-                ..
+                body, state, responder, ..
             } = req;
             *state += 1;
             if &body[..] == b"detach" {
@@ -969,23 +851,16 @@ fn tcp_detach_resume() {
 
 #[test]
 fn tcp_detach_resume_restores_nonblocking() {
-    // The furnished fd shares the pool socket's FILE DESCRIPTION, so a worker
-    // clearing O_NONBLOCK for its blocking transfer (as any blocking helper
-    // does) would otherwise leave the resumed connection's socket blocking --
-    // silently disabling the splice path's EAGAIN -> readiness-poll slow-loris
-    // guard (`tcp_splice_read` takes its wait mode from the file's
-    // O_NONBLOCK). `Detached::resume` must restore the flag itself. Observed
-    // through a worker-held dup() of the furnished fd: same file description,
-    // still open after resume consumes the handle.
+    // The furnished fd shares the pool socket's FILE DESCRIPTION, so a worker clearing O_NONBLOCK for its blocking
+    // transfer (as any blocking helper does) would otherwise leave the resumed connection's socket blocking -- silently
+    // disabling the splice path's EAGAIN -> readiness-poll slow-loris guard (`tcp_splice_read` takes its wait mode from
+    // the file's O_NONBLOCK). `Detached::resume` must restore the flag itself. Observed through a worker-held dup() of
+    // the furnished fd: same file description, still open after resume consumes the handle.
     let (flag_tx, flag_rx) = std::sync::mpsc::channel::<bool>();
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             if &req.body[..] == b"detach" {
                 Response::Detach(req.responder.detach())
@@ -1009,8 +884,7 @@ fn tcp_detach_resume_restores_nonblocking() {
             // The blocking-transfer pattern: clear O_NONBLOCK, do the work.
             let _s = detach_stream(raw); // set_nonblocking(false)
             detached.resume();
-            // resume() restored O_NONBLOCK on the shared description before
-            // signaling; the alias observes it.
+            // resume() restored O_NONBLOCK on the shared description before signaling; the alias observes it.
             // SAFETY: fcntl on the live dup; then close it.
             let restored = unsafe {
                 let fl = libc::fcntl(alias, libc::F_GETFL);
@@ -1050,16 +924,12 @@ fn tcp_detach_resume_restores_nonblocking() {
 
 #[test]
 fn tcp_detach_close() {
-    // Detach, then the worker CLOSES the connection instead of resuming (e.g. a
-    // one-shot transfer on a dedicated connection): the client sees a clean EOF.
+    // Detach, then the worker CLOSES the connection instead of resuming (e.g. a one-shot transfer on a dedicated
+    // connection): the client sees a clean EOF.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| Response::Detach(req.responder.detach()),
     };
     let mut server = match Server::bind([addr], proto) {
@@ -1103,17 +973,12 @@ fn tcp_detach_close() {
 
 #[test]
 fn tcp_detach_drop_closes() {
-    // A lost/panicked detach worker: the handler moves the `Detached` to a
-    // thread that drops it without resume/close. Its Drop must close the parked
-    // connection rather than leak the pool slot, so the client sees a clean EOF.
+    // A lost/panicked detach worker: the handler moves the `Detached` to a thread that drops it without resume/close.
+    // Its Drop must close the parked connection rather than leak the pool slot, so the client sees a clean EOF.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| Response::Detach(req.responder.detach()),
     };
     let mut server = match Server::bind([addr], proto) {
@@ -1153,24 +1018,16 @@ fn tcp_detach_drop_closes() {
 
 #[test]
 fn tcp_deferred_worker_close_ends_the_connection() {
-    // `Deferred::close` is the worker deciding the request is fatal - distinct
-    // from dropping the handle, which closes only because a lost worker must
-    // not leak the parked slot. Both end the connection and both report
-    // `WorkerClosed`, so a test of the drop path says nothing about whether
-    // the deliberate one works. The close is also final: a request answered
-    // this way is gone, so the pipelined follower behind it is not served.
+    // `Deferred::close` is the worker deciding the request is fatal - distinct from dropping the handle, which closes
+    // only because a lost worker must not leak the parked slot. Both end the connection and both report `WorkerClosed`,
+    // so a test of the drop path says nothing about whether the deliberate one works. The close is also final: a
+    // request answered this way is gone, so the pipelined follower behind it is not served.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             if &body[..] == b"fatal" {
                 let (deferred, permit) = responder.defer();
                 thread::spawn(move || {
@@ -1199,11 +1056,7 @@ fn tcp_deferred_worker_close_ends_the_connection() {
         let r = (|| -> io::Result<Vec<u8>> {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"ping")?;
-            assert_eq!(
-                recv_framed(&mut s)?,
-                b"ping",
-                "serving before the close"
-            );
+            assert_eq!(recv_framed(&mut s)?, b"ping", "serving before the close");
             let _ = send_framed(&mut s, b"fatal");
             let mut tail = Vec::new();
             s.read_to_end(&mut tail)?;
@@ -1215,10 +1068,7 @@ fn tcp_deferred_worker_close_ends_the_connection() {
 
     server.serve_forever().expect("serve_forever");
     match client.join().expect("thread join") {
-        Ok(tail) => assert!(
-            tail.is_empty(),
-            "a closed request must send nothing, got {tail:?}"
-        ),
+        Ok(tail) => assert!(tail.is_empty(), "a closed request must send nothing, got {tail:?}"),
         Err(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
     }
     assert_eq!(
@@ -1230,11 +1080,9 @@ fn tcp_deferred_worker_close_ends_the_connection() {
 
 #[test]
 fn handle_types_are_debug() {
-    // The reply/push/detach handles are what a consumer holds when something
-    // goes wrong in its own worker, so they are what lands in its logs. Each
-    // is `finish_non_exhaustive` and each deliberately withholds its channel
-    // and routing token - a `Debug` that printed the token would put a
-    // forgeable routing capability in a log file.
+    // The reply/push/detach handles are what a consumer holds when something goes wrong in its own worker, so they are
+    // what lands in its logs. Each is `finish_non_exhaustive` and each deliberately withholds its channel and routing
+    // token - a `Debug` that printed the token would put a forgeable routing capability in a log file.
     use std::sync::mpsc;
     let (seen_tx, seen_rx) = mpsc::channel::<(&'static str, String)>();
     let worker_tx = seen_tx.clone();
@@ -1242,20 +1090,13 @@ fn handle_types_are_debug() {
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             if &body[..] == b"detach" {
                 return Response::Detach(responder.detach());
             }
-            // `push_handle` borrows, so it can be minted before `defer`
-            // consumes the responder.
+            // `push_handle` borrows, so it can be minted before `defer` consumes the responder.
             let push = responder.push_handle();
             let _ = seen_tx.send(("push", format!("{push:?}")));
             let _ = seen_tx.send(("responder", format!("{responder:?}")));
@@ -1300,12 +1141,9 @@ fn handle_types_are_debug() {
     server.serve_forever().expect("serve_forever");
     client.join().expect("thread join").expect("client io");
 
-    let seen: std::collections::HashMap<&str, String> =
-        seen_rx.try_iter().collect();
+    let seen: std::collections::HashMap<&str, String> = seen_rx.try_iter().collect();
     for name in ["responder", "deferred", "push", "detached"] {
-        let rendered = seen
-            .get(name)
-            .unwrap_or_else(|| panic!("{name} was never formatted"));
+        let rendered = seen.get(name).unwrap_or_else(|| panic!("{name} was never formatted"));
         assert!(
             rendered.ends_with(".. }"),
             "{name}'s Debug must stay non-exhaustive: {rendered}"
@@ -1325,8 +1163,7 @@ fn handle_types_are_debug() {
         "unexpected shape: {}",
         seen["deferred"]
     );
-    // The routable handles name their slot, which is what makes one log line
-    // traceable to one connection.
+    // The routable handles name their slot, which is what makes one log line traceable to one connection.
     for name in ["push", "detached"] {
         assert!(
             seen[name].contains("slot"),
@@ -1338,23 +1175,17 @@ fn handle_types_are_debug() {
 
 #[test]
 fn push_of_an_empty_payload_is_a_no_op() {
-    // An empty push is dropped at the handle rather than travelling to the
-    // loop, so it never reaches the send queue. That matters because the
-    // server frames nothing itself: a zero-length PDU handed to the socket
-    // would be an empty write the peer cannot distinguish from a stall, and a
-    // queued empty push would still consume backlog accounting. The client
-    // must see exactly the one real push.
+    // An empty push is dropped at the handle rather than travelling to the loop, so it never reaches the send queue.
+    // That matters because the server frames nothing itself: a zero-length PDU handed to the socket would be an empty
+    // write the peer cannot distinguish from a stall, and a queued empty push would still consume backlog accounting.
+    // The client must see exactly the one real push.
     use std::sync::Mutex;
     let stash: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let for_body = Arc::clone(&stash);
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
             *for_body.lock().unwrap() = Some(req.responder.push_handle());
             Response::Reply(echo_frame(b"ok"))
@@ -1379,8 +1210,7 @@ fn push_of_an_empty_payload_is_a_no_op() {
             let push = stash.lock().unwrap().clone().expect("stashed handle");
             push.push(Vec::new()); // dropped at the handle
             push.push(echo_frame(b"real"));
-            // If the empty push had been queued it would arrive first and this
-            // frame read would desynchronise.
+            // If the empty push had been queued it would arrive first and this frame read would desynchronise.
             recv_framed(&mut s)
         })();
         stop.shutdown();
@@ -1392,11 +1222,9 @@ fn push_of_an_empty_payload_is_a_no_op() {
     assert_eq!(got, b"real", "an empty push must not reach the wire");
 }
 
-/// A server whose replies are prefixed with a tag the control hook can
-/// swap: the reload shape. The hook and the body handler share the tag
-/// through an `Rc`, which only works because both were built on the loop
-/// thread; the message that crosses threads is just the new tag. Each
-/// applied message is acknowledged with the thread it ran on.
+/// A server whose replies are prefixed with a tag the control hook can swap: the reload shape. The hook and the body
+/// handler share the tag through an `Rc`, which only works because both were built on the loop thread; the message that
+/// crosses threads is just the new tag. Each applied message is acknowledged with the thread it ran on.
 #[allow(clippy::type_complexity)]
 fn tagged_server() -> Option<(
     Server<
@@ -1415,11 +1243,7 @@ fn tagged_server() -> Option<(
     let for_body = Rc::clone(&tag);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| -> Response {
             let mut out = for_body.borrow().clone();
             out.extend_from_slice(&req.body);
@@ -1446,10 +1270,9 @@ fn tagged_server() -> Option<(
     Some((server, v4, ack_rx))
 }
 
-/// A control message runs on the server thread, between requests, and two
-/// sent back to back apply in order: a request answered before the swap
-/// carries the old tag, one answered after it carries the new one, and
-/// nothing in between carries half of either.
+/// A control message runs on the server thread, between requests, and two sent back to back apply in order: a request
+/// answered before the swap carries the old tag, one answered after it carries the new one, and nothing in between
+/// carries half of either.
 #[test]
 fn control_message_runs_on_the_server_thread_between_requests() {
     let Some((mut server, v4, acks)) = tagged_server() else {
@@ -1466,9 +1289,7 @@ fn control_message_runs_on_the_server_thread_between_requests() {
         control.send(Box::new(b"B".to_vec()));
         control.send(Box::new(b"C".to_vec()));
         for expect in [b"B", b"C"] {
-            let (tag, ran_on) = acks
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the hook ran");
+            let (tag, ran_on) = acks.recv_timeout(Duration::from_secs(10)).expect("the hook ran");
             assert_eq!(tag, expect, "applied in the order sent");
             assert_eq!(ran_on, loop_thread, "ran on the server thread");
         }
@@ -1480,9 +1301,8 @@ fn control_message_runs_on_the_server_thread_between_requests() {
     client.join().expect("client thread").expect("client io");
 }
 
-/// A control message is still delivered while the server drains: the drain
-/// is held open by a parked request, the message applies, and the parked
-/// request's reply then carries the new tag.
+/// A control message is still delivered while the server drains: the drain is held open by a parked request, the
+/// message applies, and the parked request's reply then carries the new tag.
 #[test]
 fn control_message_is_delivered_while_draining() {
     use std::cell::RefCell;
@@ -1493,11 +1313,7 @@ fn control_message_is_delivered_while_draining() {
     let for_body = Rc::clone(&tag);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| -> Response {
             if &req.body[..] == b"park" {
                 let (deferred, permit) = req.responder.defer();
@@ -1545,9 +1361,8 @@ fn control_message_is_delivered_while_draining() {
         ack_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("the hook ran during the drain");
-        // Prove the swap is what the handler now sees: the parked request
-        // is redelivered after it, and its rerun (over an empty frame, as a
-        // redelivery is) reads the tag.
+        // Prove the swap is what the handler now sees: the parked request is redelivered after it, and its rerun (over
+        // an empty frame, as a redelivery is) reads the tag.
         deferred.redeliver();
         assert_eq!(recv_framed(&mut parked)?, b"B");
         assert_eq!(parked.read(&mut b)?, 0, "closed once nothing is owed");
@@ -1557,8 +1372,8 @@ fn control_message_is_delivered_while_draining() {
     client.join().expect("client thread").expect("client io");
 }
 
-/// After the server has stopped a control message goes nowhere: the send
-/// neither fails nor runs the hook, like a late push.
+/// After the server has stopped a control message goes nowhere: the send neither fails nor runs the hook, like a late
+/// push.
 #[test]
 fn control_message_after_shutdown_is_dropped() {
     let Some((mut server, _v4, acks)) = tagged_server() else {
@@ -1576,8 +1391,7 @@ fn control_message_after_shutdown_is_dropped() {
     );
 }
 
-/// A handle minted but never given a hook drops its messages rather than
-/// failing, and the server keeps serving.
+/// A handle minted but never given a hook drops its messages rather than failing, and the server keeps serving.
 #[test]
 fn control_message_without_a_hook_is_dropped() {
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -1606,21 +1420,14 @@ fn control_message_without_a_hook_is_dropped() {
 
 #[test]
 fn shutdown_graceful_with_zero_grace_is_a_hard_shutdown() {
-    // `shutdown_graceful(0)` is documented as exactly `shutdown()`. The
-    // distinction is not cosmetic: the graceful path arms a grace-period
-    // TIMEOUT op and waits for connections to quiesce, so a zero duration
-    // taken literally would arm a timer that fires immediately - or, worse,
-    // a drain with no deadline at all. Delegating instead means a caller
-    // computing a grace from configuration cannot accidentally hang the
-    // shutdown by configuring zero.
+    // `shutdown_graceful(0)` is documented as exactly `shutdown()`. The distinction is not cosmetic: the graceful path
+    // arms a grace-period TIMEOUT op and waits for connections to quiesce, so a zero duration taken literally would arm
+    // a timer that fires immediately - or, worse, a drain with no deadline at all. Delegating instead means a caller
+    // computing a grace from configuration cannot accidentally hang the shutdown by configuring zero.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     };
     let mut server = match Server::bind([addr], proto) {
@@ -1635,9 +1442,8 @@ fn shutdown_graceful_with_zero_grace_is_a_hard_shutdown() {
 
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
-        // Serve one request so the loop is definitely running, hold the
-        // connection open, then stop with a zero grace: a drain that waited
-        // for this connection to quiesce would never return.
+        // Serve one request so the loop is definitely running, hold the connection open, then stop with a zero grace: a
+        // drain that waited for this connection to quiesce would never return.
         let r = (|| -> io::Result<TcpStream> {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"ping")?;
@@ -1649,36 +1455,30 @@ fn shutdown_graceful_with_zero_grace_is_a_hard_shutdown() {
     });
 
     server.serve_forever().expect("serve_forever");
-    // Reaching here at all is the assertion: an open connection did not hold
-    // the loop open, because zero grace degraded to a hard stop.
+    // Reaching here at all is the assertion: an open connection did not hold the loop open, because zero grace degraded
+    // to a hard stop.
     let held = client.join().expect("thread join").expect("client io");
     drop(held);
 }
 
 #[test]
 fn tls_listener_without_a_handshake_handler_is_rejected() {
-    // A kTLS listener cannot serve itself: the accept handler does not run for
-    // kTLS connections, so `set_tls_handshake` IS the admission decision as
-    // well as the handshake. Construction cannot catch a missing one - the
-    // handler is installed after `bind` returns - so `serve_forever` refuses
-    // to start rather than accept connections it can only drop. Fail-fast at
-    // startup, not per connection at runtime.
+    // A kTLS listener cannot serve itself: the accept handler does not run for kTLS connections, so `set_tls_handshake`
+    // IS the admission decision as well as the handshake. Construction cannot catch a missing one - the handler is
+    // installed after `bind` returns - so `serve_forever` refuses to start rather than accept connections it can only
+    // drop. Fail-fast at startup, not per connection at runtime.
     use truenas_ros::net::server::Listen;
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     };
     let mut server = match Server::bind([Listen::tls(addr)], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
-        // A kernel without FIXED_FD_INSTALL rejects the listener earlier, with
-        // its own validation message - environmental, not the case under test.
+        // A kernel without FIXED_FD_INSTALL rejects the listener earlier, with its own validation message -
+        // environmental, not the case under test.
         Err(Error::Validation(m)) if m.contains("FIXED_FD_INSTALL") => return,
         Err(e) => panic!("bind: {e}"),
     };
@@ -1695,18 +1495,13 @@ fn tls_listener_without_a_handshake_handler_is_rejected() {
 
 #[test]
 fn server_debug_reports_its_listeners() {
-    // `Server`'s own `Debug` is what ends up in a consumer's startup log or
-    // panic message, and it is the only way to see the resolved listener list
-    // after an ephemeral `:0` bind. Bound but never served: `Drop` tears the
-    // ring down on its own.
+    // `Server`'s own `Debug` is what ends up in a consumer's startup log or panic message, and it is the only way to
+    // see the resolved listener list after an ephemeral `:0` bind. Bound but never served: `Drop` tears the ring down
+    // on its own.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     };
     let server = match Server::bind([addr], proto) {
@@ -1718,10 +1513,7 @@ fn server_debug_reports_its_listeners() {
         panic!("expected Tcp");
     };
     let rendered = format!("{server:?}");
-    assert!(
-        rendered.starts_with("Server {"),
-        "unexpected Debug shape: {rendered}"
-    );
+    assert!(rendered.starts_with("Server {"), "unexpected Debug shape: {rendered}");
     assert!(
         rendered.contains(&bound.port().to_string()),
         "Debug should report the resolved listener, not the requested :0: \
@@ -1736,16 +1528,12 @@ fn server_debug_reports_its_listeners() {
 
 #[test]
 fn tcp6_echo() {
-    // IPv6 is not just IPv4 with a longer address here: the listener asks
-    // for `AF_INET6` and sets
-    // `IPV6_V6ONLY`, and the per-connection peer fetch has to request exactly
-    // `sockaddr_in6`'s size - the kernel's `SO_PEERNAME` rejects an optlen
-    // LARGER than the actual address, and the completion then requires the
-    // returned length to match exactly, failing closed otherwise. So an
-    // address-family size mistake does not corrupt an address, it sheds every
-    // connection. A round-trip proves the sizing on both sides, and the peer
-    // handed to the accept handler proves it parsed as a real V6 address
-    // rather than something salvaged from a short pad.
+    // IPv6 is not just IPv4 with a longer address here: the listener asks for `AF_INET6` and sets `IPV6_V6ONLY`, and
+    // the per-connection peer fetch has to request exactly `sockaddr_in6`'s size - the kernel's `SO_PEERNAME` rejects
+    // an optlen LARGER than the actual address, and the completion then requires the returned length to match exactly,
+    // failing closed otherwise. So an address-family size mistake does not corrupt an address, it sheds every
+    // connection. A round-trip proves the sizing on both sides, and the peer handed to the accept handler proves it
+    // parsed as a real V6 address rather than something salvaged from a short pad.
     use std::net::SocketAddrV6;
     let (peer_tx, peer_rx) = std::sync::mpsc::channel::<ClientAddr>();
     let addr = ServerAddr::Tcp6("[::1]:0".parse::<SocketAddrV6>().unwrap());
@@ -1754,18 +1542,13 @@ fn tcp6_echo() {
             let _ = peer_tx.send(inc.peer.clone());
             Some(())
         },
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     };
     let mut server = match Server::bind([addr], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
-        // A host with IPv6 compiled out or ::1 absent is environmental, like
-        // the io_uring skip above.
+        // A host with IPv6 compiled out or ::1 absent is environmental, like the io_uring skip above.
         Err(Error::Errno(Errno::EAFNOSUPPORT | Errno::EADDRNOTAVAIL)) => return,
         Err(e) => panic!("bind: {e}"),
     };
@@ -1798,8 +1581,8 @@ fn tcp6_echo() {
     }
 }
 
-/// Collect the close reasons a server reports, so a test can assert not just
-/// that a connection died but that it died for the documented reason.
+/// Collect the close reasons a server reports, so a test can assert not just that a connection died but that it died
+/// for the documented reason.
 fn close_reason_channel<U>(
     server: &mut Server<
         U,
@@ -1817,21 +1600,15 @@ fn close_reason_channel<U>(
 
 #[test]
 fn tcp_detach_without_a_handler_closes() {
-    // A body handler returns `Response::Detach` on a server that never called
-    // `set_detach_handler` - a misconfiguration. The fd is furnished by the
-    // kernel before anything notices, so the loop has to close the alias it
-    // will not use, reattach the parked connection to `Serving`, and tear it
-    // down; leaking the alias would pin the socket open past the close.
-    // Reported as `HandlerClosed`, distinguishing the misconfig from an install
-    // failure (`RecvError`) and from shutdown (`ShuttingDown`).
+    // A body handler returns `Response::Detach` on a server that never called `set_detach_handler` - a
+    // misconfiguration. The fd is furnished by the kernel before anything notices, so the loop has to close the alias
+    // it will not use, reattach the parked connection to `Serving`, and tear it down; leaking the alias would pin the
+    // socket open past the close. Reported as `HandlerClosed`, distinguishing the misconfig from an install failure
+    // (`RecvError`) and from shutdown (`ShuttingDown`).
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| Response::Detach(req.responder.detach()),
     };
     let mut server = match Server::bind([addr], proto) {
@@ -1873,33 +1650,25 @@ fn tcp_detach_without_a_handler_closes() {
 
 #[test]
 fn tcp_detach_with_a_foreign_permit_closes() {
-    // `DetachPermit` proves `Responder::detach` ran, but only its token proves
-    // it ran for THIS request. A handler that mints a permit on one request,
-    // stashes it in the connection state, and returns it on a later one is
-    // claiming a detach the loop cannot route: the request it names is already
-    // answered. The token check must reject it and close, rather than park a
-    // request nothing can ever resolve.
+    // `DetachPermit` proves `Responder::detach` ran, but only its token proves it ran for THIS request. A handler that
+    // mints a permit on one request, stashes it in the connection state, and returns it on a later one is claiming a
+    // detach the loop cannot route: the request it names is already answered. The token check must reject it and close,
+    // rather than park a request nothing can ever resolve.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
-        accept: |_: Incoming<'_>| {
-            Some(None::<truenas_ros::net::server::DetachPermit>)
-        },
-        header: length_prefix_header::<
-            Option<truenas_ros::net::server::DetachPermit>,
-        >(PrefixWidth::U32, Endian::Big, false),
-        body: |req: Request<
-            '_,
-            Option<truenas_ros::net::server::DetachPermit>,
-        >| {
+        accept: |_: Incoming<'_>| Some(None::<truenas_ros::net::server::DetachPermit>),
+        header: length_prefix_header::<Option<truenas_ros::net::server::DetachPermit>>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, Option<truenas_ros::net::server::DetachPermit>>| {
             let Request {
-                body,
-                state,
-                responder,
-                ..
+                body, state, responder, ..
             } = req;
             if &body[..] == b"stash" {
-                // Mint this request's permit and keep it; answer normally, so
-                // the request it is stamped with is retired.
+                // Mint this request's permit and keep it; answer normally, so the request it is stamped with is
+                // retired.
                 *state = Some(responder.detach());
                 Response::Reply(echo_frame(b"stashed"))
             } else {
@@ -1915,9 +1684,7 @@ fn tcp_detach_with_a_foreign_permit_closes() {
     };
     // Registered, so the close cannot be blamed on a missing handler.
     server.set_detach_handler(|_ctx, detached| {
-        panic!(
-            "a foreign permit must never reach the detach handler: {detached:?}"
-        );
+        panic!("a foreign permit must never reach the detach handler: {detached:?}");
     });
     let reasons = close_reason_channel(&mut server);
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
@@ -1955,18 +1722,15 @@ fn tcp_detach_with_a_foreign_permit_closes() {
 
 #[test]
 fn tcp_detach_on_an_unsettled_connection_closes() {
-    // Detach hands the raw socket to a worker, so the bytes that follow belong
-    // to the fd rather than the framer. It is only safe on a fully settled
-    // connection - nothing in flight and nothing buffered past this request.
-    // A pipelined second message still sitting in the server's buffer is
-    // exactly that: the worker would consume bytes the framer already owns, so
-    // the loop must close instead.
+    // Detach hands the raw socket to a worker, so the bytes that follow belong to the fd rather than the framer. It is
+    // only safe on a fully settled connection - nothing in flight and nothing buffered past this request.
+    // A pipelined second message still sitting in the server's buffer is exactly that: the worker would consume bytes
+    // the framer already owns, so the loop must close instead.
     //
-    // The framer has to be a scanning one for this to arise. A fixed-width
-    // length prefix asks for exact byte counts, so a pipelined follower stays
-    // in the socket and never reaches the buffer - the connection reads as
-    // settled. `lsp_header` scans for a `\r\n\r\n` terminator and so consumes
-    // opportunistically, which is what leaves the second message buffered.
+    // The framer has to be a scanning one for this to arise. A fixed-width length prefix asks for exact byte counts, so
+    // a pipelined follower stays in the socket and never reaches the buffer - the connection reads as settled.
+    // `lsp_header` scans for a `\r\n\r\n` terminator and so consumes opportunistically, which is what leaves the second
+    // message buffered.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
@@ -1991,8 +1755,8 @@ fn tcp_detach_on_an_unsettled_connection_closes() {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<Vec<u8>> {
             let mut s = connect_tcp(v4)?;
-            // Two complete LSP-framed messages in one write, so the scanning
-            // framer buffers the second while the first is being handled.
+            // Two complete LSP-framed messages in one write, so the scanning framer buffers the second while the first
+            // is being handled.
             let mut pipelined = b"Content-Length: 6\r\n\r\ndetach".to_vec();
             pipelined.extend_from_slice(b"Content-Length: 8\r\n\r\ntrailing");
             let _ = s.write_all(&pipelined);
@@ -2018,14 +1782,11 @@ fn tcp_detach_on_an_unsettled_connection_closes() {
 
 #[test]
 fn protocol_context_types_are_debug() {
-    // `Incoming`, `Request` and `DetachContext` are `#[non_exhaustive]`, so a
-    // consumer cannot build one to print - their `Debug` impls are reachable
-    // only from inside a live handler. They are the types that end up in a
-    // consumer's error logs, and each one
-    // deliberately withholds fields: `Request` prints `header_len` rather than
-    // the header, and neither it nor `DetachContext` prints the connection
-    // state, which is where an application keeps its secrets. Assert the shape
-    // and those omissions, not merely that formatting does not panic.
+    // `Incoming`, `Request` and `DetachContext` are `#[non_exhaustive]`, so a consumer cannot build one to print -
+    // their `Debug` impls are reachable only from inside a live handler. They are the types that end up in a consumer's
+    // error logs, and each one deliberately withholds fields: `Request` prints `header_len` rather than the header, and
+    // neither it nor `DetachContext` prints the connection state, which is where an application keeps its secrets.
+    // Assert the shape and those omissions, not merely that formatting does not panic.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
     let accept_tx = tx.clone();
@@ -2035,11 +1796,7 @@ fn protocol_context_types_are_debug() {
             let _ = accept_tx.send(("incoming".into(), format!("{inc:?}")));
             Some(String::from("s3cret-state"))
         },
-        header: length_prefix_header::<String>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<String>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, String>| {
             let rendered = format!("{req:?}");
             let _ = detach_tx.send(("request".into(), rendered));
@@ -2050,8 +1807,7 @@ fn protocol_context_types_are_debug() {
             }
         },
     };
-    // `Protocol`'s own `Debug` is reachable from outside; check it before the
-    // server takes ownership.
+    // `Protocol`'s own `Debug` is reachable from outside; check it before the server takes ownership.
     assert_eq!(format!("{proto:?}"), "Protocol { .. }");
 
     let mut server = match Server::bind([addr], proto) {
@@ -2088,11 +1844,9 @@ fn protocol_context_types_are_debug() {
     server.serve_forever().expect("serve_forever");
     client.join().expect("thread join").expect("client io");
 
-    // `try_iter`, not `iter`: the sender clones live in handler closures the
-    // server still owns, so waiting for the channel to hang up would deadlock.
-    // Every send happened before `serve_forever` returned.
-    let rendered: std::collections::HashMap<String, String> =
-        rx.try_iter().collect();
+    // `try_iter`, not `iter`: the sender clones live in handler closures the server still owns, so waiting for the
+    // channel to hang up would deadlock. Every send happened before `serve_forever` returned.
+    let rendered: std::collections::HashMap<String, String> = rx.try_iter().collect();
     let incoming = rendered.get("incoming").expect("accept handler ran");
     assert!(
         incoming.starts_with("Incoming {") && incoming.contains("peer"),
@@ -2128,14 +1882,11 @@ fn protocol_context_types_are_debug() {
     );
 }
 
-/// A `[tag: u8][len: u32 BE]` framer for the splice tests: tag `S` diverts the
-/// next `len` body bytes straight to `pipe_wr` via `Framing::SpliceBody`
-/// (zero-copy, never buffered); tag `C` is a normal control frame whose `len`
-/// body is delivered to the body handler. The header is read with exact
-/// `Need`, so no body byte is ever over-read into the buffer.
-fn splice_header(
-    pipe_wr: libc::c_int,
-) -> impl FnMut(&[u8], &mut ()) -> Framing {
+/// A `[tag: u8][len: u32 BE]` framer for the splice tests: tag `S` diverts the next `len` body bytes straight to
+/// `pipe_wr` via `Framing::SpliceBody` (zero-copy, never buffered); tag `C` is a normal control frame whose `len` body
+/// is delivered to the body handler. The header is read with exact `Need`, so no body byte is ever over-read into the
+/// buffer.
+fn splice_header(pipe_wr: libc::c_int) -> impl FnMut(&[u8], &mut ()) -> Framing {
     move |buf: &[u8], _s: &mut ()| {
         if buf.len() < 5 {
             return Framing::Need(5 - buf.len());
@@ -2166,14 +1917,12 @@ fn splice_frame<W: Write>(s: &mut W, tag: u8, body: &[u8]) -> io::Result<()> {
 
 #[test]
 fn tcp_splice_body_recv() {
-    // A framer diverts a DATA frame's body straight from the socket to a
-    // consumer pipe with IORING_OP_SPLICE - zero-copy, the body never enters
-    // the connection buffer - while CONTROL frames deliver to the body handler
-    // as usual. Proves: (a) the spliced bytes arrive intact on the pipe; (b) a
-    // body several times the pipe capacity drives the partial-splice resubmit
-    // path and end-to-end backpressure (the ring never blocks - an io-wq worker
-    // does - while the reader drains); (c) keep-alive framing resumes after the
-    // splice (a control frame still echoes on the same connection).
+    // A framer diverts a DATA frame's body straight from the socket to a consumer pipe with IORING_OP_SPLICE -
+    // zero-copy, the body never enters the connection buffer - while CONTROL frames deliver to the body handler as
+    // usual. Proves: (a) the spliced bytes arrive intact on the pipe; (b) a body several times the pipe capacity drives
+    // the partial-splice resubmit path and end-to-end backpressure (the ring never blocks - an io-wq worker does -
+    // while the reader drains); (c) keep-alive framing resumes after the splice (a control frame still echoes on the
+    // same connection).
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills the two-element array with {read, write} fds.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -2202,8 +1951,8 @@ fn tcp_splice_body_recv() {
     };
     let stop = server.shutdown_handle();
 
-    // The spliced body: several times a pipe's default 64 KiB capacity, so the
-    // splice completes in multiple partial steps as the reader drains.
+    // The spliced body: several times a pipe's default 64 KiB capacity, so the splice completes in multiple partial
+    // steps as the reader drains.
     const BODY: usize = 256 * 1024;
     let payload: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
 
@@ -2214,13 +1963,7 @@ fn tcp_splice_body_recv() {
         let mut off = 0;
         while off < BODY {
             // SAFETY: read into `got[off..]`, within bounds.
-            let n = unsafe {
-                libc::read(
-                    pipe_rd,
-                    got.as_mut_ptr().add(off).cast(),
-                    (BODY - off) as libc::size_t,
-                )
-            };
+            let n = unsafe { libc::read(pipe_rd, got.as_mut_ptr().add(off).cast(), (BODY - off) as libc::size_t) };
             assert!(n > 0, "pipe read returned {n}");
             off += n as usize;
         }
@@ -2242,10 +1985,9 @@ fn tcp_splice_body_recv() {
     });
 
     server.serve_forever().expect("serve_forever");
-    // Close the write end BEFORE joining the reader: if anything upstream
-    // delivered the body short, the reader then sees EOF and its `n > 0`
-    // assertion fires with a real diagnostic - instead of blocking forever in
-    // read() on a pipe this process still holds open (a hang, not a failure).
+    // Close the write end BEFORE joining the reader: if anything upstream delivered the body short, the reader then
+    // sees EOF and its `n > 0` assertion fires with a real diagnostic - instead of blocking forever in read() on a pipe
+    // this process still holds open (a hang, not a failure).
     // SAFETY: closing the test-owned write end (the server only borrowed it).
     unsafe { libc::close(pipe_wr) };
     reader.join().expect("reader join");
@@ -2255,24 +1997,19 @@ fn tcp_splice_body_recv() {
 
 #[test]
 fn tcp_splice_body_close_mid_splice() {
-    // Teardown while a body splice is genuinely IN FLIGHT - the security-critical
-    // path. A splice's SQE fd is the consumer pipe, not the socket, so the
-    // fd-keyed teardown cancel can't reach it: `close_conn` must cancel the
-    // splice by its user_data and defer the index-freeing CLOSE until it reaps
-    // (the splice pins the socket's fixed resource node exactly like a recv, so
-    // CLOSE must be the connection's last op).
+    // Teardown while a body splice is genuinely IN FLIGHT - the security-critical path. A splice's SQE fd is the
+    // consumer pipe, not the socket, so the fd-keyed teardown cancel can't reach it: `close_conn` must cancel the
+    // splice by its user_data and defer the index-freeing CLOSE until it reaps (the splice pins the socket's fixed
+    // resource node exactly like a recv, so CLOSE must be the connection's last op).
     //
-    // Pin the splice in flight deterministically: a tiny pipe with NO reader, and
-    // a body larger than it. The first splice fills the pipe; the next parks in
-    // the kernel `wait_for_space` (pipe full, never drained) - an in-flight
-    // splice blocked on an io-wq worker. A graceful drain deliberately does NOT
-    // touch an in-flight splice (`begin_drain`'s quiesced test skips `splicing`
-    // -- it cannot tell this wedged transfer from a healthy one, and truncating
-    // a healthy one is the bug in `tcp_graceful_drain_lets_healthy_splice_finish`).
-    // So the wedged splice is reclaimed only when the grace Deadline escalates to
-    // a hard stop: this test proves that escalation's `cancel_and_reap_all` can
-    // cancel a splice BLOCKED in io-wq (whose SQE fd is the pipe, not the socket)
-    // rather than hanging on it - `serve_forever` returns promptly.
+    // Pin the splice in flight deterministically: a tiny pipe with NO reader, and a body larger than it. The first
+    // splice fills the pipe; the next parks in the kernel `wait_for_space` (pipe full, never drained) - an in-flight
+    // splice blocked on an io-wq worker. A graceful drain deliberately does NOT touch an in-flight splice
+    // (`begin_drain`'s quiesced test skips `splicing` -- it cannot tell this wedged transfer from a healthy one, and
+    // truncating a healthy one is the bug in `tcp_graceful_drain_lets_healthy_splice_finish`). So the wedged splice is
+    // reclaimed only when the grace Deadline escalates to a hard stop: this test proves that escalation's
+    // `cancel_and_reap_all` can cancel a splice BLOCKED in io-wq (whose SQE fd is the pipe, not the socket) rather than
+    // hanging on it - `serve_forever` returns promptly.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -2309,13 +2046,13 @@ fn tcp_splice_body_close_mid_splice() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<TcpStream> {
             let mut s = connect_tcp(v4)?;
-            // A data frame whose body overruns the unread pipe: the splice fills
-            // the pipe, then parks in flight (nothing drains it).
+            // A data frame whose body overruns the unread pipe: the splice fills the pipe, then parks in flight
+            // (nothing drains it).
             splice_frame(&mut s, b'S', &vec![0xABu8; BODY])?;
             thread::sleep(Duration::from_millis(150)); // let the splice park
             stop.shutdown_graceful(Duration::from_millis(300));
-            // Keep the socket open (returned); the hard stop abandons the
-            // connection and its EOF arrives when the server is dropped.
+            // Keep the socket open (returned); the hard stop abandons the connection and its EOF arrives when the
+            // server is dropped.
             Ok(s)
         })()
         .expect("client io")
@@ -2329,14 +2066,13 @@ fn tcp_splice_body_close_mid_splice() {
         t0.elapsed()
     );
     let mut s = client.join().expect("client join");
-    // Hard-stop abandoned the connection; dropping the server closes its pool
-    // descriptor and only then does the client see EOF, with no data.
+    // Hard-stop abandoned the connection; dropping the server closes its pool descriptor and only then does the client
+    // see EOF, with no data.
     drop(server);
     let mut buf = Vec::new();
     let n = s.read_to_end(&mut buf).unwrap_or(buf.len());
     assert_eq!(n, 0, "unexpected data after abandon: {buf:?}");
-    // SAFETY: closing the test-owned pipe fds (the server only borrowed the
-    // write end; nothing read the read end).
+    // SAFETY: closing the test-owned pipe fds (the server only borrowed the write end; nothing read the read end).
     unsafe {
         libc::close(pipe_rd);
         libc::close(pipe_wr);
@@ -2345,14 +2081,12 @@ fn tcp_splice_body_close_mid_splice() {
 
 #[test]
 fn tcp_splice_body_close_mid_poll() {
-    // Teardown while a splice is parked on its readiness POLL. A body splice off
-    // the non-blocking pool socket returns `-EAGAIN` when the socket is drained
-    // mid-body; the server then waits for `POLLIN` before resubmitting. Here the
-    // client sends a data-frame header but NO body, so the first splice EAGAINs
-    // and parks on the poll indefinitely. As with an in-flight splice, a graceful
-    // drain leaves the parked poll alone (`splice_polling` reads as in-flight
-    // work); the grace Deadline escalation then reaps it. This proves escalation
-    // doesn't hang on a parked splice poll - `serve_forever` returns promptly.
+    // Teardown while a splice is parked on its readiness POLL. A body splice off the non-blocking pool socket returns
+    // `-EAGAIN` when the socket is drained mid-body; the server then waits for `POLLIN` before resubmitting. Here the
+    // client sends a data-frame header but NO body, so the first splice EAGAINs and parks on the poll indefinitely. As
+    // with an in-flight splice, a graceful drain leaves the parked poll alone (`splice_polling` reads as in-flight
+    // work); the grace Deadline escalation then reaps it. This proves escalation doesn't hang on a parked splice poll -
+    // `serve_forever` returns promptly.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -2385,8 +2119,8 @@ fn tcp_splice_body_close_mid_poll() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<TcpStream> {
             let mut s = connect_tcp(v4)?;
-            // Header only, declaring an 8 MiB body: the splice arms, finds the
-            // socket empty, EAGAINs, and parks on the readiness poll.
+            // Header only, declaring an 8 MiB body: the splice arms, finds the socket empty, EAGAINs, and parks on the
+            // readiness poll.
             let mut hdr = vec![b'S'];
             hdr.extend_from_slice(&(8u32 * 1024 * 1024).to_be_bytes());
             s.write_all(&hdr)?;
@@ -2418,11 +2152,11 @@ fn tcp_splice_body_close_mid_poll() {
 
 #[test]
 fn tcp_splice_body_request_timeout_reclaims_stall() {
-    // SECURITY (slow-loris, splice path): a peer that sends a `SpliceBody` header
-    // then withholds the body must not pin its slot. The body splice EAGAINs on
+    // SECURITY (slow-loris, splice path): a peer that sends a `SpliceBody` header then withholds the body must not pin
+    // its slot. The body splice EAGAINs on
     // the drained non-blocking socket and parks on its readiness poll;
-    // `request_timeout` bounds that poll exactly like a body recv, so the stalled
-    // slot is reclaimed. (Without the bound the poll would wait forever.)
+    // `request_timeout` bounds that poll exactly like a body recv, so the stalled slot is reclaimed. (Without the bound
+    // the poll would wait forever.)
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -2457,8 +2191,8 @@ fn tcp_splice_body_request_timeout_reclaims_stall() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
-            // A SpliceBody header declaring an 8 MiB body, then stall: the splice
-            // parks on its readiness poll and request_timeout reclaims the slot.
+            // A SpliceBody header declaring an 8 MiB body, then stall: the splice parks on its readiness poll and
+            // request_timeout reclaims the slot.
             let mut stall = connect_tcp(v4)?;
             let mut hdr = vec![b'S'];
             hdr.extend_from_slice(&(8u32 * 1024 * 1024).to_be_bytes());
@@ -2481,13 +2215,11 @@ fn tcp_splice_body_request_timeout_reclaims_stall() {
 
 #[test]
 fn tcp_graceful_drain_lets_healthy_splice_finish() {
-    // `shutdown_graceful`'s contract: work in flight runs to completion
-    // within the grace. A body mid-splice IS in-flight work even though
-    // `recving` is false - the drain sweep must not classify it quiesced and
-    // cancel it (that silently truncates the body in the consumer's pipe).
-    // Regression test: begin a drain while a splice is parked on its
-    // readiness poll mid-body, then let the client finish; the FULL body must
-    // reach the pipe, and the connection closes only after it does.
+    // `shutdown_graceful`'s contract: work in flight runs to completion within the grace. A body mid-splice IS
+    // in-flight work even though `recving` is false - the drain sweep must not classify it quiesced and cancel it (that
+    // silently truncates the body in the consumer's pipe). Regression test: begin a drain while a splice is parked on
+    // its readiness poll mid-body, then let the client finish; the FULL body must reach the pipe, and the connection
+    // closes only after it does.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -2524,8 +2256,8 @@ fn tcp_graceful_drain_lets_healthy_splice_finish() {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // Header + first half: the splice moves what arrived, then parks
-            // on its readiness poll mid-body (`splice_polling`).
+            // Header + first half: the splice moves what arrived, then parks on its readiness poll mid-body
+            // (`splice_polling`).
             let mut first = vec![b'S'];
             first.extend_from_slice(&(BODY as u32).to_be_bytes());
             first.extend_from_slice(&sent[..BODY / 2]);
@@ -2537,8 +2269,8 @@ fn tcp_graceful_drain_lets_healthy_splice_finish() {
             thread::sleep(Duration::from_millis(100)); // let the sweep run
             s.write_all(&sent[BODY / 2..])?; // finish the transfer
 
-            // The body completes and only THEN does the drain close us --
-            // well inside the grace (no Deadline escalation involved).
+            // The body completes and only THEN does the drain close us -- well inside the grace (no Deadline escalation
+            // involved).
             let mut buf = Vec::new();
             s.read_to_end(&mut buf)?;
             assert!(
@@ -2554,8 +2286,7 @@ fn tcp_graceful_drain_lets_healthy_splice_finish() {
 
     server.serve_forever().expect("serve_forever");
     client.join().expect("client join").expect("client io");
-    // EOF the pipe, then read it all back: the drain must not have truncated
-    // the spliced body.
+    // EOF the pipe, then read it all back: the drain must not have truncated the spliced body.
     // SAFETY: closing the test-owned write end (the server only borrowed it).
     unsafe { libc::close(pipe_wr) };
     let mut got = Vec::new();
@@ -2566,16 +2297,14 @@ fn tcp_graceful_drain_lets_healthy_splice_finish() {
     assert_eq!(got, payload, "spliced body corrupted");
 }
 
-/// SECURITY: one destination pipe, one body. Two connections splicing to
-/// the same fd do not merely queue behind each other - they **interleave**.
-/// A splice moves at most what the transport hands over in one call, and
-/// the remainder is resubmitted as a fresh op, so another connection's
-/// splice can take the pipe's mutex in between and write its own bytes.
+/// SECURITY: one destination pipe, one body. Two connections splicing to the same fd do not merely queue behind each
+/// other - they **interleave**. A splice moves at most what the transport hands over in one call, and the remainder is
+/// resubmitted as a fresh op, so another connection's splice can take the pipe's mutex in between and write its own
+/// bytes.
 /// The second body is refused rather than served corrupt.
 ///
-/// A captured-fd framer closure is the shape that invites this, which is
-/// exactly what `splice_header` is - so this test is the framer every other
-/// splice test here uses, driven by two connections instead of one.
+/// A captured-fd framer closure is the shape that invites this, which is exactly what `splice_header` is - so this test
+/// is the framer every other splice test here uses, driven by two connections instead of one.
 #[test]
 fn tcp_splice_body_refuses_a_destination_already_in_use() {
     use std::sync::Mutex;
@@ -2617,32 +2346,23 @@ fn tcp_splice_body_refuses_a_destination_already_in_use() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
-            // The first connection opens a body far larger than the pipe and
-            // never finishes it, so its splice stays in flight.
-            // `pipe_rd` is this thread's for the duration; the outer scope
-            // closes both ends once it has joined.
+            // The first connection opens a body far larger than the pipe and never finishes it, so its splice stays in
+            // flight.
+            // `pipe_rd` is this thread's for the duration; the outer scope closes both ends once it has joined.
             let mut first = connect_tcp(v4)?;
             let mut hdr = vec![b'S'];
             hdr.extend_from_slice(&(8u32 * 1024 * 1024).to_be_bytes());
             first.write_all(&hdr)?;
             first.write_all(&[b'a'; 4096])?;
             first.flush()?;
-            // Wait for the splice by *observing* it, not by sleeping: the
-            // bytes reaching the pipe are the proof that the first body is
-            // in flight, and it stays in flight because only 4096 of the
-            // declared 8 MiB were sent.
+            // Wait for the splice by *observing* it, not by sleeping: the bytes reaching the pipe are the proof that
+            // the first body is in flight, and it stays in flight because only 4096 of the declared 8 MiB were sent.
             let mut drained = 0usize;
             let deadline = Instant::now() + Duration::from_secs(10);
             while drained < 4096 && Instant::now() < deadline {
                 let mut sink = [0u8; 4096];
                 // SAFETY: reading into a local buffer of its own length.
-                let n = unsafe {
-                    libc::read(
-                        pipe_rd,
-                        sink.as_mut_ptr().cast(),
-                        (4096 - drained) as libc::size_t,
-                    )
-                };
+                let n = unsafe { libc::read(pipe_rd, sink.as_mut_ptr().cast(), (4096 - drained) as libc::size_t) };
                 if n > 0 {
                     drained += n as usize;
                 }
@@ -2667,10 +2387,7 @@ fn tcp_splice_body_refuses_a_destination_already_in_use() {
     server.serve_forever().expect("serve_forever");
     client.join().expect("client join");
     assert!(
-        reasons
-            .lock()
-            .unwrap()
-            .contains(&CloseReason::SpliceFdInUse),
+        reasons.lock().unwrap().contains(&CloseReason::SpliceFdInUse),
         "a shared splice destination must be refused, got {:?}",
         reasons.lock().unwrap()
     );
@@ -2683,13 +2400,11 @@ fn tcp_splice_body_refuses_a_destination_already_in_use() {
 
 #[test]
 fn tcp_splice_body_nonblocking_pipe_rejected() {
-    // A NON-BLOCKING destination breaks the splice path's contract two ways:
-    // `do_splice` promotes the output fd's O_NONBLOCK to SPLICE_F_NONBLOCK,
-    // so a full pipe fails the splice with EAGAIN before the socket is read --
-    // indistinguishable from "socket empty", which would spin the readiness
-    // poll hot (POLLIN completes instantly, splice EAGAINs again) - and the
-    // designed blocking-pipe backpressure never engages. The server refuses
-    // the fd at body start: `CloseReason::SpliceBadFd`, kernel never sees it.
+    // A NON-BLOCKING destination breaks the splice path's contract two ways: `do_splice` promotes the output fd's
+    // O_NONBLOCK to SPLICE_F_NONBLOCK, so a full pipe fails the splice with EAGAIN before the socket is read --
+    // indistinguishable from "socket empty", which would spin the readiness poll hot (POLLIN completes instantly,
+    // splice EAGAINs again) - and the designed blocking-pipe backpressure never engages. The server refuses the fd at
+    // body start: `CloseReason::SpliceBadFd`, kernel never sees it.
     use std::sync::Mutex;
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
@@ -2768,11 +2483,10 @@ fn tcp_splice_body_nonblocking_pipe_rejected() {
 
 #[test]
 fn tcp_send_timeout_reclaims_slot() {
-    // A peer that requests a huge reply and then never reads it parks a
-    // MSG_WAITALL send forever (TCP zero-window probing never gives up). With
-    // `send_timeout`, the linked timeout cancels the stalled send and the
-    // connection's pool slot is reclaimed - proven with pool_size=1: a second
-    // client can only ever be served if the first slot was actually freed.
+    // A peer that requests a huge reply and then never reads it parks a MSG_WAITALL send forever (TCP zero-window
+    // probing never gives up). With `send_timeout`, the linked timeout cancels the stalled send and the connection's
+    // pool slot is reclaimed - proven with pool_size=1: a second client can only ever be served if the first slot was
+    // actually freed.
     const BIG: usize = 8 * 1024 * 1024; // far beyond the socket send buffer
     let cfg = ServerConfig {
         pool_size: 1,
@@ -2792,9 +2506,7 @@ fn tcp_send_timeout_reclaims_slot() {
         },
     );
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto,
     ) {
@@ -2810,15 +2522,14 @@ fn tcp_send_timeout_reclaims_slot() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let r = (|| -> io::Result<Vec<u8>> {
-            // Stalled reader: request the big reply, never read a byte, and
-            // keep the socket open so only the send timeout can free the slot.
+            // Stalled reader: request the big reply, never read a byte, and keep the socket open so only the send
+            // timeout can free the slot.
             let mut stalled = connect_tcp(v4)?;
             send_framed(&mut stalled, b"big")?;
             thread::sleep(Duration::from_millis(600)); // > send_timeout
 
-            // The slot must now be free; a fresh client gets served. Retry a
-            // few times in case the pool is momentarily mid-teardown (a shed
-            // connection sees accept-then-close).
+            // The slot must now be free; a fresh client gets served. Retry a few times in case the pool is momentarily
+            // mid-teardown (a shed connection sees accept-then-close).
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let attempt = (|| -> io::Result<Vec<u8>> {
@@ -2844,18 +2555,12 @@ fn tcp_send_timeout_reclaims_slot() {
 
 #[test]
 fn tcp_one_way_notification() {
-    // `Response::Reply(empty)` means "answered, nothing to send" - a one-way
-    // message. The connection stays open and the next request is served.
-    // Full Protocol here; `tcp_builder_close_and_one_way` covers the same
-    // contract through the `length_prefixed` builder (`Some(empty)` one-way,
-    // `None` close).
+    // `Response::Reply(empty)` means "answered, nothing to send" - a one-way message. The connection stays open and the
+    // next request is served. Full Protocol here; `tcp_builder_close_and_one_way` covers the same contract through the
+    // `length_prefixed` builder (`Some(empty)` one-way, `None` close).
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request { body, .. } = req;
             if &body[..] == b"notify" {
@@ -2895,9 +2600,8 @@ fn tcp_one_way_notification() {
 
 #[test]
 fn tcp_builder_close_and_one_way() {
-    // The `length_prefixed` builder's Option contract: `Some(empty)` is the
-    // one-way case (sends nothing, keeps serving - same as Response::Reply's
-    // documented empty semantics), `None` is the close signal.
+    // The `length_prefixed` builder's Option contract: `Some(empty)` is the one-way case (sends nothing, keeps
+    // serving - same as Response::Reply's documented empty semantics), `None` is the close signal.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let proto = length_prefixed(
@@ -2954,10 +2658,9 @@ fn tcp_builder_close_and_one_way() {
 
 #[test]
 fn tcp_length_prefix_overflow_rejected() {
-    // A u64 length prefix of !0 once wrapped the header+body usize total past
-    // the TooLarge guard (release) or panicked the loop on the add (debug) --
-    // a remote crash from one 8-byte message. It must instead close that
-    // connection as TooLarge and keep serving others.
+    // A u64 length prefix of !0 once wrapped the header+body usize total past the TooLarge guard (release) or panicked
+    // the loop on the add (debug) -- a remote crash from one 8-byte message. It must instead close that connection as
+    // TooLarge and keep serving others.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let proto = length_prefixed(PrefixWidth::U64, Endian::Big, false, echo);
@@ -2986,8 +2689,7 @@ fn tcp_length_prefix_overflow_rejected() {
             // The server must close this connection (TooLarge), not crash.
             let mut b = [0u8; 1];
             assert_eq!(s.read(&mut b)?, 0, "expected EOF after bogus prefix");
-            // ...and still serve a fresh connection (8-byte U64 framing in,
-            // `echo`'s 4-byte framing back).
+            // ...and still serve a fresh connection (8-byte U64 framing in, `echo`'s 4-byte framing back).
             let mut ok = connect_tcp(v4)?;
             ok.write_all(&4u64.to_be_bytes())?;
             ok.write_all(b"ping")?;
@@ -3009,9 +2711,8 @@ fn tcp_length_prefix_overflow_rejected() {
 
 #[test]
 fn tcp_need_overflow_rejected() {
-    // A custom framer that echoes a hostile wire length as `Framing::Need(n)`
-    // (the LSP pattern with an unvalidated Content-Length): the server must
-    // bound the requested read against max_request_bytes up front - both the
+    // A custom framer that echoes a hostile wire length as `Framing::Need(n)` (the LSP pattern with an unvalidated
+    // Content-Length): the server must bound the requested read against max_request_bytes up front - both the
     // overflowing and the merely-huge shape - not allocate n bytes.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
@@ -3048,11 +2749,7 @@ fn tcp_need_overflow_rejected() {
                 let mut s = connect_tcp(v4)?;
                 s.write_all(first_byte)?;
                 let mut b = [0u8; 1];
-                assert_eq!(
-                    s.read(&mut b)?,
-                    0,
-                    "expected EOF after hostile Need"
-                );
+                assert_eq!(s.read(&mut b)?, 0, "expected EOF after hostile Need");
             }
             Ok(())
         })()
@@ -3072,17 +2769,12 @@ fn tcp_need_overflow_rejected() {
 
 #[test]
 fn tcp_stale_deferred_dropped() {
-    // A handler that mints a Deferred but then answers inline: the worker's
-    // late reply is for a request that was already answered, so it must be
-    // dropped (per-request token gating) - not sent as a spurious extra PDU,
-    // and its Drop-close must not kill the healthy connection.
+    // A handler that mints a Deferred but then answers inline: the worker's late reply is for a request that was
+    // already answered, so it must be dropped (per-request token gating) - not sent as a spurious extra PDU, and its
+    // Drop-close must not kill the healthy connection.
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request { responder, .. } = req;
             let (deferred, _permit) = responder.defer();
@@ -3130,10 +2822,9 @@ fn tcp_stale_deferred_dropped() {
 
 #[test]
 fn tcp_mismatched_defer_permit_closes() {
-    // A DeferPermit is stamped with its request's token and verified at
-    // delivery: stashing one and returning it for a LATER request (whose own
-    // defer() was never called) must close the connection - not park a
-    // request nothing can ever resolve, wedging the slot until shutdown.
+    // A DeferPermit is stamped with its request's token and verified at delivery: stashing one and returning it for a
+    // LATER request (whose own defer() was never called) must close the connection - not park a request nothing can
+    // ever resolve, wedging the slot until shutdown.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     struct Stash {
@@ -3141,17 +2832,10 @@ fn tcp_mismatched_defer_permit_closes() {
     }
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(Stash { pair: None }),
-        header: length_prefix_header::<Stash>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<Stash>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, Stash>| {
             let Request {
-                body,
-                state,
-                responder,
-                ..
+                body, state, responder, ..
             } = req;
             if &body[..] == b"mint" {
                 // Mint and stash the pair, then answer inline. Keeping the
@@ -3187,18 +2871,13 @@ fn tcp_mismatched_defer_permit_closes() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // Bound the read: a wedged (parked-forever) connection must fail
-            // the test, not hang it.
+            // Bound the read: a wedged (parked-forever) connection must fail the test, not hang it.
             s.set_read_timeout(Some(Duration::from_secs(5)))?;
             send_framed(&mut s, b"mint")?;
             assert_eq!(recv_framed(&mut s)?, b"ok");
             send_framed(&mut s, b"boom")?;
             let mut b = [0u8; 1];
-            assert_eq!(
-                s.read(&mut b)?,
-                0,
-                "expected close on mismatched permit"
-            );
+            assert_eq!(s.read(&mut b)?, 0, "expected close on mismatched permit");
             Ok(())
         })()
         .expect("client io");
@@ -3216,9 +2895,8 @@ fn tcp_mismatched_defer_permit_closes() {
 
 #[test]
 fn tcp_reuse_port_and_options() {
-    // SO_REUSEPORT: a second server binds the same address iff both set the
-    // flag (otherwise EADDRINUSE). Also smoke-tests the other socket options
-    // (nodelay is default-on; keepalive + TCP_USER_TIMEOUT set here).
+    // SO_REUSEPORT: a second server binds the same address iff both set the flag (otherwise EADDRINUSE). Also
+    // smoke-tests the other socket options (nodelay is default-on; keepalive + TCP_USER_TIMEOUT set here).
     let cfg = ServerConfig {
         reuse_port: true,
         keepalive: Some(Duration::from_secs(30)),
@@ -3227,9 +2905,7 @@ fn tcp_reuse_port_and_options() {
     };
     let proto = || length_prefixed(PrefixWidth::U32, Endian::Big, false, echo);
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto(),
     ) {
@@ -3243,33 +2919,26 @@ fn tcp_reuse_port_and_options() {
 
     // Second bind to the SAME port must succeed with reuse_port...
     //
-    // `with_config` is a ring setup as well as a bind, and a second ring
-    // needs physically contiguous high-order pages: on the platform this
-    // crate targets, where ARC holds most of RAM, that is exactly the
-    // allocation that fails `ENOMEM`. That is the environmental skip
-    // `should_skip` already answers for the first server above - and
-    // `TRUENAS_ROS_REQUIRE_IO_URING`, which both CI lanes arm, turns it
-    // red where it must not happen. The message names the call, because
-    // `bind(2)` is not what refused.
-    let second = match Server::with_config([ServerAddr::Tcp(v4)], cfg, proto())
-    {
+    // `with_config` is a ring setup as well as a bind, and a second ring needs physically contiguous high-order pages:
+    // on the platform this crate targets, where ARC holds most of RAM, that is exactly the allocation that fails
+    // `ENOMEM`. That is the environmental skip `should_skip` already answers for the first server above - and
+    // `TRUENAS_ROS_REQUIRE_IO_URING`, which both CI lanes arm, turns it red where it must not happen. The message names
+    // the call, because `bind(2)` is not what refused.
+    let second = match Server::with_config([ServerAddr::Tcp(v4)], cfg, proto()) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("reuse_port second Server::with_config: {e}"),
     };
-    // ...and is dropped before any client connects, so the kernel cannot have
-    // routed our test connection into its (never-served) backlog.
+    // ...and is dropped before any client connects, so the kernel cannot have routed our test connection into its
+    // (never-served) backlog.
     drop(second);
 
     // Without the flag the same bind fails with EADDRINUSE.
     //
-    // `Server::bind` is `with_config` with the default config
-    // (`net/server/mod.rs`), so it sets a ring up exactly as the two calls
-    // above do - and answers the same environmental `ENOMEM` for the same
-    // reason. Screened through `should_skip` before the errno is judged,
-    // or that skip becomes `expected EADDRINUSE, got ENOMEM`: a hard
-    // failure naming the wrong syscall, on the one call in this test that
-    // was left unguarded.
+    // `Server::bind` is `with_config` with the default config (`net/server/mod.rs`), so it sets a ring up exactly as
+    // the two calls above do - and answers the same environmental `ENOMEM` for the same reason. Screened through
+    // `should_skip` before the errno is judged, or that skip becomes `expected EADDRINUSE, got ENOMEM`: a hard failure
+    // naming the wrong syscall, on the one call in this test that was left unguarded.
     let dup = Server::bind(
         [ServerAddr::Tcp(v4)],
         length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
@@ -3287,8 +2956,7 @@ fn tcp_reuse_port_and_options() {
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        let r = connect_tcp(v4)
-            .and_then(|s| framed_roundtrips(s, &[b"opts" as &[u8]]));
+        let r = connect_tcp(v4).and_then(|s| framed_roundtrips(s, &[b"opts" as &[u8]]));
         stop.shutdown();
         r
     });
@@ -3299,9 +2967,8 @@ fn tcp_reuse_port_and_options() {
 
 #[test]
 fn unix_peercred_auth() {
-    // With `unix_peercred`, the accept handler receives the peer's SO_PEERCRED
-    // (fetched via an io_uring socket URING_CMD - Linux >= 6.7; this host is
-    // newer) before running, and can authenticate on it. The body echoes the
+    // With `unix_peercred`, the accept handler receives the peer's SO_PEERCRED (fetched via an io_uring socket
+    // URING_CMD - Linux >= 6.7; this host is newer) before running, and can authenticate on it. The body echoes the
     // credentials back and the client checks them against its real ids.
     let dir = truenas_ros::tempdir().unwrap();
     let path = dir.path().join("cred.sock");
@@ -3315,25 +2982,17 @@ fn unix_peercred_auth() {
             ClientAddr::Unix { cred: Some(c) } => Some(*c),
             _ => None,
         },
-        header: length_prefix_header::<PeerCred>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<PeerCred>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, PeerCred>| {
             let Request { state: cred, .. } = req;
-            Response::Reply(echo_frame(
-                format!("{}:{}:{}", cred.pid, cred.uid, cred.gid).as_bytes(),
-            ))
+            Response::Reply(echo_frame(format!("{}:{}:{}", cred.pid, cred.uid, cred.gid).as_bytes()))
         },
     };
-    let mut server =
-        match Server::with_config([ServerAddr::Unix(path.clone())], cfg, proto)
-        {
-            Ok(s) => s,
-            Err(e) if should_skip(&e) || peercred_unsupported(&e) => return,
-            Err(e) => panic!("bind: {e}"),
-        };
+    let mut server = match Server::with_config([ServerAddr::Unix(path.clone())], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) || peercred_unsupported(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
     let stop = server.shutdown_handle();
 
     let client = thread::spawn(move || {
@@ -3363,25 +3022,18 @@ fn unix_peercred_auth() {
 
 #[test]
 fn tcp_push_pub_sub() {
-    // Server push: a subscriber stashes its PushHandle via the "sub" request; a
-    // publisher's "pub" request pushes an unsolicited PDU to the subscriber.
-    // After the subscriber disconnects, further pushes are dropped harmlessly
-    // and the publisher's connection keeps working.
+    // Server push: a subscriber stashes its PushHandle via the "sub" request; a publisher's "pub" request pushes an
+    // unsolicited PDU to the subscriber. After the subscriber disconnects, further pushes are dropped harmlessly and
+    // the publisher's connection keeps working.
     use std::sync::Mutex;
     let sub_handle: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: {
             let sub_handle = Arc::clone(&sub_handle);
             move |req: Request<'_, ()>| {
-                let Request {
-                    body, responder, ..
-                } = req;
+                let Request { body, responder, .. } = req;
                 if &body[..] == b"sub" {
                     *sub_handle.lock().unwrap() = Some(responder.push_handle());
                     Response::Reply(echo_frame(b"subscribed"))
@@ -3420,8 +3072,7 @@ fn tcp_push_pub_sub() {
             // The unsolicited push arrives on the subscriber's connection.
             assert_eq!(recv_framed(&mut sub)?, b"event-1");
 
-            // Subscriber leaves; a push to the dead connection is dropped and
-            // the publisher keeps working.
+            // Subscriber leaves; a push to the dead connection is dropped and the publisher keeps working.
             drop(sub);
             thread::sleep(Duration::from_millis(50)); // let the close land
             send_framed(&mut publisher, b"pub:event-2")?;
@@ -3440,16 +3091,13 @@ fn tcp_push_pub_sub() {
 
 #[test]
 fn tcp_push_backlog_evicts() {
-    // A subscriber that stops reading: pushes accumulate until
-    // max_send_backlog, then the connection is evicted with SendBacklog.
+    // A subscriber that stops reading: pushes accumulate until max_send_backlog, then the connection is evicted with
+    // SendBacklog.
     use std::sync::Mutex;
-    // Each push must exceed what the kernel alone can absorb - sndbuf
-    // autotunes up to tcp_wmem[2] (typically 4 MiB) plus the peer's ~128 KiB
-    // initial window - because a fully-absorbed WAITALL send completes and
-    // leaves the library queue empty. At 32 MiB the first push is still
-    // (partially) queued when the second arrives (`queued_bytes` counts the
-    // whole front PDU until fully sent), so the second deterministically
-    // overflows the cap.
+    // Each push must exceed what the kernel alone can absorb - sndbuf autotunes up to tcp_wmem[2] (typically 4 MiB)
+    // plus the peer's ~128 KiB initial window - because a fully-absorbed WAITALL send completes and leaves the library
+    // queue empty. At 32 MiB the first push is still (partially) queued when the second arrives (`queued_bytes` counts
+    // the whole front PDU until fully sent), so the second deterministically overflows the cap.
     const PUSH: usize = 32 * 1024 * 1024;
     let sub_handle: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let reasons = Arc::new(Mutex::new(Vec::new()));
@@ -3459,17 +3107,11 @@ fn tcp_push_backlog_evicts() {
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: {
             let sub_handle = Arc::clone(&sub_handle);
             move |req: Request<'_, ()>| {
-                let Request {
-                    body, responder, ..
-                } = req;
+                let Request { body, responder, .. } = req;
                 if &body[..] == b"sub" {
                     *sub_handle.lock().unwrap() = Some(responder.push_handle());
                     Response::Reply(echo_frame(b"ok"))
@@ -3485,9 +3127,7 @@ fn tcp_push_backlog_evicts() {
         },
     };
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto,
     ) {
@@ -3540,11 +3180,9 @@ fn tcp_push_backlog_evicts() {
 
 #[test]
 fn tcp_push_held_across_detach() {
-    // PushHandle's contract is "usable for the connection's lifetime". While
-    // the connection is DETACHED its raw stream belongs to the worker - a
-    // push must neither write mid-detach (corrupting the worker's transfer)
-    // nor be silently dropped: it queues against the parked connection and
-    // flushes, FIFO, when the worker resumes it.
+    // PushHandle's contract is "usable for the connection's lifetime". While the connection is DETACHED its raw stream
+    // belongs to the worker - a push must neither write mid-detach (corrupting the worker's transfer) nor be silently
+    // dropped: it queues against the parked connection and flushes, FIFO, when the worker resumes it.
     use std::sync::Mutex;
     use std::sync::mpsc;
     let push_slot: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
@@ -3556,11 +3194,7 @@ fn tcp_push_held_across_detach() {
     let stash = Arc::clone(&push_slot);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| match &req.body[..] {
             b"sub" => {
                 *stash.lock().unwrap() = Some(req.responder.push_handle());
@@ -3600,16 +3234,13 @@ fn tcp_push_held_across_detach() {
             assert_eq!(recv_framed(&mut s)?, b"ok");
             send_framed(&mut s, b"detach")?;
             parked_rx.recv().expect("parked");
-            // The connection is parked with a worker: push now. These must be
-            // HELD (not written - the worker owns the stream - and not
-            // dropped), then flushed in order at resume.
-            let push =
-                push_slot.lock().unwrap().clone().expect("stashed handle");
+            // The connection is parked with a worker: push now. These must be HELD (not written - the worker owns the
+            // stream - and not dropped), then flushed in order at resume.
+            let push = push_slot.lock().unwrap().clone().expect("stashed handle");
             for i in 0..3u8 {
                 push.push(echo_frame(format!("evt{i}").as_bytes()));
             }
-            // Let the loop drain the injections while still parked (a drop
-            // would happen here, silently).
+            // Let the loop drain the injections while still parked (a drop would happen here, silently).
             thread::sleep(Duration::from_millis(150));
             resume_tx.send(()).expect("resume signal");
             for i in 0..3u8 {
@@ -3634,22 +3265,16 @@ fn tcp_push_held_across_detach() {
 
 #[test]
 fn tcp_reply_close_replies_then_closes() {
-    // `Response::ReplyClose`: the server speaks last. The client gets the
-    // reply and then EOF - no idle-timeout wait, no relying on the peer to
-    // hang up (RFC 6455 sec. 5.5.1-style close handshakes need exactly this).
-    // A second request pipelined behind the first is discarded undelivered:
-    // the farewell retires the recv side.
+    // `Response::ReplyClose`: the server speaks last. The client gets the reply and then EOF - no idle-timeout wait, no
+    // relying on the peer to hang up (RFC 6455 sec. 5.5.1-style close handshakes need exactly this). A second request
+    // pipelined behind the first is discarded undelivered: the farewell retires the recv side.
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let delivered = Arc::new(AtomicUsize::new(0));
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: {
             let delivered = Arc::clone(&delivered);
             move |req: Request<'_, ()>| {
@@ -3679,8 +3304,7 @@ fn tcp_reply_close_replies_then_closes() {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // Two requests in one write: only the first is served - the
-            // farewell is final.
+            // Two requests in one write: only the first is served - the farewell is final.
             let mut wire = Vec::new();
             send_framed(&mut wire, b"bye")?;
             send_framed(&mut wire, b"ignored")?;
@@ -3704,26 +3328,18 @@ fn tcp_reply_close_replies_then_closes() {
     server.serve_forever().expect("serve_forever");
     client.join().expect("thread join").expect("client io");
     assert_eq!(delivered.load(Ordering::SeqCst), 1, "pipelined 2nd request");
-    assert_eq!(
-        reasons.lock().unwrap().as_slice(),
-        &[CloseReason::HandlerClosed],
-    );
+    assert_eq!(reasons.lock().unwrap().as_slice(), &[CloseReason::HandlerClosed],);
 }
 
 #[test]
 fn tcp_deferred_reply_close() {
-    // `Deferred::reply_close`: the worker speaks last - its final PDU is
-    // sent, then the connection closes (WorkerClosed), exactly like the
-    // inline `Response::ReplyClose` but from another thread.
+    // `Deferred::reply_close`: the worker speaks last - its final PDU is sent, then the connection closes
+    // (WorkerClosed), exactly like the inline `Response::ReplyClose` but from another thread.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
             let input = req.body.to_vec();
             let (deferred, permit) = req.responder.defer();
@@ -3767,27 +3383,19 @@ fn tcp_deferred_reply_close() {
 
     server.serve_forever().expect("serve_forever");
     client.join().expect("thread join").expect("client io");
-    assert_eq!(
-        reasons.lock().unwrap().as_slice(),
-        &[CloseReason::WorkerClosed],
-    );
+    assert_eq!(reasons.lock().unwrap().as_slice(), &[CloseReason::WorkerClosed],);
 }
 
 #[test]
 fn tcp_deferred_reply_close_empty_flushes_queued() {
-    // An EMPTY `reply_close` queues no PDU of its own but still flushes
-    // whatever is already queued before closing - here a push the worker
-    // issued just before it (both ride the same FIFO injection queue, so
-    // the order is deterministic). `Response::Close` would drop that push.
+    // An EMPTY `reply_close` queues no PDU of its own but still flushes whatever is already queued before closing -
+    // here a push the worker issued just before it (both ride the same FIFO injection queue, so the order is
+    // deterministic). `Response::Close` would drop that push.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
             let push = req.responder.push_handle();
             let (deferred, permit) = req.responder.defer();
@@ -3832,17 +3440,13 @@ fn tcp_deferred_reply_close_empty_flushes_queued() {
 
     server.serve_forever().expect("serve_forever");
     client.join().expect("thread join").expect("client io");
-    assert_eq!(
-        reasons.lock().unwrap().as_slice(),
-        &[CloseReason::WorkerClosed],
-    );
+    assert_eq!(reasons.lock().unwrap().as_slice(), &[CloseReason::WorkerClosed],);
 }
 
-/// A throwaway protocol for the construction-time validation cases, which are
-/// rejected before any socket or ring exists and so never reach io_uring.
-// Three opaque closure types in the return, for the same reason
-// `net::server::length_prefixed` carries this allow: they cannot be
-// type-aliased on stable, and the signature IS the type.
+/// A throwaway protocol for the construction-time validation cases, which are rejected before any socket or ring exists
+/// and so never reach io_uring.
+// Three opaque closure types in the return, for the same reason `net::server::length_prefixed` carries this allow: they
+// cannot be type-aliased on stable, and the signature IS the type.
 #[allow(clippy::type_complexity)]
 fn noop_protocol() -> Protocol<
     impl FnMut(Incoming<'_>) -> Option<()>,
@@ -3851,28 +3455,21 @@ fn noop_protocol() -> Protocol<
 > {
     Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     }
 }
 
 #[test]
 fn server_config_bounds_are_rejected_at_construction() {
-    // `ServerConfig::validate` runs as the first statement of `with_config`,
-    // before a socket or a ring exists, so every case here is reachable with
-    // no io_uring at all. Each knob is checked for the message it produces,
-    // not merely that it errored: an out-of-range value accepted here becomes
-    // a truncated completion token or a thread storm much later, and the
-    // message is the only thing naming the knob that was wrong.
+    // `ServerConfig::validate` runs as the first statement of `with_config`, before a socket or a ring exists, so every
+    // case here is reachable with no io_uring at all. Each knob is checked for the message it produces, not merely that
+    // it errored: an out-of-range value accepted here becomes a truncated completion token or a thread storm much
+    // later, and the message is the only thing naming the knob that was wrong.
     use truenas_ros::net::server::Listen;
-    let tcp =
-        || ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let expect = |addrs: Vec<Listen>, cfg: ServerConfig, needle: &str| {
-        match Server::with_config(addrs, cfg, noop_protocol()) {
+    let tcp = || ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let expect =
+        |addrs: Vec<Listen>, cfg: ServerConfig, needle: &str| match Server::with_config(addrs, cfg, noop_protocol()) {
             Err(Error::Validation(m)) => assert!(
                 m.contains(needle),
                 "expected a validation error mentioning {needle:?}, got {m:?}",
@@ -3881,8 +3478,7 @@ fn server_config_bounds_are_rejected_at_construction() {
                 panic!("expected a validation error for {needle:?}, got {e}")
             }
             Ok(_) => panic!("expected {needle:?} to be rejected"),
-        }
-    };
+        };
 
     // The listener list itself.
     expect(Vec::new(), ServerConfig::default(), "listener count");
@@ -3936,10 +3532,9 @@ fn server_config_bounds_are_rejected_at_construction() {
             },
             "max_send_backlog must be non-zero",
         ),
-        // `listen(2)` takes a signed backlog but compares it unsigned, so a
-        // negative value is reinterpreted as enormous and silently clamped to
-        // somaxconn rather than rejected; zero listens but accepts almost
-        // nothing. Neither is what any caller meant.
+        // `listen(2)` takes a signed backlog but compares it unsigned, so a negative value is reinterpreted as enormous
+        // and silently clamped to somaxconn rather than rejected; zero listens but accepts almost nothing. Neither is
+        // what any caller meant.
         (
             ServerConfig {
                 backlog: 0,
@@ -3994,8 +3589,7 @@ fn server_config_bounds_are_rejected_at_construction() {
         expect(one(), cfg, needle);
     }
 
-    // A timeout knob is optional, but `Some(0)` is never what anyone means:
-    // it would expire the moment it was armed.
+    // A timeout knob is optional, but `Some(0)` is never what anyone means: it would expire the moment it was armed.
     let zero = Duration::ZERO;
     for (cfg, needle) in [
         (
@@ -4055,24 +3649,18 @@ fn server_config_bounds_are_rejected_at_construction() {
 #[cfg(feature = "uring-fs")]
 #[test]
 fn server_config_fs_pool_bounds_are_rejected_at_construction() {
-    // The fs knobs carry their own bounds for reasons the generic ones do not:
-    // an op-slot index shares the 24-bit `user_data` slot field, so an
+    // The fs knobs carry their own bounds for reasons the generic ones do not: an op-slot index shares the 24-bit
+    // `user_data` slot field, so an
     // oversized `fs_ops` would truncate a completion token rather than fail;
-    // and the offload floor spawns eagerly
-    // on the reactor thread, so an absurd value is a thread storm at first use.
-    // Both must fail here, at construction, where the message still names the
-    // knob.
+    // and the offload floor spawns eagerly on the reactor thread, so an absurd value is a thread storm at first use.
+    // Both must fail here, at construction, where the message still names the knob.
     use truenas_ros::net::server::Listen;
     let one = || {
         vec![Listen::from(ServerAddr::Tcp(
             "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
         ))]
     };
-    let expect = |cfg: ServerConfig, needle: &str| match Server::with_config(
-        one(),
-        cfg,
-        noop_protocol(),
-    ) {
+    let expect = |cfg: ServerConfig, needle: &str| match Server::with_config(one(), cfg, noop_protocol()) {
         Err(Error::Validation(m)) => assert!(
             m.contains(needle),
             "expected a validation error mentioning {needle:?}, got {m:?}",
@@ -4111,8 +3699,8 @@ fn server_config_fs_pool_bounds_are_rejected_at_construction() {
         },
         "fs_offload_floor",
     );
-    // The body chunk sizes two kernel-visible buffers per streaming
-    // connection and its read result must fit a CQE's i32.
+    // The body chunk sizes two kernel-visible buffers per streaming connection and its read result must fit a CQE's
+    // i32.
     expect(
         ServerConfig {
             fs_body_chunk: 0, // below the 4 KiB floor
@@ -4129,11 +3717,9 @@ fn server_config_fs_pool_bounds_are_rejected_at_construction() {
     );
 }
 
-/// `Response::ReplyFile` on a server built WITHOUT an fs pool must refuse
-/// loudly - close before any reply byte - never send the head and then a
-/// body it has no reactor to read. The `File` comes from a standalone
-/// `UringFs` host: an open fd is host-independent, which is exactly the
-/// misconfiguration shape (files wired over from one reactor into a server
+/// `Response::ReplyFile` on a server built WITHOUT an fs pool must refuse loudly - close before any reply byte - never
+/// send the head and then a body it has no reactor to read. The `File` comes from a standalone `UringFs` host: an open
+/// fd is host-independent, which is exactly the misconfiguration shape (files wired over from one reactor into a server
 /// missing `fs_ops`).
 #[cfg(feature = "uring-fs")]
 #[test]
@@ -4161,12 +3747,7 @@ fn file_reply_without_an_fs_pool_sheds_loudly() {
     let (ftx, frx) = mpsc::channel();
     thread::scope(|sc| {
         sc.spawn(move || {
-            let r = handle.open(
-                who,
-                &anchor,
-                c"f",
-                OpenHow::new().flags(OFlag::O_RDONLY),
-            );
+            let r = handle.open(who, &anchor, c"f", OpenHow::new().flags(OFlag::O_RDONLY));
             let _ = ftx.send(r);
             stop_fs.shutdown();
         });
@@ -4179,11 +3760,7 @@ fn file_reply_without_an_fs_pool_sheds_loudly() {
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |_req: Request<'_, ()>| Response::ReplyFile {
             head: b"HEAD".to_vec(),
             file: file_slot.lock().unwrap().take().expect("one request"),
@@ -4217,10 +3794,7 @@ fn file_reply_without_an_fs_pool_sheds_loudly() {
             s.write_all(&msg)?;
             let mut buf = Vec::new();
             s.read_to_end(&mut buf)?;
-            assert!(
-                buf.is_empty(),
-                "refusal must be a close, not a short body: {buf:?}"
-            );
+            assert!(buf.is_empty(), "refusal must be a close, not a short body: {buf:?}");
             Ok(())
         })();
         stop.shutdown();
@@ -4237,27 +3811,18 @@ fn file_reply_without_an_fs_pool_sheds_loudly() {
 
 #[test]
 fn tcp_deferred_worker_completes_with_nothing() {
-    // `Deferred::reply` with an EMPTY body is the one-way case: the worker
-    // finished, there is nothing to send, and the request must simply be
-    // retired. It travels as its own outcome rather than as an empty reply,
-    // because a queued reply has its in-flight count retired when the send
-    // flushes and here no send will ever happen - so the count is dropped
-    // where the outcome lands instead. Get that wrong and the connection
-    // keeps a phantom request forever, which the request cap would eventually
-    // stall on. Proven by continuing to serve afterwards: a leaked count would
-    // still be outstanding.
+    // `Deferred::reply` with an EMPTY body is the one-way case: the worker finished, there is nothing to send, and the
+    // request must simply be retired. It travels as its own outcome rather than as an empty reply, because a queued
+    // reply has its in-flight count retired when the send flushes and here no send will ever happen - so the count is
+    // dropped where the outcome lands instead. Get that wrong and the connection keeps a phantom request forever, which
+    // the request cap would eventually stall on. Proven by continuing to serve afterwards: a leaked count would still
+    // be outstanding.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             if &body[..] == b"oneway" {
                 let (deferred, permit) = responder.defer();
                 thread::spawn(move || {
@@ -4284,9 +3849,8 @@ fn tcp_deferred_worker_completes_with_nothing() {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<Vec<u8>> {
             let mut s = connect_tcp(v4)?;
-            // Several one-way requests in a row: each must retire its own
-            // in-flight count, or the cap stalls the connection well before
-            // the round-trip below completes.
+            // Several one-way requests in a row: each must retire its own in-flight count, or the cap stalls the
+            // connection well before the round-trip below completes.
             for _ in 0..4 {
                 send_framed(&mut s, b"oneway")?;
             }
@@ -4307,30 +3871,21 @@ fn tcp_deferred_worker_completes_with_nothing() {
 
 #[test]
 fn tcp_push_close_after_the_peer_is_gone_is_inert() {
-    // A `PushHandle` outlives the connection it names - that is the point of a
-    // long-lived handle - so a `close` can always arrive after the peer has
-    // already vanished, or after the slot has been recycled onto somebody
-    // else. It must be inert rather than tearing down whoever holds the slot
-    // now. Here the subscriber disconnects, a second client takes its place,
-    // and only then does the stale handle fire.
+    // A `PushHandle` outlives the connection it names - that is the point of a long-lived handle - so a `close` can
+    // always arrive after the peer has already vanished, or after the slot has been recycled onto somebody else. It
+    // must be inert rather than tearing down whoever holds the slot now. Here the subscriber disconnects, a second
+    // client takes its place, and only then does the stale handle fire.
     use std::sync::Mutex;
     let stash: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let handle_for_body = Arc::clone(&stash);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             if &body[..] == b"sub" {
-                *handle_for_body.lock().unwrap() =
-                    Some(responder.push_handle());
+                *handle_for_body.lock().unwrap() = Some(responder.push_handle());
             }
             Response::Reply(echo_frame(&body))
         },
@@ -4359,8 +3914,7 @@ fn tcp_push_close_after_the_peer_is_gone_is_inert() {
             send_framed(&mut second, b"hello")?;
             assert_eq!(recv_framed(&mut second)?, b"hello");
 
-            // Fire the stale handle: it names a dead connection (and possibly
-            // this one's slot at an older generation).
+            // Fire the stale handle: it names a dead connection (and possibly this one's slot at an older generation).
             stash.lock().unwrap().take().expect("stashed").close();
             thread::sleep(Duration::from_millis(100));
 
@@ -4382,13 +3936,11 @@ fn tcp_push_close_after_the_peer_is_gone_is_inert() {
 
 #[test]
 fn tcp_push_close_during_a_detach_window_lands_at_resume() {
-    // A `PushHandle::close` arriving while the connection is parked under a
-    // detach worker cannot act immediately: the worker owns the raw stream, so
-    // writing the queued farewell or tearing the socket down would corrupt its
-    // transfer. It is recorded and enacted at resume - after the pushes held
-    // during the same window, which ride ahead of it. So the client must see
-    // every held push, in order, and *then* EOF, with the close attributed to
-    // the push side rather than to the worker.
+    // A `PushHandle::close` arriving while the connection is parked under a detach worker cannot act immediately: the
+    // worker owns the raw stream, so writing the queued farewell or tearing the socket down would corrupt its transfer.
+    // It is recorded and enacted at resume - after the pushes held during the same window, which ride ahead of it. So
+    // the client must see every held push, in order, and *then* EOF, with the close attributed to the push side rather
+    // than to the worker.
     use std::sync::Mutex;
     use std::sync::mpsc;
     let push_slot: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
@@ -4400,11 +3952,7 @@ fn tcp_push_close_during_a_detach_window_lands_at_resume() {
     let stash = Arc::clone(&push_slot);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| match &req.body[..] {
             b"sub" => {
                 *stash.lock().unwrap() = Some(req.responder.push_handle());
@@ -4446,8 +3994,7 @@ fn tcp_push_close_during_a_detach_window_lands_at_resume() {
             send_framed(&mut s, b"detach")?;
             parked_rx.recv().expect("parked");
 
-            let push =
-                push_slot.lock().unwrap().clone().expect("stashed handle");
+            let push = push_slot.lock().unwrap().clone().expect("stashed handle");
             push.push(echo_frame(b"farewell"));
             push.close(); // lands during the detach window
             // Let the loop drain both injections while still parked.
@@ -4483,28 +4030,20 @@ fn tcp_push_close_during_a_detach_window_lands_at_resume() {
 
 #[test]
 fn tcp_push_close_kicks_subscriber() {
-    // `PushHandle::close`: a connection is ended from outside its own
-    // request cycle (session revocation / admin kick). A farewell pushed
-    // just before the close flushes first; a push after it is dropped
-    // (nothing follows the farewell); repeat closes are no-ops; and the
-    // kicked connection's close hook reports PushClosed while other
-    // connections keep serving.
+    // `PushHandle::close`: a connection is ended from outside its own request cycle (session revocation / admin kick).
+    // A farewell pushed just before the close flushes first; a push after it is dropped (nothing follows the farewell);
+    // repeat closes are no-ops; and the kicked connection's close hook reports PushClosed while other connections keep
+    // serving.
     use std::sync::Mutex;
     let sub_handle: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: {
             let sub_handle = Arc::clone(&sub_handle);
             move |req: Request<'_, ()>| {
-                let Request {
-                    body, responder, ..
-                } = req;
+                let Request { body, responder, .. } = req;
                 if &body[..] == b"sub" {
                     *sub_handle.lock().unwrap() = Some(responder.push_handle());
                     Response::Reply(echo_frame(b"subscribed"))
@@ -4550,8 +4089,8 @@ fn tcp_push_close_kicks_subscriber() {
             send_framed(&mut admin, b"kick")?;
             assert_eq!(recv_framed(&mut admin)?, b"kicked");
 
-            // The subscriber gets the farewell, then EOF - and nothing
-            // after the farewell (the too-late push was dropped).
+            // The subscriber gets the farewell, then EOF - and nothing after the farewell (the too-late push was
+            // dropped).
             assert_eq!(recv_framed(&mut sub)?, b"farewell");
             let mut rest = Vec::new();
             sub.read_to_end(&mut rest)?;
@@ -4570,9 +4109,7 @@ fn tcp_push_close_kicks_subscriber() {
     client.join().expect("thread join").expect("client io");
     let got = reasons.lock().unwrap().clone();
     assert_eq!(
-        got.iter()
-            .filter(|r| **r == CloseReason::PushClosed)
-            .count(),
+        got.iter().filter(|r| **r == CloseReason::PushClosed).count(),
         1,
         "expected exactly one PushClosed, got {got:?}"
     );
@@ -4583,15 +4120,9 @@ fn tcp_stats_counts() {
     // The stats handle reads live counters from another thread.
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             if &body[..] == b"defer" {
                 let input = body.to_vec();
                 let (deferred, permit) = responder.defer();
@@ -4649,13 +4180,12 @@ fn tcp_stats_counts() {
     assert_eq!(s.replies, 3, "replies: {s:?}");
     assert_eq!(s.rejected, 0, "rejected: {s:?}");
     assert!(s.bytes_in > 0 && s.bytes_out > 0, "bytes: {s:?}");
-    // Length-prefixed framing costs exactly two recvs per request (header,
-    // body); EOFs don't count.
+    // Length-prefixed framing costs exactly two recvs per request (header, body); EOFs don't count.
     assert_eq!(s.recv_ops, 2 * s.requests, "recv_ops: {s:?}");
 }
 
-/// Deferring echo handler that `take()`s the body - the one-pattern
-/// placement consumer (zero-copy when placed, copy fallback inline).
+/// Deferring echo handler that `take()`s the body - the one-pattern placement consumer (zero-copy when placed, copy
+/// fallback inline).
 fn take_and_defer_echo(body: &mut Body, responder: Responder) -> Response {
     let payload = body.take();
     let (deferred, permit) = responder.defer();
@@ -4670,27 +4200,19 @@ fn patterned(len: usize) -> Vec<u8> {
 
 #[test]
 fn tcp_body_placement_roundtrip() {
-    // Bodies >= the threshold are read into their own allocation and moved
-    // out zero-copy via take(); small bodies ride the accumulate buffer with
-    // take() falling back to a copy. Sequence small -> large -> small on one
-    // connection proves keep-alive across a placed message (consume() drains
-    // only the header of a placed message).
+    // Bodies >= the threshold are read into their own allocation and moved out zero-copy via take(); small bodies ride
+    // the accumulate buffer with take() falling back to a copy. Sequence small -> large -> small on one connection
+    // proves keep-alive across a placed message (consume() drains only the header of a placed message).
     let cfg = ServerConfig {
         body_placement_threshold: Some(1024),
         ..ServerConfig::default()
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request {
-                mut body,
-                responder,
-                ..
+                mut body, responder, ..
             } = req;
             take_and_defer_echo(&mut body, responder)
         },
@@ -4713,12 +4235,7 @@ fn tcp_body_placement_roundtrip() {
             let large = patterned(256 * 1024);
             for payload in [b"small-1".as_slice(), &large, b"small-2"] {
                 send_framed(&mut s, payload)?;
-                assert_eq!(
-                    recv_framed(&mut s)?,
-                    payload,
-                    "echo mismatch at len {}",
-                    payload.len()
-                );
+                assert_eq!(recv_framed(&mut s)?, payload, "echo mismatch at len {}", payload.len());
             }
             Ok(())
         })()
@@ -4732,24 +4249,17 @@ fn tcp_body_placement_roundtrip() {
 
 #[test]
 fn tcp_body_placement_disabled() {
-    // threshold None: the same take()-based handler works with every body on
-    // the accumulate path (take() copies).
+    // threshold None: the same take()-based handler works with every body on the accumulate path (take() copies).
     let cfg = ServerConfig {
         body_placement_threshold: None,
         ..ServerConfig::default()
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request {
-                mut body,
-                responder,
-                ..
+                mut body, responder, ..
             } = req;
             take_and_defer_echo(&mut body, responder)
         },
@@ -4784,10 +4294,9 @@ fn tcp_body_placement_disabled() {
 
 #[test]
 fn lsp_large_body_placement() {
-    // More-style framer + placement: the chunk read over-reads part of the
-    // body before the verdict, exercising the prefix-copy path of
-    // arm_body_recv (prefix from the accumulate buffer + remainder read
-    // straight into the placed allocation).
+    // More-style framer + placement: the chunk read over-reads part of the body before the verdict, exercising the
+    // prefix-copy path of arm_body_recv (prefix from the accumulate buffer + remainder read straight into the placed
+    // allocation).
     let cfg = ServerConfig {
         body_placement_threshold: Some(1024),
         ..ServerConfig::default()
@@ -4797,9 +4306,7 @@ fn lsp_large_body_placement() {
         header: lsp_header,
         body: |req: Request<'_, ()>| {
             let Request {
-                mut body,
-                responder,
-                ..
+                mut body, responder, ..
             } = req;
             take_and_defer_echo(&mut body, responder)
         },
@@ -4820,10 +4327,8 @@ fn lsp_large_body_placement() {
         let r = (|| -> io::Result<(Vec<u8>, Vec<u8>)> {
             let mut s = connect_tcp(v4)?;
             let payload = patterned(8 * 1024);
-            // One write: the server's first 4 KiB chunk read grabs the header
-            // AND a body prefix.
-            let mut msg = format!("Content-Length: {}\r\n\r\n", payload.len())
-                .into_bytes();
+            // One write: the server's first 4 KiB chunk read grabs the header AND a body prefix.
+            let mut msg = format!("Content-Length: {}\r\n\r\n", payload.len()).into_bytes();
             msg.extend_from_slice(&payload);
             s.write_all(&msg)?;
             Ok((recv_framed(&mut s)?, payload))
@@ -4839,10 +4344,8 @@ fn lsp_large_body_placement() {
 
 #[test]
 fn multi_listener_unix_and_tcp() {
-    // One server, one ring, two listeners (TCP + unix). The accept handler
-    // records which listener the connection arrived on; the body echoes that
-    // plus the peer family, proving routing, framing, and identity per
-    // listener.
+    // One server, one ring, two listeners (TCP + unix). The accept handler records which listener the connection
+    // arrived on; the body echoes that plus the peer family, proving routing, framing, and identity per listener.
     let dir = truenas_ros::tempdir().unwrap();
     let path = dir.path().join("multi.sock");
     let addrs = [
@@ -4862,11 +4365,7 @@ fn multi_listener_unix_and_tcp() {
             };
             Some(format!("{l}/{p}"))
         },
-        header: length_prefix_header::<String>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<String>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, String>| {
             let Request { state: tag, .. } = req;
             Response::Reply(echo_frame(tag.as_bytes()))
@@ -4910,8 +4409,8 @@ fn multi_listener_unix_and_tcp() {
 
 #[test]
 fn multi_listener_per_port_policy() {
-    // Two TCP listeners on one server; accept admits connections on the first
-    // port and rejects the second - the listener argument drives policy.
+    // Two TCP listeners on one server; accept admits connections on the first port and rejects the second - the
+    // listener argument drives policy.
     use std::sync::Mutex;
     let addrs = [
         ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap()),
@@ -4928,11 +4427,7 @@ fn multi_listener_per_port_policy() {
                 (sa.port() == *admit_port.lock().unwrap()).then_some(())
             }
         },
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request { body, .. } = req;
             Response::Reply(echo_frame(&body[..]))
@@ -4944,8 +4439,7 @@ fn multi_listener_per_port_policy() {
         Err(e) => panic!("bind: {e}"),
     };
     let bound = server.local_addrs();
-    let (ServerAddr::Tcp(a), ServerAddr::Tcp(b)) = (&bound[0], &bound[1])
-    else {
+    let (ServerAddr::Tcp(a), ServerAddr::Tcp(b)) = (&bound[0], &bound[1]) else {
         panic!("expected two Tcp: {bound:?}");
     };
     let (a, b) = (*a, *b);
@@ -4959,11 +4453,9 @@ fn multi_listener_per_port_policy() {
             let mut ok = connect_tcp(a)?;
             send_framed(&mut ok, b"yes")?;
             assert_eq!(recv_framed(&mut ok)?, b"yes");
-            // Rejected port: no echo comes back. A short read must NOT yield
-            // the payload (rejected means no reply); EOF, reset, or a plain
-            // timeout with no data all confirm "not admitted". (This asserts
-            // policy without depending on the reject-close reaching us - see
-            // the close-propagation note on the ignored tests.)
+            // Rejected port: no echo comes back. A short read must NOT yield the payload (rejected means no reply);
+            // EOF, reset, or a plain timeout with no data all confirm "not admitted". (This asserts policy without
+            // depending on the reject-close reaching us - see the close-propagation note on the ignored tests.)
             let mut no = connect_tcp(b)?;
             no.set_read_timeout(Some(Duration::from_millis(300)))?;
             let _ = send_framed(&mut no, b"no");
@@ -4973,9 +4465,7 @@ fn multi_listener_per_port_policy() {
                 Err(e) => assert!(
                     matches!(
                         e.kind(),
-                        io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::WouldBlock
-                            | io::ErrorKind::TimedOut
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ),
                     "unexpected error on rejected conn: {e:?}"
                 ),
@@ -4995,21 +4485,16 @@ fn multi_listener_per_port_policy() {
 
 #[test]
 fn tcp_peername_is_per_connection() {
-    // Peer addresses are fetched per connection (SO_PEERNAME), not read from
-    // a buffer shared across a multishot accept's completions - so a burst of
-    // simultaneous connects must each see THEIR OWN source address echoed
-    // back. (A single shared address buffer would misattribute under a burst.)
+    // Peer addresses are fetched per connection (SO_PEERNAME), not read from a buffer shared across a multishot
+    // accept's completions - so a burst of simultaneous connects must each see THEIR OWN source address echoed back. (A
+    // single shared address buffer would misattribute under a burst.)
     const N: usize = 8;
     let proto = Protocol {
         accept: |inc: Incoming<'_>| match inc.peer {
             ClientAddr::Inet(sa) => Some(sa.to_string()),
             _ => None,
         },
-        header: length_prefix_header::<String>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<String>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, String>| {
             let Request { state: seen, .. } = req;
             Response::Reply(echo_frame(seen.as_bytes()))
@@ -5031,18 +4516,13 @@ fn tcp_peername_is_per_connection() {
         let clients: Vec<_> = (0..N)
             .map(|_| {
                 thread::spawn(move || -> io::Result<()> {
-                    // Connect within the burst, then ask who the server
-                    // thinks we are.
+                    // Connect within the burst, then ask who the server thinks we are.
                     let mut s = connect_tcp(v4)?;
                     let me = s.local_addr()?;
                     send_framed(&mut s, b"who")?;
                     let reply = recv_framed(&mut s)?;
                     let seen = String::from_utf8(reply).expect("utf8");
-                    assert_eq!(
-                        seen,
-                        me.to_string(),
-                        "server saw a different peer than this client"
-                    );
+                    assert_eq!(seen, me.to_string(), "server saw a different peer than this client");
                     Ok(())
                 })
             })
@@ -5072,11 +4552,7 @@ fn multi_listener_pool_full_rearm() {
     ];
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request { body, .. } = req;
             Response::Reply(echo_frame(&body[..]))
@@ -5088,8 +4564,7 @@ fn multi_listener_pool_full_rearm() {
         Err(e) => panic!("bind: {e}"),
     };
     let bound = server.local_addrs();
-    let (ServerAddr::Tcp(a), ServerAddr::Tcp(b)) = (&bound[0], &bound[1])
-    else {
+    let (ServerAddr::Tcp(a), ServerAddr::Tcp(b)) = (&bound[0], &bound[1]) else {
         panic!("expected two Tcp: {bound:?}");
     };
     let (a, b) = (*a, *b);
@@ -5101,11 +4576,9 @@ fn multi_listener_pool_full_rearm() {
             let mut holder = connect_tcp(a)?;
             send_framed(&mut holder, b"hold")?;
             assert_eq!(recv_framed(&mut holder)?, b"hold");
-            // Pool is full: one attempt on B is shed (accepted then closed by
-            // the kernel - ENFILE - terminating B's multishot accept). Use a
-            // short timeout because a connection can also land in B's listen
-            // backlog unaccepted, where a read would block indefinitely; that
-            // it does not get served is the point.
+            // Pool is full: one attempt on B is shed (accepted then closed by the kernel - ENFILE - terminating B's
+            // multishot accept). Use a short timeout because a connection can also land in B's listen backlog
+            // unaccepted, where a read would block indefinitely; that it does not get served is the point.
             let mut shed = connect_tcp(b)?;
             shed.set_read_timeout(Some(Duration::from_millis(200)))?;
             let mut byte = [0u8; 1];
@@ -5129,11 +4602,10 @@ fn multi_listener_pool_full_rearm() {
 
 #[test]
 fn tcp_reply_coalescing() {
-    // A burst of deferred replies released together is gathered into fewer
-    // SENDMSG ops (writev coalescing): 16 pipelined requests all defer; one
-    // worker answers all 16 at once; the client must receive every payload
-    // intact (order-independent - deferred replies may egress out of request
-    // order) and the stats must show send_ops < replies.
+    // A burst of deferred replies released together is gathered into fewer SENDMSG ops (writev coalescing): 16
+    // pipelined requests all defer; one worker answers all 16 at once; the client must receive every payload intact
+    // (order-independent - deferred replies may egress out of request order) and the stats must show send_ops <
+    // replies.
     use std::sync::Mutex;
     const N: usize = 16;
     type Parked = Vec<(Vec<u8>, truenas_ros::net::server::Deferred)>;
@@ -5144,23 +4616,17 @@ fn tcp_reply_coalescing() {
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: {
             let parked = Arc::clone(&parked);
             move |req: Request<'_, ()>| {
-                let Request {
-                    body, responder, ..
-                } = req;
+                let Request { body, responder, .. } = req;
                 let (deferred, permit) = responder.defer();
                 let mut guard = parked.lock().unwrap();
                 guard.push((body.to_vec(), deferred));
                 if guard.len() == N {
-                    // Last request in: answer the whole burst back-to-back so
-                    // the injection queue fills faster than the loop drains.
+                    // Last request in: answer the whole burst back-to-back so the injection queue fills faster than the
+                    // loop drains.
                     let batch = std::mem::take(&mut *guard);
                     thread::spawn(move || {
                         for (payload, d) in batch {
@@ -5188,15 +4654,11 @@ fn tcp_reply_coalescing() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            let sent: Vec<Vec<u8>> = (0..N)
-                .map(|i| format!("burst-{i:02}").into_bytes())
-                .collect();
+            let sent: Vec<Vec<u8>> = (0..N).map(|i| format!("burst-{i:02}").into_bytes()).collect();
             for msg in &sent {
                 send_framed(&mut s, msg)?; // pipelined: no reads in between
             }
-            let mut got: Vec<Vec<u8>> = (0..N)
-                .map(|_| recv_framed(&mut s))
-                .collect::<Result<_, _>>()?;
+            let mut got: Vec<Vec<u8>> = (0..N).map(|_| recv_framed(&mut s)).collect::<Result<_, _>>()?;
             got.sort();
             assert_eq!(got, sent, "every burst payload echoed intact");
             Ok(())
@@ -5217,20 +4679,13 @@ fn tcp_reply_coalescing() {
 
 #[test]
 fn tcp_graceful_shutdown_drains() {
-    // Graceful shutdown: a request already deferred to a worker completes and
-    // its reply is delivered; an idle connection is closed promptly; accepting
-    // stops; serve_forever returns without waiting for the grace deadline.
+    // Graceful shutdown: a request already deferred to a worker completes and its reply is delivered; an idle
+    // connection is closed promptly; accepting stops; serve_forever returns without waiting for the grace deadline.
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             let input = body.to_vec();
             let (deferred, permit) = responder.defer();
             thread::spawn(move || {
@@ -5265,16 +4720,11 @@ fn tcp_graceful_shutdown_drains() {
             // In-flight work still completes and is delivered...
             let reply = recv_framed(&mut busy)?;
             assert_eq!(reply, b"WORK");
-            // ...then the drained connection closes (EOF), as does the idle one
-            // -- well before the 5s grace deadline.
+            // ...then the drained connection closes (EOF), as does the idle one -- well before the 5s grace deadline.
             let mut b = [0u8; 1];
             assert_eq!(busy.read(&mut b)?, 0, "busy conn should see EOF");
             assert_eq!(idle.read(&mut b)?, 0, "idle conn should see EOF");
-            assert!(
-                t0.elapsed() < Duration::from_secs(2),
-                "drain took {:?}",
-                t0.elapsed()
-            );
+            assert!(t0.elapsed() < Duration::from_secs(2), "drain took {:?}", t0.elapsed());
             Ok(())
         })()
         .expect("client io");
@@ -5286,20 +4736,14 @@ fn tcp_graceful_shutdown_drains() {
 
 #[test]
 fn tcp_graceful_deadline_escalates() {
-    // A worker that never resolves its Deferred: the graceful drain cannot
-    // complete, so the grace deadline must escalate to a hard stop and
-    // serve_forever must still return. The handler parks each Deferred in
-    // `keep_rx` and never resolves it - rather than `mem::forget`, which leaks
-    // its channel Sender + Arc and trips LeakSanitizer - releasing it only at
-    // test end, long after the drain has been forced to escalate.
+    // A worker that never resolves its Deferred: the graceful drain cannot complete, so the grace deadline must
+    // escalate to a hard stop and serve_forever must still return. The handler parks each Deferred in `keep_rx` and
+    // never resolves it - rather than `mem::forget`, which leaks its channel Sender + Arc and trips LeakSanitizer -
+    // releasing it only at test end, long after the drain has been forced to escalate.
     let (keep_tx, keep_rx) = std::sync::mpsc::channel();
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
             let Request { responder, .. } = req;
             let (deferred, permit) = responder.defer();
@@ -5325,8 +4769,8 @@ fn tcp_graceful_deadline_escalates() {
             send_framed(&mut s, b"stuck")?;
             thread::sleep(Duration::from_millis(30));
             stop.shutdown_graceful(Duration::from_millis(300));
-            // Keep the socket open (returned) - its EOF only arrives when the
-            // abandoned connection's descriptor closes at server teardown.
+            // Keep the socket open (returned) - its EOF only arrives when the abandoned connection's descriptor closes
+            // at server teardown.
             Ok(s)
         })()
         .expect("client io")
@@ -5340,8 +4784,8 @@ fn tcp_graceful_deadline_escalates() {
         t0.elapsed()
     );
     let mut s = client.join().expect("thread join");
-    // Hard-stop abandons the stuck connection; dropping the server closes its
-    // pool descriptor, and only then does the client see EOF with no data.
+    // Hard-stop abandons the stuck connection; dropping the server closes its pool descriptor, and only then does the
+    // client see EOF with no data.
     drop(server);
     let mut buf = Vec::new();
     let n = s.read_to_end(&mut buf).unwrap_or(buf.len());
@@ -5351,28 +4795,19 @@ fn tcp_graceful_deadline_escalates() {
 
 #[test]
 fn tcp_graceful_drains_pipelined_deferred_reply() {
-    // Regression: in pipelined mode a connection can hold a deferred reply
-    // in flight AND a read-ahead recv parked at once. Graceful shutdown must
-    // still deliver that reply - `begin_drain` cancels the parked recv, but the
-    // connection must finish its outstanding work before closing; tearing it
-    // down would drop the reply. At the default
-    // `max_in_flight_requests` the read-ahead is never armed during a defer, so
-    // this shape is pipelined-only.
+    // Regression: in pipelined mode a connection can hold a deferred reply in flight AND a read-ahead recv parked at
+    // once. Graceful shutdown must still deliver that reply - `begin_drain` cancels the parked recv, but the connection
+    // must finish its outstanding work before closing; tearing it down would drop the reply. At the default
+    // `max_in_flight_requests` the read-ahead is never armed during a defer, so this shape is pipelined-only.
     let cfg = ServerConfig {
         max_in_flight_requests: 2, // pipelined -> read-ahead armed during a defer
         ..ServerConfig::default()
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             let mut reply = b"re:".to_vec();
             reply.extend_from_slice(&body);
             let (deferred, permit) = responder.defer();
@@ -5384,9 +4819,7 @@ fn tcp_graceful_drains_pipelined_deferred_reply() {
         },
     };
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto,
     ) {
@@ -5422,23 +4855,18 @@ fn tcp_graceful_drains_pipelined_deferred_reply() {
 
 #[test]
 fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
-    // Regression (sibling of `tcp_graceful_drains_pipelined_deferred_reply`, for
-    // the idle-timeout cancellation instead of the drain one): in pipelined mode
-    // a connection can hold a deferred reply in flight AND a parked read-ahead
-    // recv at once. When `idle_timeout` fires on that read-ahead recv the
-    // connection is NOT idle - it still owes the deferred reply - so it must
-    // finish that work, not be reaped (reaping it would drop the reply: once
-    // `closing`, `kick_send`'s `!closing` guard swallows the queued send).
-    // A perfectly normal request/response client (send one request, await its
-    // reply before the next) hits this whenever the worker outlives
-    // `idle_timeout`. At the default `max_in_flight_requests` no read-ahead is
-    // armed during a defer, so this shape is pipelined-only.
+    // Regression (sibling of `tcp_graceful_drains_pipelined_deferred_reply`, for the idle-timeout cancellation instead
+    // of the drain one): in pipelined mode a connection can hold a deferred reply in flight AND a parked read-ahead
+    // recv at once. When `idle_timeout` fires on that read-ahead recv the connection is NOT idle - it still owes the
+    // deferred reply - so it must finish that work, not be reaped (reaping it would drop the reply: once `closing`,
+    // `kick_send`'s `!closing` guard swallows the queued send).
+    // A perfectly normal request/response client (send one request, await its reply before the next) hits this whenever
+    // the worker outlives `idle_timeout`. At the default `max_in_flight_requests` no read-ahead is armed during a
+    // defer, so this shape is pipelined-only.
     //
-    // `WORK` being an exact multiple of `IDLE` also lands the final clock
-    // expiry in a photo-finish with the reply's flush and the client's
-    // immediate next request - the served-since-arm rule keeps every ordering
-    // of that race alive (pinned deterministically, with wide margins, by
-    // `tcp_idle_clock_resets_on_served_reply`).
+    // `WORK` being an exact multiple of `IDLE` also lands the final clock expiry in a photo-finish with the reply's
+    // flush and the client's immediate next request - the served-since-arm rule keeps every ordering of that race alive
+    // (pinned deterministically, with wide margins, by `tcp_idle_clock_resets_on_served_reply`).
     const IDLE: Duration = Duration::from_millis(100);
     const WORK: Duration = Duration::from_millis(400); // outlives IDLE 4x
     let cfg = ServerConfig {
@@ -5448,21 +4876,15 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             let mut reply = b"re:".to_vec();
             reply.extend_from_slice(&body);
             let (deferred, permit) = responder.defer();
             thread::spawn(move || {
-                // Outlives `idle_timeout`, so the read-ahead recv's idle timeout
-                // fires while this reply is still in flight.
+                // Outlives `idle_timeout`, so the read-ahead recv's idle timeout fires while this reply is still in
+                // flight.
                 thread::sleep(WORK);
                 deferred.reply(echo_frame(&reply));
             });
@@ -5470,9 +4892,7 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
         },
     };
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto,
     ) {
@@ -5489,19 +4909,17 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // Send one request, then just wait for its reply - the read-ahead
-            // recv parks and its idle timeout fires long before the worker
-            // replies. Were the server to close the connection here, this read
-            // would hit EOF; the reply must instead still arrive.
+            // Send one request, then just wait for its reply - the read-ahead recv parks and its idle timeout fires
+            // long before the worker replies. Were the server to close the connection here, this read would hit EOF;
+            // the reply must instead still arrive.
             send_framed(&mut s, b"hello")?;
             assert_eq!(
                 recv_framed(&mut s)?,
                 b"re:hello",
                 "deferred reply dropped by an idle-timeout reap"
             );
-            // The connection was not reaped, so keep-alive continues: a second
-            // round-trip on the same socket succeeds (also exercises the idle
-            // fire during the *second* defer).
+            // The connection was not reaped, so keep-alive continues: a second round-trip on the same socket succeeds
+            // (also exercises the idle fire during the *second* defer).
             send_framed(&mut s, b"world")?;
             assert_eq!(recv_framed(&mut s)?, b"re:world");
             Ok(())
@@ -5516,21 +4934,17 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
 
 #[test]
 fn tcp_idle_clock_resets_on_served_reply() {
-    // Regression - the deterministic form of the race its sibling above only
-    // hits on a slow box: the idle clock rides the
-    // parked read-ahead recv from ARM time, so while a deferred reply is
-    // produced and flushed the clock keeps counting. Serving that reply is
-    // activity - the quiet interval must restart - yet a guard that only asks
-    // "owes work NOW?" sees nothing outstanding at the next expiry and reaps
-    // the connection out from under a client it served moments ago (the
-    // client's follow-up request then hits EOF/reset).
+    // Regression - the deterministic form of the race its sibling above only hits on a slow box: the idle clock rides
+    // the parked read-ahead recv from ARM time, so while a deferred reply is produced and flushed the clock keeps
+    // counting. Serving that reply is activity - the quiet interval must restart - yet a guard that only asks "owes
+    // work NOW?" sees nothing outstanding at the next expiry and reaps the connection out from under a client it served
+    // moments ago (the client's follow-up request then hits EOF/reset).
     //
     // Timeline pinned here, margins in the hundreds of ms so a loaded VM
     // cannot flip any edge: the read-ahead parks at ~0 with the clock running;
-    // the deferred reply flushes at ~WORK (300 ms); the stale clock expires at
-    // ~IDLE (600 ms) - an interval that SAW a served reply, so it must re-arm
-    // a fresh quiet interval, not reap - and the client's second request lands
-    // at ~700 ms, inside that fresh interval, and must be answered.
+    // the deferred reply flushes at ~WORK (300 ms); the stale clock expires at ~IDLE (600 ms) - an interval that SAW a
+    // served reply, so it must re-arm a fresh quiet interval, not reap - and the client's second request lands at ~700
+    // ms, inside that fresh interval, and must be answered.
     const IDLE: Duration = Duration::from_millis(600);
     const WORK: Duration = Duration::from_millis(300);
     const CLIENT_PAUSE: Duration = Duration::from_millis(400);
@@ -5541,15 +4955,9 @@ fn tcp_idle_clock_resets_on_served_reply() {
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             let mut reply = b"re:".to_vec();
             reply.extend_from_slice(&body);
             let (deferred, permit) = responder.defer();
@@ -5561,9 +4969,7 @@ fn tcp_idle_clock_resets_on_served_reply() {
         },
     };
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto,
     ) {
@@ -5582,9 +4988,8 @@ fn tcp_idle_clock_resets_on_served_reply() {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"hello")?;
             assert_eq!(recv_framed(&mut s)?, b"re:hello");
-            // Idle across the stale clock's expiry (but well inside the fresh
-            // interval that expiry must start): served-then-quiet, the exact
-            // window the flag-less guard reaped.
+            // Idle across the stale clock's expiry (but well inside the fresh interval that expiry must start):
+            // served-then-quiet, the exact window the flag-less guard reaped.
             thread::sleep(CLIENT_PAUSE);
             send_framed(&mut s, b"world")?;
             assert_eq!(
@@ -5604,28 +5009,21 @@ fn tcp_idle_clock_resets_on_served_reply() {
 
 #[test]
 fn tcp_default_config_never_times_out_a_deferred_request() {
-    // The handler/worker phase is un-timed: a request delivered and offloaded
-    // via `Response::Defer` must never be timed out, however long the worker
-    // runs. At the default `max_in_flight_requests` (1) no read-ahead recv is
-    // armed while a defer is outstanding, so even with `idle_timeout` set well
-    // below the worker's duration nothing fires - the reply still arrives.
+    // The handler/worker phase is un-timed: a request delivered and offloaded via `Response::Defer` must never be timed
+    // out, however long the worker runs. At the default `max_in_flight_requests` (1) no read-ahead recv is armed while
+    // a defer is outstanding, so even with `idle_timeout` set well below the worker's duration nothing fires - the
+    // reply still arrives.
     const IDLE: Duration = Duration::from_millis(100);
     const WORK: Duration = Duration::from_millis(500); // 5x the idle timeout
     let cfg = ServerConfig {
-        idle_timeout: Some(IDLE), // set, but must not reach a handled request
+        idle_timeout: Some(IDLE),  // set, but must not reach a handled request
         ..ServerConfig::default()  // max_in_flight_requests == 1
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             let echo = echo_frame(&body);
             let (deferred, permit) = responder.defer();
             thread::spawn(move || {
@@ -5636,9 +5034,7 @@ fn tcp_default_config_never_times_out_a_deferred_request() {
         },
     };
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto,
     ) {
@@ -5656,8 +5052,8 @@ fn tcp_default_config_never_times_out_a_deferred_request() {
         (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"slow")?;
-            // The worker sleeps far longer than idle_timeout; the reply must
-            // still come back - the handled request is never timed out.
+            // The worker sleeps far longer than idle_timeout; the reply must still come back - the handled request is
+            // never timed out.
             assert_eq!(recv_framed(&mut s)?, b"slow");
             Ok(())
         })()
@@ -5671,8 +5067,8 @@ fn tcp_default_config_never_times_out_a_deferred_request() {
 
 #[test]
 fn tcp_close_hook_reasons() {
-    // The close hook reports why each connection closed: a clean keep-alive
-    // EOF, a handler-initiated close, and an idle timeout.
+    // The close hook reports why each connection closed: a clean keep-alive EOF, a handler-initiated close, and an idle
+    // timeout.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let cfg = ServerConfig {
@@ -5681,11 +5077,7 @@ fn tcp_close_hook_reasons() {
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request { body, .. } = req;
             if &body[..] == b"close" {
@@ -5696,9 +5088,7 @@ fn tcp_close_hook_reasons() {
         },
     };
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto,
     ) {
@@ -5759,28 +5149,21 @@ fn tcp_close_hook_reasons() {
 
 #[test]
 fn tcp_multicore_two_rings() {
-    // The SO_REUSEPORT multi-core recipe (examples/tcp_multicore.rs): two
-    // independent single-ring servers on one address; the kernel spreads
-    // connections across them; every round-trip is served; both drain cleanly.
-    fn worker(
-        addr: SocketAddrV4,
-        ready: std::sync::mpsc::Sender<
-            Result<(SocketAddrV4, ShutdownHandle), Error>,
-        >,
-    ) {
+    // The SO_REUSEPORT multi-core recipe (examples/tcp_multicore.rs): two independent single-ring servers on one
+    // address; the kernel spreads connections across them; every round-trip is served; both drain cleanly.
+    fn worker(addr: SocketAddrV4, ready: std::sync::mpsc::Sender<Result<(SocketAddrV4, ShutdownHandle), Error>>) {
         let cfg = ServerConfig {
             reuse_port: true,
             ..ServerConfig::default()
         };
         let proto = length_prefixed(PrefixWidth::U32, Endian::Big, false, echo);
-        let mut server =
-            match Server::with_config([ServerAddr::Tcp(addr)], cfg, proto) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = ready.send(Err(e));
-                    return;
-                }
-            };
+        let mut server = match Server::with_config([ServerAddr::Tcp(addr)], cfg, proto) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        };
         let ServerAddr::Tcp(bound) = server.local_addrs().remove(0) else {
             panic!("expected Tcp");
         };
@@ -5805,9 +5188,8 @@ fn tcp_multicore_two_rings() {
     let w1 = thread::spawn(move || {
         worker(addr, tx);
     });
-    // As above: the second `with_config` sets up a second ring, and a box
-    // whose free memory is fragmented refuses that with `ENOMEM` long
-    // before it refuses a bind.
+    // As above: the second `with_config` sets up a second ring, and a box whose free memory is fragmented refuses that
+    // with `ENOMEM` long before it refuses a bind.
     let (_, stop1) = match rx.recv().expect("worker 1") {
         Ok(v) => v,
         Err(e) if should_skip(&e) => {
@@ -5834,9 +5216,8 @@ fn tcp_multicore_two_rings() {
     w1.join().expect("worker 1 join");
 }
 
-/// Two servers on one port in one [`Spread`], the first on a port of its
-/// own and the second on that one. Each answers every request with its own
-/// index, so a client learns which ring serves it.
+/// Two servers on one port in one [`Spread`], the first on a port of its own and the second on that one. Each answers
+/// every request with its own index, so a client learns which ring serves it.
 struct SpreadPair {
     addr: SocketAddrV4,
     stops: Vec<ShutdownHandle>,
@@ -5848,43 +5229,25 @@ type SpreadReady = Result<(SocketAddrV4, ShutdownHandle, StatsHandle), Error>;
 
 impl SpreadPair {
     fn start() -> Option<SpreadPair> {
-        fn worker(
-            index: u8,
-            addr: SocketAddrV4,
-            spread: Spread,
-            ready: std::sync::mpsc::Sender<SpreadReady>,
-        ) {
+        fn worker(index: u8, addr: SocketAddrV4, spread: Spread, ready: std::sync::mpsc::Sender<SpreadReady>) {
             let cfg = ServerConfig {
                 reuse_port: true,
                 ..ServerConfig::default()
             };
-            let which = move |_h: &[u8], _b: &[u8], _p: &ClientAddr| {
-                Some(echo_frame(&[index]))
-            };
-            let proto =
-                length_prefixed(PrefixWidth::U32, Endian::Big, false, which);
-            let mut server = match Server::with_config(
-                [ServerAddr::Tcp(addr)],
-                cfg,
-                proto,
-            ) {
+            let which = move |_h: &[u8], _b: &[u8], _p: &ClientAddr| Some(echo_frame(&[index]));
+            let proto = length_prefixed(PrefixWidth::U32, Endian::Big, false, which);
+            let mut server = match Server::with_config([ServerAddr::Tcp(addr)], cfg, proto) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = ready.send(Err(e));
                     return;
                 }
             };
-            server
-                .join_spread(&spread, usize::from(index))
-                .expect("join_spread");
+            server.join_spread(&spread, usize::from(index)).expect("join_spread");
             let ServerAddr::Tcp(bound) = server.local_addrs().remove(0) else {
                 panic!("expected Tcp");
             };
-            let _ = ready.send(Ok((
-                bound,
-                server.shutdown_handle(),
-                server.stats_handle(),
-            )));
+            let _ = ready.send(Ok((bound, server.shutdown_handle(), server.stats_handle())));
             server.serve_forever().expect("serve_forever");
         }
 
@@ -5903,8 +5266,7 @@ impl SpreadPair {
             Err(e) => panic!("bind: {e}"),
         };
         let w1 = thread::spawn(move || worker(1, addr, spread, tx));
-        // A second ring can be refused `ENOMEM` on a fragmented box, as
-        // `tcp_multicore_two_rings` says.
+        // A second ring can be refused `ENOMEM` on a fragmented box, as `tcp_multicore_two_rings` says.
         let (_, stop1, stats1) = match rx.recv().expect("worker 1") {
             Ok(v) => v,
             Err(e) if should_skip(&e) => {
@@ -5923,9 +5285,8 @@ impl SpreadPair {
         })
     }
 
-    /// Open a connection and learn which ring serves it. The reply comes
-    /// after that ring has counted it, so the next connection sees the
-    /// count.
+    /// Open a connection and learn which ring serves it. The reply comes after that ring has counted it, so the next
+    /// connection sees the count.
     fn connect(&self) -> (TcpStream, u8) {
         let mut s = connect_tcp(self.addr).expect("connect");
         send_framed(&mut s, b"which").expect("send");
@@ -5959,18 +5320,15 @@ fn on(held: &[(TcpStream, u8)], ring: u8) -> usize {
     held.iter().filter(|(_, r)| *r == ring).count()
 }
 
-/// A connection goes to the ring of the spread with the fewest, wherever the
-/// kernel's hash put it, and a closed one comes off its ring's count.
-/// Connections arrive one at a time, so each is counted before the next. The
-/// hash alone ends 64 even about one time in ten, and never with nothing
-/// handed off.
+/// A connection goes to the ring of the spread with the fewest, wherever the kernel's hash put it, and a closed one
+/// comes off its ring's count. Connections arrive one at a time, so each is counted before the next. The hash alone
+/// ends 64 even about one time in ten, and never with nothing handed off.
 #[test]
 fn a_spread_evens_connections_across_its_rings() {
     let Some(pair) = SpreadPair::start() else {
         return;
     };
-    let mut held: Vec<(TcpStream, u8)> =
-        (0..64).map(|_| pair.connect()).collect();
+    let mut held: Vec<(TcpStream, u8)> = (0..64).map(|_| pair.connect()).collect();
     assert_eq!((on(&held, 0), on(&held, 1)), (32, 32));
     let handed: u64 = pair.stats.iter().map(|s| s.snapshot().handed_off).sum();
     assert!(handed > 0, "the hash alone placed every connection");
@@ -5984,8 +5342,8 @@ fn a_spread_evens_connections_across_its_rings() {
     pair.stop();
 }
 
-/// A ring that drained takes no more: every connection stays on the ring
-/// that is left, and none is sent to the one that is gone.
+/// A ring that drained takes no more: every connection stays on the ring that is left, and none is sent to the one that
+/// is gone.
 #[test]
 fn a_ring_that_drained_is_sent_nothing() {
     let Some(mut pair) = SpreadPair::start() else {
@@ -6000,22 +5358,16 @@ fn a_ring_that_drained_is_sent_nothing() {
     pair.stop();
 }
 
-/// A drain refuses new connections instead of quietly accepting them into a
-/// backlog nobody will ever read: `shutdown_graceful` shuts every listener
-/// down first, so a connect from then on fails with `ECONNREFUSED` while the
-/// request already in flight still finishes. The idle connection's EOF is
-/// the "drain has begun" signal (the idle sweep runs after the listeners are
-/// shut), so nothing here waits on a timer.
+/// A drain refuses new connections instead of quietly accepting them into a backlog nobody will ever read:
+/// `shutdown_graceful` shuts every listener down first, so a connect from then on fails with `ECONNREFUSED` while the
+/// request already in flight still finishes. The idle connection's EOF is the "drain has begun" signal (the idle sweep
+/// runs after the listeners are shut), so nothing here waits on a timer.
 #[test]
 fn graceful_drain_refuses_new_connections() {
     let (park_tx, park_rx) = std::sync::mpsc::channel::<Deferred>();
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| -> Response {
             if &req.body[..] == b"park" {
                 let (deferred, permit) = req.responder.defer();
@@ -6073,12 +5425,10 @@ fn graceful_drain_refuses_new_connections() {
     client.join().expect("client thread").expect("client io");
 }
 
-/// Draining one `reuse_port` sibling must not take the address down: its
-/// shut listener leaves the kernel's reuseport group while the server is
-/// still alive and draining, so every new connect lands on the survivor and
-/// is served rather than queued on a ring that will never read it. The
-/// drained ring is held open by a parked request for the whole check, so
-/// what the test proves is `shutdown(2)`, not the fd closing at drop.
+/// Draining one `reuse_port` sibling must not take the address down: its shut listener leaves the kernel's reuseport
+/// group while the server is still alive and draining, so every new connect lands on the survivor and is served rather
+/// than queued on a ring that will never read it. The drained ring is held open by a parked request for the whole
+/// check, so what the test proves is `shutdown(2)`, not the fd closing at drop.
 #[test]
 fn draining_one_reuse_port_sibling_leaves_the_other_serving() {
     type Ready = Result<(SocketAddrV4, ShutdownHandle), Error>;
@@ -6094,19 +5444,13 @@ fn draining_one_reuse_port_sibling_leaves_the_other_serving() {
         };
         let proto = Protocol {
             accept: |_: Incoming<'_>| Some(()),
-            header: length_prefix_header::<()>(
-                PrefixWidth::U32,
-                Endian::Big,
-                false,
-            ),
-            // Echoes are tagged with the ring that served them; "park"
-            // defers so the test can hold that ring open while it drains.
+            header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
+            // Echoes are tagged with the ring that served them; "park" defers so the test can hold that ring open while
+            // it drains.
             body: move |req: Request<'_, ()>| -> Response {
                 if &req.body[..] == b"park" {
                     let (deferred, permit) = req.responder.defer();
-                    park_tx
-                        .send(deferred)
-                        .expect("the test holds the receiver");
+                    park_tx.send(deferred).expect("the test holds the receiver");
                     return Response::Defer(permit);
                 }
                 let mut out = vec![idx];
@@ -6114,14 +5458,13 @@ fn draining_one_reuse_port_sibling_leaves_the_other_serving() {
                 Response::Reply(echo_frame(&out))
             },
         };
-        let mut server =
-            match Server::with_config([ServerAddr::Tcp(addr)], cfg, proto) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = ready.send(Err(e));
-                    return;
-                }
-            };
+        let mut server = match Server::with_config([ServerAddr::Tcp(addr)], cfg, proto) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        };
         let ServerAddr::Tcp(bound) = server.local_addrs().remove(0) else {
             panic!("expected Tcp");
         };
@@ -6147,9 +5490,8 @@ fn draining_one_reuse_port_sibling_leaves_the_other_serving() {
     let w1 = thread::spawn(move || worker(1, addr, tx, park_tx));
     let (_, stop1) = rx.recv().expect("worker 1").expect("second bind");
 
-    // Two connections that ring 0 answered: one to park on it, one to idle
-    // on it. The kernel hashes each new connection across the group, so a
-    // bounded number of tries finds them (each try is a coin flip).
+    // Two connections that ring 0 answered: one to park on it, one to idle on it. The kernel hashes each new connection
+    // across the group, so a bounded number of tries finds them (each try is a coin flip).
     let mut on_ring0 = Vec::new();
     for _ in 0..64 {
         let mut s = connect_tcp(addr).expect("connect");
@@ -6174,16 +5516,13 @@ fn draining_one_reuse_port_sibling_leaves_the_other_serving() {
     let mut b = [0u8; 1];
     assert_eq!(idle0.read(&mut b).expect("read"), 0, "ring 0's idle sweep");
 
-    // Ring 0 is alive, draining, and out of the group: the survivor takes
-    // every new connection.
+    // Ring 0 is alive, draining, and out of the group: the survivor takes every new connection.
     for i in 0..16 {
         let msg = format!("m{i}");
-        let mut s = TcpStream::connect(addr)
-            .expect("a connect while a sibling drains must succeed");
+        let mut s = TcpStream::connect(addr).expect("a connect while a sibling drains must succeed");
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         send_framed(&mut s, msg.as_bytes()).expect("send");
-        let reply = recv_framed(&mut s)
-            .expect("served by the survivor, not queued on the drained ring");
+        let reply = recv_framed(&mut s).expect("served by the survivor, not queued on the drained ring");
         assert_eq!(reply[0], 1, "connection {i} landed on the drained ring");
         assert_eq!(&reply[1..], msg.as_bytes());
     }
@@ -6199,11 +5538,10 @@ fn draining_one_reuse_port_sibling_leaves_the_other_serving() {
 
 #[test]
 fn tcp_pipelined_out_of_order() {
-    // Pipelined (max_in_flight > 1): the client sends several requests without
-    // waiting; each is deferred to a worker that finishes in REVERSE order. With
-    // read-ahead the server reads and defers all of them before any reply, so
-    // replies egress out of request order - proving recv is decoupled from send.
-    // The body carries a 1-byte id the client matches replies against.
+    // Pipelined (max_in_flight > 1): the client sends several requests without waiting; each is deferred to a worker
+    // that finishes in REVERSE order. With read-ahead the server reads and defers all of them before any reply, so
+    // replies egress out of request order - proving recv is decoupled from send. The body carries a 1-byte id the
+    // client matches replies against.
     const N: u8 = 4;
     let cfg = ServerConfig {
         max_in_flight_requests: 8,
@@ -6211,15 +5549,9 @@ fn tcp_pipelined_out_of_order() {
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             let id = body[0];
             let (deferred, permit) = responder.defer();
             thread::spawn(move || {
@@ -6231,9 +5563,7 @@ fn tcp_pipelined_out_of_order() {
         },
     };
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto,
     ) {
@@ -6265,16 +5595,15 @@ fn tcp_pipelined_out_of_order() {
 
     server.serve_forever().expect("serve_forever");
     let order = client.join().expect("thread join").expect("client io");
-    // Deterministic reversal from the inverse delays - the last request sent is
-    // answered first, which can only happen if reads ran ahead of sends.
+    // Deterministic reversal from the inverse delays - the last request sent is answered first, which can only happen
+    // if reads ran ahead of sends.
     assert_eq!(order, vec![3, 2, 1, 0]);
 }
 
 #[test]
 fn tcp_pipelined_backpressure() {
-    // A tight cap with more pipelined requests than the cap: read-ahead must
-    // pause at the cap and resume as replies drain - every request answered,
-    // none dropped or deadlocked.
+    // A tight cap with more pipelined requests than the cap: read-ahead must pause at the cap and resume as replies
+    // drain - every request answered, none dropped or deadlocked.
     const N: u8 = 12;
     let cfg = ServerConfig {
         max_in_flight_requests: 2,
@@ -6282,15 +5611,9 @@ fn tcp_pipelined_backpressure() {
     };
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
-            let Request {
-                body, responder, ..
-            } = req;
+            let Request { body, responder, .. } = req;
             let id = body[0];
             let (deferred, permit) = responder.defer();
             thread::spawn(move || {
@@ -6301,9 +5624,7 @@ fn tcp_pipelined_backpressure() {
         },
     };
     let mut server = match Server::with_config(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
+        [ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())],
         cfg,
         proto,
     ) {
@@ -6341,27 +5662,19 @@ fn tcp_pipelined_backpressure() {
 
 #[test]
 fn tcp_large_response() {
-    // A response far larger than the socket send buffer exercises the WAITALL
-    // send: io_uring accumulates the short writes in-kernel and delivers the
-    // whole PDU in one op. The client reads it all back and checks it. (Runs in
-    // the default sequential mode - the WAITALL send is orthogonal to pipelining.)
+    // A response far larger than the socket send buffer exercises the WAITALL send: io_uring accumulates the short
+    // writes in-kernel and delivers the whole PDU in one op. The client reads it all back and checks it. (Runs in the
+    // default sequential mode - the WAITALL send is orthogonal to pipelining.)
     const SIZE: usize = 2 * 1024 * 1024; // >> the default socket sndbuf
     let proto = length_prefixed(
         PrefixWidth::U32,
         Endian::Big,
         false,
         |_h: &[u8], _b: &[u8], _p: &ClientAddr| {
-            Some(echo_frame(
-                &(0..SIZE).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
-            ))
+            Some(echo_frame(&(0..SIZE).map(|i| (i % 251) as u8).collect::<Vec<u8>>()))
         },
     );
-    let mut server = match Server::bind(
-        [ServerAddr::Tcp(
-            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
-        )],
-        proto,
-    ) {
+    let mut server = match Server::bind([ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap())], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -6390,16 +5703,12 @@ fn tcp_large_response() {
 
 #[test]
 fn tcp_reject() {
-    // `accept` returns None -> the connection is accepted then immediately closed
-    // before any read; the client observes a clean EOF with no reply.
+    // `accept` returns None -> the connection is accepted then immediately closed before any read; the client observes
+    // a clean EOF with no reply.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| None::<()>,
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |_: Request<'_, ()>| Response::Close,
     };
     let mut server = match Server::bind([addr], proto) {
@@ -6436,20 +5745,13 @@ fn tcp_reject() {
 
 #[test]
 fn server_close_reaches_peer_while_another_idles() {
-    // A server-initiated close must send the peer its FIN promptly even when
-    // another connection sits idle on a parked recv. A bare CLOSE of a direct
-    // descriptor only drops the ring's file-table reference; the socket's
-    // fput (and thus the FIN) can be deferred while the idle connection's
-    // in-flight recv pins the ring's resource node - so the closed peer would
-    // hang fully connected. The pre-close SHUTDOWN fixes that; this is the
-    // regression guard.
+    // A server-initiated close must send the peer its FIN promptly even when another connection sits idle on a parked
+    // recv. A bare CLOSE of a direct descriptor only drops the ring's file-table reference; the socket's fput (and thus
+    // the FIN) can be deferred while the idle connection's in-flight recv pins the ring's resource node - so the closed
+    // peer would hang fully connected. The pre-close SHUTDOWN fixes that; this is the regression guard.
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         // 'C' => close the connection; anything else => echo (keep-alive).
         body: |req: Request<'_, ()>| {
             let Request { body, .. } = req;
@@ -6474,14 +5776,14 @@ fn server_close_reaches_peer_while_another_idles() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
-            // Idle connection: one request keeps it alive, then it parks on a
-            // recv (pinning the resource node) without closing.
+            // Idle connection: one request keeps it alive, then it parks on a recv (pinning the resource node) without
+            // closing.
             let mut idle = connect_tcp(v4)?;
             send_framed(&mut idle, b"keepalive")?;
             assert_eq!(recv_framed(&mut idle)?, b"keepalive");
 
-            // Second connection asks the server to close it. With the idle
-            // recv pinning the node, the FIN must still arrive promptly.
+            // Second connection asks the server to close it. With the idle recv pinning the node, the FIN must still
+            // arrive promptly.
             let mut victim = connect_tcp(v4)?;
             victim.set_read_timeout(Some(Duration::from_secs(3)))?;
             send_framed(&mut victim, b"C")?;
@@ -6508,9 +5810,8 @@ fn server_close_reaches_peer_while_another_idles() {
     client.join().expect("thread join");
 }
 
-/// Block on a read and assert the server closes an idle connection promptly - a
-/// clean EOF (orderly close) or a reset. The stream's existing read timeout
-/// turns a server that never closes into a failure rather than a hang.
+/// Block on a read and assert the server closes an idle connection promptly - a clean EOF (orderly close) or a reset.
+/// The stream's existing read timeout turns a server that never closes into a failure rather than a hang.
 fn expect_idle_close(s: &mut TcpStream) -> io::Result<()> {
     let start = Instant::now();
     let mut buf = [0u8; 1];
@@ -6530,20 +5831,16 @@ fn expect_idle_close(s: &mut TcpStream) -> io::Result<()> {
 
 #[test]
 fn tcp_idle_timeout() {
-    // With an idle timeout set, a connection left waiting for its next request
-    // is closed and its slot reclaimed - while an in-flight request is never
-    // interrupted. Covers both idle recvs: after a completed round-trip, and a
-    // connection that sends nothing at all.
+    // With an idle timeout set, a connection left waiting for its next request is closed and its slot reclaimed - while
+    // an in-flight request is never interrupted. Covers both idle recvs: after a completed round-trip, and a connection
+    // that sends nothing at all.
     let cfg = ServerConfig {
         idle_timeout: Some(Duration::from_millis(200)),
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -6556,8 +5853,8 @@ fn tcp_idle_timeout() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let r = (|| -> io::Result<()> {
-            // Serviced, then idle: the active exchange succeeds, then the idle
-            // connection is closed on the *next* header recv's timeout.
+            // Serviced, then idle: the active exchange succeeds, then the idle connection is closed on the *next*
+            // header recv's timeout.
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"ping")?;
             assert_eq!(recv_framed(&mut s)?, b"ping");
@@ -6578,12 +5875,10 @@ fn tcp_idle_timeout() {
 
 #[test]
 fn timeouts_duration_max_mean_never() {
-    // `Duration::MAX` (and anything >= 2^63 seconds) must mean "never fires",
-    // not "fires instantly": the kernel-timespec conversion clamps tv_sec. An
-    // unclamped `as i64` cast wraps negative, LINK_TIMEOUT prep then fails
-    // -EINVAL and takes its linked recv down -ECANCELED - misreported as
-    // IdleTimeout/RequestTimeout - closing every connection at its first
-    // parked read: the server could not hold a single client.
+    // `Duration::MAX` (and anything >= 2^63 seconds) must mean "never fires", not "fires instantly": the
+    // kernel-timespec conversion clamps tv_sec. An unclamped `as i64` cast wraps negative, LINK_TIMEOUT prep then fails
+    // -EINVAL and takes its linked recv down -ECANCELED - misreported as IdleTimeout/RequestTimeout - closing every
+    // connection at its first parked read: the server could not hold a single client.
     let cfg = ServerConfig {
         idle_timeout: Some(Duration::MAX),
         request_timeout: Some(Duration::MAX),
@@ -6591,11 +5886,8 @@ fn timeouts_duration_max_mean_never() {
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -6613,8 +5905,8 @@ fn timeouts_duration_max_mean_never() {
             thread::sleep(Duration::from_millis(300));
             send_framed(&mut s, b"still here")?;
             assert_eq!(recv_framed(&mut s)?, b"still here");
-            // Hold the REQUEST clock across a wait too: prefix now, body
-            // later - the split parks the body recv with its linked clock.
+            // Hold the REQUEST clock across a wait too: prefix now, body later - the split parks the body recv with its
+            // linked clock.
             let mut frame = echo_frame(b"split");
             let body = frame.split_off(4);
             s.write_all(&frame)?;
@@ -6633,21 +5925,17 @@ fn timeouts_duration_max_mean_never() {
 
 #[test]
 fn tcp_request_timeout_reclaims_stalled_body() {
-    // SECURITY (slow-loris): a peer that sends a valid length prefix and then
-    // withholds the body must not pin its pool slot. `request_timeout` bounds
-    // an in-progress request even though `idle_timeout` (unset here) never
-    // would - the connection is not idle, it is mid-frame. An idle keep-alive
-    // connection is left untouched (that is `idle_timeout`'s job, not this).
+    // SECURITY (slow-loris): a peer that sends a valid length prefix and then withholds the body must not pin its pool
+    // slot. `request_timeout` bounds an in-progress request even though `idle_timeout` (unset here) never would - the
+    // connection is not idle, it is mid-frame. An idle keep-alive connection is left untouched (that is
+    // `idle_timeout`'s job, not this).
     let cfg = ServerConfig {
         request_timeout: Some(Duration::from_millis(200)),
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -6665,14 +5953,14 @@ fn tcp_request_timeout_reclaims_stalled_body() {
             send_framed(&mut ok, b"ping")?;
             assert_eq!(recv_framed(&mut ok)?, b"ping");
 
-            // Prefix declaring a 64-byte body, then nothing: the body recv
-            // stalls and the slot is reclaimed within request_timeout.
+            // Prefix declaring a 64-byte body, then nothing: the body recv stalls and the slot is reclaimed within
+            // request_timeout.
             let mut stall = connect_tcp(v4)?;
             stall.write_all(&64u32.to_be_bytes())?;
             expect_idle_close(&mut stall)?; // detects the prompt server close
 
-            // The idle keep-alive `ok` is NOT reclaimed by request_timeout: it
-            // still serves after well over the timeout window.
+            // The idle keep-alive `ok` is NOT reclaimed by request_timeout: it still serves after well over the timeout
+            // window.
             thread::sleep(Duration::from_millis(400));
             send_framed(&mut ok, b"pong")?;
             assert_eq!(recv_framed(&mut ok)?, b"pong");
@@ -6688,15 +5976,12 @@ fn tcp_request_timeout_reclaims_stalled_body() {
 
 #[test]
 fn tcp_request_timeout_partial_body_reports_request_timeout() {
-    // Close-reason fidelity for the slow-loris guard: a peer that trickles
-    // SOME body bytes then stalls must be reported as RequestTimeout, not
-    // TruncatedMessage. A LINK_TIMEOUT-cancelled MSG_WAITALL recv that had
-    // consumed bytes completes with res = done_io > 0 (io_sendrecv_fail) --
-    // bit-identical to a peer FIN mid-frame - so the server pairs the recv
-    // completion with its clock CQE (-ETIME vs -ECANCELED) to classify.
-    // Operators tuning slow-loris defenses read these reasons; "the peer
-    // vanished mid-message" for a live, merely-stalled peer sends them
-    // chasing the wrong problem.
+    // Close-reason fidelity for the slow-loris guard: a peer that trickles SOME body bytes then stalls must be reported
+    // as RequestTimeout, not TruncatedMessage. A LINK_TIMEOUT-cancelled MSG_WAITALL recv that had consumed bytes
+    // completes with res = done_io > 0 (io_sendrecv_fail) -- bit-identical to a peer FIN mid-frame - so the server
+    // pairs the recv completion with its clock CQE (-ETIME vs -ECANCELED) to classify. Operators tuning slow-loris
+    // defenses read these reasons; "the peer vanished mid-message" for a live, merely-stalled peer sends them chasing
+    // the wrong problem.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let cfg = ServerConfig {
@@ -6704,11 +5989,8 @@ fn tcp_request_timeout_partial_body_reports_request_timeout() {
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -6728,8 +6010,8 @@ fn tcp_request_timeout_partial_body_reports_request_timeout() {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // A valid prefix declaring 64 bytes, then only 10 of them: the
-            // body recv accrues partial progress before the clock fires.
+            // A valid prefix declaring 64 bytes, then only 10 of them: the body recv accrues partial progress before
+            // the clock fires.
             s.write_all(&64u32.to_be_bytes())?;
             s.write_all(&[0xEE; 10])?;
             expect_idle_close(&mut s)?; // reclaimed promptly (< 2s)
@@ -6749,11 +6031,10 @@ fn tcp_request_timeout_partial_body_reports_request_timeout() {
     );
 }
 
-/// A receipt budget at or under the inactivity bound leaves the latter dead:
-/// the message is closed before a whole silent period can be observed, so
-/// `request_timeout` never fires and the pair reads as one knob with two
-/// names. Refused at validation, where the operator finds out, rather than
-/// tolerated into a configuration that means something else.
+/// A receipt budget at or under the inactivity bound leaves the latter dead: the message is closed before a whole
+/// silent period can be observed, so `request_timeout` never fires and the pair reads as one knob with two names.
+/// Refused at validation, where the operator finds out, rather than tolerated into a configuration that means something
+/// else.
 #[test]
 fn a_receipt_budget_may_not_pre_empt_the_inactivity_bound() {
     use truenas_ros::net::server::Listen;
@@ -6762,30 +6043,24 @@ fn a_receipt_budget_may_not_pre_empt_the_inactivity_bound() {
             "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
         ))]
     };
-    let build = |cfg: ServerConfig| {
-        Server::with_config(one(), cfg, noop_protocol()).map(|_| ())
-    };
+    let build = |cfg: ServerConfig| Server::with_config(one(), cfg, noop_protocol()).map(|_| ());
     let request = Duration::from_secs(30);
-    for (what, receipt) in
-        [("under", Duration::from_secs(29)), ("equal", request)]
-    {
+    for (what, receipt) in [("under", Duration::from_secs(29)), ("equal", request)] {
         let cfg = ServerConfig {
             request_timeout: Some(request),
             max_receipt_time: Some(receipt),
             ..ServerConfig::default()
         };
         match build(cfg) {
-            Err(Error::Validation(m)) => assert!(
-                m.contains("must exceed request_timeout"),
-                "{what}: wrong message {m:?}"
-            ),
+            Err(Error::Validation(m)) => {
+                assert!(m.contains("must exceed request_timeout"), "{what}: wrong message {m:?}")
+            }
             other => panic!("{what} must be refused, got {:?}", other.is_ok()),
         }
     }
-    // One period longer is the smallest configuration that means what it
-    // says, and it is accepted. Either clock alone is fine too: the budget
-    // is the rate floor, the inactivity bound is the liveness check, and
-    // neither implies the other.
+    // One period longer is the smallest configuration that means what it says, and it is accepted. Either clock alone
+    // is fine too: the budget is the rate floor, the inactivity bound is the liveness check, and neither implies the
+    // other.
     for (what, cfg) in [
         (
             "both",
@@ -6818,17 +6093,14 @@ fn a_receipt_budget_may_not_pre_empt_the_inactivity_bound() {
     }
 }
 
-/// SECURITY (slow-loris, the case `request_timeout` cannot reach):
-/// `request_timeout` bounds progress per period, so a peer that sends one
-/// byte just inside every period re-arms it forever and holds its pool slot
-/// indefinitely. A slot is taken at accept, before authentication, and accept
-/// is gated on a free slot - so `pool_size` such peers deny service.
-/// `max_receipt_time` is the bound that cannot be restarted by progress: it
-/// runs from a message's first byte to its delivery.
+/// SECURITY (slow-loris, the case `request_timeout` cannot reach): `request_timeout` bounds progress per period, so a
+/// peer that sends one byte just inside every period re-arms it forever and holds its pool slot indefinitely. A slot is
+/// taken at accept, before authentication, and accept is gated on a free slot - so `pool_size` such peers deny service.
+/// `max_receipt_time` is the bound that cannot be restarted by progress: it runs from a message's first byte to its
+/// delivery.
 ///
-/// The trickle here is deliberately faster than `request_timeout`, so the
-/// inactivity guard never fires and the close reason proves which clock did
-/// the reclaiming.
+/// The trickle here is deliberately faster than `request_timeout`, so the inactivity guard never fires and the close
+/// reason proves which clock did the reclaiming.
 #[test]
 fn max_receipt_time_reclaims_a_peer_trickling_under_the_floor() {
     use std::sync::Mutex;
@@ -6839,11 +6111,8 @@ fn max_receipt_time_reclaims_a_peer_trickling_under_the_floor() {
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -6863,10 +6132,9 @@ fn max_receipt_time_reclaims_a_peer_trickling_under_the_floor() {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // Declare 64 bytes, then feed them one at a time every 100 ms --
-            // half the request_timeout period, so that clock is re-armed on
-            // every byte and never fires. At this pace the message needs
-            // 6.4 s, nine times the receipt budget.
+            // Declare 64 bytes, then feed them one at a time every 100 ms -- half the request_timeout period, so that
+            // clock is re-armed on every byte and never fires. At this pace the message needs 6.4 s, nine times the
+            // receipt budget.
             s.write_all(&64u32.to_be_bytes())?;
             for _ in 0..64 {
                 if s.write_all(&[0xEE]).is_err() {
@@ -6895,16 +6163,13 @@ fn max_receipt_time_reclaims_a_peer_trickling_under_the_floor() {
     );
 }
 
-/// The budget is not restarted by progress - the property that separates it
-/// from `request_timeout`, driven on the framing that can tell them apart.
+/// The budget is not restarted by progress - the property that separates it from `request_timeout`, driven on the
+/// framing that can tell them apart.
 ///
-/// A length-prefixed body is a single exact read, so the arm happens once
-/// whatever the code does afterwards and a per-read re-arm is invisible. A
-/// `More`/delimiter scan re-enters `submit_recv` on every chunk, so a budget
-/// that is cancelled and re-armed there rides the trickle forever, exactly
-/// as the inactivity clock does. The gaps here are half `request_timeout`,
-/// so that clock is satisfied throughout and the close reason names which
-/// one fired.
+/// A length-prefixed body is a single exact read, so the arm happens once whatever the code does afterwards and a
+/// per-read re-arm is invisible. A `More`/delimiter scan re-enters `submit_recv` on every chunk, so a budget that is
+/// cancelled and re-armed there rides the trickle forever, exactly as the inactivity clock does. The gaps here are half
+/// `request_timeout`, so that clock is satisfied throughout and the close reason names which one fired.
 #[test]
 fn a_chunk_scan_budget_is_not_restarted_by_progress() {
     use std::sync::Mutex;
@@ -6940,10 +6205,9 @@ fn a_chunk_scan_budget_is_not_restarted_by_progress() {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // A header that never terminates, one byte per 100 ms: every
-            // chunk read completes and re-arms, so `request_timeout` is
-            // satisfied on every one of them and never fires. Thirty bytes
-            // is 3 s of trickle against a 700 ms budget.
+            // A header that never terminates, one byte per 100 ms: every chunk read completes and re-arms, so
+            // `request_timeout` is satisfied on every one of them and never fires. Thirty bytes is 3 s of trickle
+            // against a 700 ms budget.
             for _ in 0..30 {
                 if s.write_all(b"x").is_err() || s.flush().is_err() {
                     break; // closed under us, which is the point
@@ -6968,13 +6232,11 @@ fn a_chunk_scan_budget_is_not_restarted_by_progress() {
 
 /// Exactly one budget per message, and the retire cancels the one there is.
 ///
-/// A `More`/delimiter framer reads in chunks that complete on any byte, so a
-/// trickled header is many non-idle reads of one message - the shape that
-/// tells an idempotent arm from a per-read one. Arming per read stacks a
-/// timer each time, and they all carry the same `user_data`, so the retire's
-/// `ASYNC_CANCEL` reaps one and leaves the rest to fire later against a
-/// connection that has done nothing wrong. The header here completes well
-/// inside the budget, so a close of any kind is the bug.
+/// A `More`/delimiter framer reads in chunks that complete on any byte, so a trickled header is many non-idle reads of
+/// one message - the shape that tells an idempotent arm from a per-read one. Arming per read stacks a timer each time,
+/// and they all carry the same `user_data`, so the retire's `ASYNC_CANCEL` reaps one and leaves the rest to fire later
+/// against a connection that has done nothing wrong. The header here completes well inside the budget, so a close of
+/// any kind is the bug.
 #[test]
 fn a_trickled_header_leaves_exactly_one_receipt_budget() {
     let budget = Duration::from_millis(400);
@@ -7003,9 +6265,8 @@ fn a_trickled_header_leaves_exactly_one_receipt_budget() {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // Eight chunk reads for one header, spread over 160 ms - well
-            // inside the budget, and none of the gaps near the inactivity
-            // bound either.
+            // Eight chunk reads for one header, spread over 160 ms - well inside the budget, and none of the gaps near
+            // the inactivity bound either.
             let head = b"Content-Length: 0\r\n\r\n";
             for b in head {
                 s.write_all(&[*b])?;
@@ -7016,16 +6277,12 @@ fn a_trickled_header_leaves_exactly_one_receipt_budget() {
             s.read_exact(&mut got)?;
             assert_eq!(&got, b"ok");
 
-            // Sit idle for several budgets. A timer left over from the
-            // trickle fires here and takes the slot with it.
+            // Sit idle for several budgets. A timer left over from the trickle fires here and takes the slot with it.
             thread::sleep(budget * 3);
             s.write_all(head)?;
             s.flush()?;
             s.read_exact(&mut got)?;
-            assert_eq!(
-                &got, b"ok",
-                "a stale receipt budget reaped a healthy connection"
-            );
+            assert_eq!(&got, b"ok", "a stale receipt budget reaped a healthy connection");
             Ok(())
         })();
         stop.shutdown();
@@ -7038,12 +6295,10 @@ fn a_trickled_header_leaves_exactly_one_receipt_budget() {
 
 /// The budget is retired at delivery, so it bounds receipt and nothing else.
 ///
-/// Two ways this could go wrong and both are silent: a budget that outlives
-/// its message would fire during handling or while the connection sits idle
-/// between requests, killing healthy keep-alive connections on a timer; and
-/// one that is re-armed rather than left running would degrade into the
-/// inactivity guard it exists beside. The sleeps here are several times the
-/// budget with the connection well-behaved throughout.
+/// Two ways this could go wrong and both are silent: a budget that outlives its message would fire during handling or
+/// while the connection sits idle between requests, killing healthy keep-alive connections on a timer; and one that is
+/// re-armed rather than left running would degrade into the inactivity guard it exists beside. The sleeps here are
+/// several times the budget with the connection well-behaved throughout.
 #[test]
 fn max_receipt_time_does_not_clock_handling_or_an_idle_connection() {
     let budget = Duration::from_millis(300);
@@ -7053,11 +6308,8 @@ fn max_receipt_time_does_not_clock_handling_or_an_idle_connection() {
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -7074,12 +6326,11 @@ fn max_receipt_time_does_not_clock_handling_or_an_idle_connection() {
             for i in 0..3 {
                 send_framed(&mut s, b"ping")?;
                 assert_eq!(recv_framed(&mut s)?, b"ping", "round {i}");
-                // Idle for well over the budget between requests. A budget
-                // still armed from the last message reaps the slot here.
+                // Idle for well over the budget between requests. A budget still armed from the last message reaps the
+                // slot here.
                 thread::sleep(budget * 3);
             }
-            // And a message split across the budget in ONE go is fine so
-            // long as it lands inside it.
+            // And a message split across the budget in ONE go is fine so long as it lands inside it.
             s.write_all(&4u32.to_be_bytes())?;
             s.flush()?;
             thread::sleep(budget / 3);
@@ -7098,11 +6349,10 @@ fn max_receipt_time_does_not_clock_handling_or_an_idle_connection() {
 
 #[test]
 fn request_timeout_reclaims_stalled_more_scan() {
-    // SECURITY (slow-loris, chunk-read path): a `More`/delimiter framer reads
-    // in chunks that complete on any byte, so the request clock bounds them by
-    // inactivity. A peer that sends a partial header (no `\r\n\r\n`) then stalls
-    // has its non-idle chunk read time out and its slot reclaimed - the
-    // `idle_timeout` clock (unset here) would never fire mid-scan.
+    // SECURITY (slow-loris, chunk-read path): a `More`/delimiter framer reads in chunks that complete on any byte, so
+    // the request clock bounds them by inactivity. A peer that sends a partial header (no `\r\n\r\n`) then stalls has
+    // its non-idle chunk read time out and its slot reclaimed - the `idle_timeout` clock (unset here) would never fire
+    // mid-scan.
     let cfg = ServerConfig {
         request_timeout: Some(Duration::from_millis(200)),
         ..ServerConfig::default()
@@ -7126,8 +6376,8 @@ fn request_timeout_reclaims_stalled_more_scan() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
-            // A partial LSP header with no `\r\n\r\n` terminator, then stall:
-            // the scan's next chunk read waits for a byte that never comes.
+            // A partial LSP header with no `\r\n\r\n` terminator, then stall: the scan's next chunk read waits for a
+            // byte that never comes.
             let mut stall = connect_tcp(v4)?;
             stall.write_all(b"Content-Length: 5\r\n")?;
             expect_idle_close(&mut stall)?;
@@ -7141,8 +6391,7 @@ fn request_timeout_reclaims_stalled_more_scan() {
     client.join().expect("thread join").expect("client io");
 }
 
-/// Read an LSP-framed message: header up to `\r\n\r\n`, then `Content-Length`
-/// body bytes.
+/// Read an LSP-framed message: header up to `\r\n\r\n`, then `Content-Length` body bytes.
 fn read_lsp<R: Read>(s: &mut R) -> io::Result<Vec<u8>> {
     let mut header = Vec::new();
     let mut byte = [0u8; 1];
@@ -7200,23 +6449,19 @@ fn retry<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 
 // ---- kernel TLS (kTLS) --------------------------------------------------
 //
-// The handshake/probe scaffolding - throwaway cert, `truenas_ktls` acceptor,
-// OpenSSL client, and the ULP/engagement skip machinery - is shared with
-// `test/http_live.rs`; see `test/support/ktls.rs`.
+// The handshake/probe scaffolding - throwaway cert, `truenas_ktls` acceptor, OpenSSL client, and the ULP/engagement
+// skip machinery - is shared with `test/http_live.rs`; see `test/support/ktls.rs`.
 
 #[path = "support/ktls.rs"]
 mod ktls;
 use ktls::{
-    ktls_acceptor, ktls_openssl_unsupported, ktls_server_handshake,
-    ktls_unsupported, self_signed, tls_connect,
+    ktls_acceptor, ktls_openssl_unsupported, ktls_server_handshake, ktls_unsupported, self_signed, tls_connect,
 };
 
-/// Shuts the server down when dropped. Every test here runs `serve_forever`
-/// on the test thread and drives the client from a spawned thread, so a
-/// panicking client (a failed assert, an I/O expect) would otherwise skip
-/// its shutdown call and strand the server - hanging the whole test binary
-/// instead of going red. A clone of the handle in this guard makes the
-/// panic surface through `client.join()`.
+/// Shuts the server down when dropped. Every test here runs `serve_forever` on the test thread and drives the client
+/// from a spawned thread, so a panicking client (a failed assert, an I/O expect) would otherwise skip its shutdown call
+/// and strand the server - hanging the whole test binary instead of going red. A clone of the handle in this guard
+/// makes the panic surface through `client.join()`.
 struct ShutdownOnDrop(ShutdownHandle);
 
 impl Drop for ShutdownOnDrop {
@@ -7227,18 +6472,16 @@ impl Drop for ShutdownOnDrop {
 
 #[test]
 fn ktls_echo_roundtrip() {
-    // End-to-end: a kTLS listener, the consumer's OpenSSL handshake worker, and
-    // a real TLS client. Requests/replies frame with the usual 4-byte prefix
-    // over the kernel-TLS transport; the server sees plaintext (kernel decrypts)
-    // and the framer is unchanged.
+    // End-to-end: a kTLS listener, the consumer's OpenSSL handshake worker, and a real TLS client. Requests/replies
+    // frame with the usual 4-byte prefix over the kernel-TLS transport; the server sees plaintext (kernel decrypts) and
+    // the framer is unchanged.
     use std::sync::Mutex;
     if ktls_openssl_unsupported() {
         return;
     }
     let (cert, key) = self_signed();
     let acceptor = Arc::new(ktls_acceptor(&cert, &key));
-    let seen_listener: Arc<Mutex<Option<ServerAddr>>> =
-        Arc::new(Mutex::new(None));
+    let seen_listener: Arc<Mutex<Option<ServerAddr>>> = Arc::new(Mutex::new(None));
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = length_prefixed(
         PrefixWidth::U32,
@@ -7246,10 +6489,7 @@ fn ktls_echo_roundtrip() {
         false,
         |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
     );
-    let mut server = match Server::bind(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        proto,
-    ) {
+    let mut server = match Server::bind([truenas_ros::net::server::Listen::tls(addr)], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -7276,18 +6516,15 @@ fn ktls_echo_roundtrip() {
         let _stop = ShutdownOnDrop(stop); // shuts down even if this panics
         (|| -> io::Result<()> {
             let mut s = tls_connect(v4)?;
-            for msg in [b"tls-hello".as_slice(), b"second", b"third-and-final"]
-            {
+            for msg in [b"tls-hello".as_slice(), b"second", b"third-and-final"] {
                 send_framed(&mut s, msg)?;
                 assert_eq!(recv_framed(&mut s)?, msg, "kTLS echo mismatch");
             }
-            // A larger payload spanning multiple TLS records still frames.
-            // 512 KiB is above the default `recv_buffer_bytes`, so the body
-            // is *placed* - read into its own allocation rather than the
-            // pool buffer - which is the arm the kTLS continuation's bound
-            // has to follow.
-            // Well under the 1 MiB `max_request_bytes` a server advertises,
-            // so this is an ordinary message, not an edge.
+            // A larger payload spanning multiple TLS records still frames. 512 KiB is above the default
+            // `recv_buffer_bytes`, so the body is *placed* - read into its own allocation rather than the pool buffer -
+            // which is the arm the kTLS continuation's bound has to follow.
+            // Well under the 1 MiB `max_request_bytes` a server advertises, so this is an ordinary message, not an
+            // edge.
             let big = vec![0x5au8; 512 * 1024];
             send_framed(&mut s, &big)?;
             assert_eq!(recv_framed(&mut s)?, big);
@@ -7308,9 +6545,8 @@ fn ktls_echo_roundtrip() {
 
 #[test]
 fn ktls_rejected_handshake_sheds() {
-    // A handshake that fails (the client speaks plaintext, not TLS) must reject
-    // cleanly - the worker calls deferral.reject(), the slot is shed - and the
-    // server keeps serving later TLS connections.
+    // A handshake that fails (the client speaks plaintext, not TLS) must reject cleanly - the worker calls
+    // deferral.reject(), the slot is shed - and the server keeps serving later TLS connections.
     if ktls_openssl_unsupported() {
         return;
     }
@@ -7323,10 +6559,7 @@ fn ktls_rejected_handshake_sheds() {
         false,
         |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
     );
-    let mut server = match Server::bind(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        proto,
-    ) {
+    let mut server = match Server::bind([truenas_ros::net::server::Listen::tls(addr)], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -7368,8 +6601,8 @@ fn ktls_rejected_handshake_sheds() {
 
     server.serve_forever().expect("serve_forever");
     client.join().expect("thread join");
-    // The client read the rejected connection to EOF (the shed's FIN) before its
-    // real TLS roundtrip, so the reject-shed is already counted here.
+    // The client read the rejected connection to EOF (the shed's FIN) before its real TLS roundtrip, so the reject-shed
+    // is already counted here.
     assert!(
         stats.snapshot().shed >= 1,
         "the rejected handshake should be shed (shed={})",
@@ -7377,13 +6610,10 @@ fn ktls_rejected_handshake_sheds() {
     );
 }
 
-/// A worker's `ready()` alone does not make a socket encrypted: the
-/// deferral reads the kernel's per-direction key state back
-/// (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`) and sheds a connection whose
-/// keys the kernel does not hold. Without the readback a hook that never
-/// ran a handshake - or a library that silently fell back to userspace
-/// records - has the server framing plaintext as TLS; this test's client
-/// speaks bare TCP and must be shed unanswered.
+/// A worker's `ready()` alone does not make a socket encrypted: the deferral reads the kernel's per-direction key state
+/// back (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`) and sheds a connection whose keys the kernel does not hold. Without the
+/// readback a hook that never ran a handshake - or a library that silently fell back to userspace records - has the
+/// server framing plaintext as TLS; this test's client speaks bare TCP and must be shed unanswered.
 #[test]
 fn ktls_ready_without_kernel_keys_is_shed() {
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -7393,20 +6623,15 @@ fn ktls_ready_without_kernel_keys_is_shed() {
         false,
         |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
     );
-    let mut server = match Server::bind(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        proto,
-    ) {
+    let mut server = match Server::bind([truenas_ros::net::server::Listen::tls(addr)], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
     };
     server.set_tls_handshake(move |fd, _inc, deferral| {
         thread::spawn(move || {
-            // No handshake at all: claim success on an untouched TCP
-            // socket. The furnished fd is closed first, as a worker done
-            // with it would - the readback rides the deferral's own dup,
-            // not a number that may be reused.
+            // No handshake at all: claim success on an untouched TCP socket. The furnished fd is closed first, as a
+            // worker done with it would - the readback rides the deferral's own dup, not a number that may be reused.
             // SAFETY: the furnished fd is the worker's to close.
             unsafe { libc::close(fd) };
             deferral.ready(());
@@ -7426,18 +6651,8 @@ fn ktls_ready_without_kernel_keys_is_shed() {
             let mut one = [0u8; 1];
             match s.read(&mut one) {
                 Ok(0) => Ok(()), // shed: EOF, nothing served
-                Ok(_) => panic!(
-                    "a ready() with no kernel keys was served in the clear"
-                ),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::UnexpectedEof
-                    ) =>
-                {
-                    Ok(())
-                }
+                Ok(_) => panic!("a ready() with no kernel keys was served in the clear"),
+                Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof) => Ok(()),
                 Err(e) => Err(e),
             }
         })()
@@ -7452,15 +6667,12 @@ fn ktls_ready_without_kernel_keys_is_shed() {
 
 /// A shutdown that lands while bytes are arriving must not abort.
 ///
-/// Stopping the reactor reaps outstanding completions rather than
-/// dispatching them, so a recv the kernel has already chosen a provided
-/// buffer for is drained without that buffer ever being adopted. Its
-/// descriptor is consumed and the connection is going away, which is
-/// correct - but it means the kernel's consumer head and this side's
-/// posted count legitimately disagree at teardown, and any drain-time
-/// equality check between them fires on an ordinary shutdown. `Server`
-/// drains from `Drop`, where a panic aborts the process rather than
-/// failing a test, so such a check costs a crash on a correct path.
+/// Stopping the reactor reaps outstanding completions rather than dispatching them, so a recv the kernel has already
+/// chosen a provided buffer for is drained without that buffer ever being adopted. Its descriptor is consumed and the
+/// connection is going away, which is correct - but it means the kernel's consumer head and this side's posted count
+/// legitimately disagree at teardown, and any drain-time equality check between them fires on an ordinary shutdown.
+/// `Server` drains from `Drop`, where a panic aborts the process rather than failing a test, so such a check costs a
+/// crash on a correct path.
 #[test]
 fn a_shutdown_amid_arrivals_tears_down_quietly() {
     let cfg = ServerConfig {
@@ -7486,17 +6698,14 @@ fn a_shutdown_amid_arrivals_tears_down_quietly() {
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        // One full round trip first, so the fixture is known to have been
-        // accepted and served before anything races - the shutdown below
-        // is deliberately concurrent and would otherwise be free to win
-        // before the first accept.
+        // One full round trip first, so the fixture is known to have been accepted and served before anything races -
+        // the shutdown below is deliberately concurrent and would otherwise be free to win before the first accept.
         let mut first = connect_tcp(v4).expect("connect");
         send_framed(&mut first, b"warmup").expect("send");
         assert_eq!(recv_framed(&mut first).expect("echo"), b"warmup");
 
-        // Then several connections delivering at the moment the reactor
-        // stops, so a recv completes with a buffer already selected and is
-        // reaped rather than dispatched.
+        // Then several connections delivering at the moment the reactor stops, so a recv completes with a buffer
+        // already selected and is reaped rather than dispatched.
         let mut socks = Vec::new();
         for _ in 0..6 {
             let mut s = connect_tcp(v4).expect("connect");
@@ -7522,23 +6731,20 @@ fn a_shutdown_amid_arrivals_tears_down_quietly() {
     assert!(s.replies >= 1, "the fixture was served: {s:?}");
 }
 
-/// Half a handshake is not a handshake: a socket the kernel keyed in only
-/// **one** direction passes the other direction's bytes in the clear, so
-/// `ready()` sheds it exactly as it sheds an unkeyed one.
+/// Half a handshake is not a handshake: a socket the kernel keyed in only **one** direction passes the other
+/// direction's bytes in the clear, so `ready()` sheds it exactly as it sheds an unkeyed one.
 ///
-/// The unkeyed case cannot see this distinction. A predicate that ORs the
-/// two directions instead of ANDing them still refuses a socket with no
-/// keys at all - passing `ktls_ready_without_kernel_keys_is_shed` - while
-/// admitting this one, whose TX side is plaintext on the wire. The hook
-/// installs the RX key only, leaving `tx_conf` at `TLS_BASE`, which is the
-/// shape a handshake library with a TLS 1.3 RX/TX gap produces.
+/// The unkeyed case cannot see this distinction. A predicate that ORs the two directions instead of ANDing them still
+/// refuses a socket with no keys at all - passing `ktls_ready_without_kernel_keys_is_shed` - while admitting this one,
+/// whose TX side is plaintext on the wire. The hook installs the RX key only, leaving `tx_conf` at `TLS_BASE`, which is
+/// the shape a handshake library with a TLS 1.3 RX/TX gap produces.
 #[test]
 fn ktls_ready_with_only_one_direction_keyed_is_shed() {
     const SOL_TLS: libc::c_int = 282;
     const TLS_RX: libc::c_int = 2;
     const TCP_ULP: libc::c_int = 31;
-    // `struct tls12_crypto_info_aes_gcm_128`. The contents do not matter -
-    // only that the kernel accepts them and sets `crypto_recv.info`.
+    // `struct tls12_crypto_info_aes_gcm_128`. The contents do not matter - only that the kernel accepts them and sets
+    // `crypto_recv.info`.
     #[repr(C)]
     struct AesGcm128 {
         version: u16,
@@ -7556,18 +6762,14 @@ fn ktls_ready_with_only_one_direction_keyed_is_shed() {
         false,
         |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
     );
-    let mut server = match Server::bind(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        proto,
-    ) {
+    let mut server = match Server::bind([truenas_ros::net::server::Listen::tls(addr)], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
     };
     server.set_tls_handshake(move |fd, _inc, deferral| {
         thread::spawn(move || {
-            // Attach the ULP and key RX only, so everything the server
-            // sends goes out in the clear.
+            // Attach the ULP and key RX only, so everything the server sends goes out in the clear.
             // SAFETY: setsockopt on the furnished fd this worker owns.
             let keyed_one_way = unsafe {
                 let tls = b"tls\0";
@@ -7596,8 +6798,7 @@ fn ktls_ready_with_only_one_direction_keyed_is_shed() {
                         ) == 0
                     }
             };
-            // SAFETY: the furnished fd is the worker's to close. The
-            // readback rides the deferral's own dup.
+            // SAFETY: the furnished fd is the worker's to close. The readback rides the deferral's own dup.
             unsafe { libc::close(fd) };
             if keyed_one_way {
                 deferral.ready(()); // "success" on a half-keyed socket
@@ -7623,9 +6824,8 @@ fn ktls_ready_with_only_one_direction_keyed_is_shed() {
                 Ok(_) => {
                     panic!("a half-keyed ready() was served in the clear")
                 }
-                // WouldBlock is tolerated because an admitted half-keyed
-                // connection answers nothing either - the read alone cannot
-                // separate the two. The stats assertion below is what does.
+                // WouldBlock is tolerated because an admitted half-keyed connection answers nothing either - the read
+                // alone cannot separate the two. The stats assertion below is what does.
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -7645,21 +6845,19 @@ fn ktls_ready_with_only_one_direction_keyed_is_shed() {
     server.serve_forever().expect("serve_forever");
     client.join().expect("thread join");
     let s = stats.snapshot();
-    // Shed, not installed-then-closed: under an OR predicate the connection
-    // is admitted, so `shed` stays 0 and the teardown counts as `closed`.
+    // Shed, not installed-then-closed: under an OR predicate the connection is admitted, so `shed` stays 0 and the
+    // teardown counts as `closed`.
     assert!(s.shed >= 1, "the half-keyed connection was shed: {s:?}");
     assert_eq!(s.replies, 0, "and nothing was answered: {s:?}");
 }
 
 #[test]
 fn ktls_handshake_timeout_sheds_parked_slot() {
-    // SECURITY: a kTLS connection whose handshake never completes (the
-    // consumer's worker never calls back) parks a pool slot - it holds a
-    // descriptor but has no in-flight recv/send, so neither idle_timeout nor
-    // request_timeout (both linked to a recv) can reach it. With
-    // `tls_handshake_timeout` set the park is bounded: the slot is shed. Here
-    // the handshake handler closes the furnished fd and *holds* the deferral
-    // (never resolving, so no reject-shed), leaving only the timeout to reclaim.
+    // SECURITY: a kTLS connection whose handshake never completes (the consumer's worker never calls back) parks a pool
+    // slot - it holds a descriptor but has no in-flight recv/send, so neither idle_timeout nor request_timeout (both
+    // linked to a recv) can reach it. With `tls_handshake_timeout` set the park is bounded: the slot is shed. Here the
+    // handshake handler closes the furnished fd and *holds* the deferral (never resolving, so no reject-shed), leaving
+    // only the timeout to reclaim.
     let cfg = ServerConfig {
         tls_handshake_timeout: Some(Duration::from_millis(250)),
         pool_size: 4,
@@ -7672,17 +6870,13 @@ fn ktls_handshake_timeout_sheds_parked_slot() {
         false,
         |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
     );
-    let mut server = match Server::with_config(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        cfg,
-        proto,
-    ) {
+    let mut server = match Server::with_config([truenas_ros::net::server::Listen::tls(addr)], cfg, proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
     };
-    // Buffer each deferral (never resolving it -> no reject-shed) and close the
-    // fd we won't use; the held deferrals are released when `keep_rx` drops.
+    // Buffer each deferral (never resolving it -> no reject-shed) and close the fd we won't use; the held deferrals are
+    // released when `keep_rx` drops.
     let (keep_tx, keep_rx) = std::sync::mpsc::channel();
     server.set_tls_handshake(move |fd, _inc, deferral| {
         // SAFETY: closing the furnished fd this handler owns and won't use.
@@ -7697,13 +6891,11 @@ fn ktls_handshake_timeout_sheds_parked_slot() {
 
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        // Connect (raw TCP); the server furnishes the fd and parks. We never
-        // handshake - the park timeout must shed each slot.
-        let peers: Vec<_> =
-            (0..3).map(|_| connect_tcp(v4).expect("connect")).collect();
+        // Connect (raw TCP); the server furnishes the fd and parks. We never handshake - the park timeout must shed
+        // each slot.
+        let peers: Vec<_> = (0..3).map(|_| connect_tcp(v4).expect("connect")).collect();
         let t0 = Instant::now();
-        while stats.snapshot().shed < 3 && t0.elapsed() < Duration::from_secs(3)
-        {
+        while stats.snapshot().shed < 3 && t0.elapsed() < Duration::from_secs(3) {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
@@ -7722,11 +6914,9 @@ fn ktls_handshake_timeout_sheds_parked_slot() {
 
 #[test]
 fn ktls_close_notify_reports_tls_control() {
-    // A polite TLS client ends its session with close_notify - on the wire a
-    // 2-byte alert record. The server's parked exact header read completes
-    // SHORT with record type 21 (alert), which must classify as TlsControl --
-    // the documented reason for a peer's clean TLS close - not as
-    // TruncatedMessage.
+    // A polite TLS client ends its session with close_notify - on the wire a 2-byte alert record. The server's parked
+    // exact header read completes SHORT with record type 21 (alert), which must classify as TlsControl -- the
+    // documented reason for a peer's clean TLS close - not as TruncatedMessage.
     use std::sync::Mutex;
     if ktls_openssl_unsupported() {
         return;
@@ -7741,10 +6931,7 @@ fn ktls_close_notify_reports_tls_control() {
         false,
         |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
     );
-    let mut server = match Server::bind(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        proto,
-    ) {
+    let mut server = match Server::bind([truenas_ros::net::server::Listen::tls(addr)], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -7776,8 +6963,7 @@ fn ktls_close_notify_reports_tls_control() {
             let mut s = tls_connect(v4)?;
             send_framed(&mut s, b"bye-soon")?;
             assert_eq!(recv_framed(&mut s)?, b"bye-soon");
-            // Clean TLS teardown: the close_notify lands on the server's
-            // idle header read.
+            // Clean TLS teardown: the close_notify lands on the server's idle header read.
             s.shutdown().map_err(io::Error::other)?;
             // Give the alert time to complete the parked recv and close.
             thread::sleep(Duration::from_millis(100));
@@ -7800,33 +6986,24 @@ fn ktls_close_notify_reports_tls_control() {
     );
 }
 
-/// A peer's TLS 1.3 KeyUpdate closes the connection as `TlsControl`, and the
-/// request behind it is not answered.
+/// A peer's TLS 1.3 KeyUpdate closes the connection as `TlsControl`, and the request behind it is not answered.
 ///
-/// `CloseReason::TlsControl` names this case outright - "a post-handshake
-/// handshake message, TLS 1.3 KeyUpdate, or alert ... renegotiation/rekey are
-/// out of scope" - but only the alert half had a test
-/// (`ktls_close_notify_reports_tls_control`). The two halves reach the same
-/// reason down different paths: an alert completes the parked idle read SHORT
-/// (`on_recv_complete`'s `res > 0 && ktls_control_record` arm), while a
-/// KeyUpdate arrives mid-conversation with a request queued behind it.
+/// `CloseReason::TlsControl` names this case outright - "a post-handshake handshake message, TLS 1.3 KeyUpdate, or
+/// alert ... renegotiation/rekey are out of scope" - but only the alert half had a test
+/// (`ktls_close_notify_reports_tls_control`). The two halves reach the same reason down different paths: an alert
+/// completes the parked idle read SHORT (`on_recv_complete`'s `res > 0 && ktls_control_record` arm), while a KeyUpdate
+/// arrives mid-conversation with a request queued behind it.
 ///
-/// Measured, not assumed: this kernel does NOT absorb an RX KeyUpdate on the
-/// server's behalf, so the record does reach the reactor. Pinning that here
-/// means a kernel or policy change that starts handling rekey - or that
-/// reclassifies the record - goes red rather than silently altering what a
-/// long-lived peer sees.
+/// Measured, not assumed: this kernel does NOT absorb an RX KeyUpdate on the server's behalf, so the record does reach
+/// the reactor. Pinning that here means a kernel or policy change that starts handling rekey - or that reclassifies the
+/// record - goes red rather than silently altering what a long-lived peer sees.
 #[test]
 fn ktls_peer_key_update_closes_as_tls_control() {
     use foreign_types::ForeignTypeRef;
     use std::sync::Mutex;
-    // Not bound by the `openssl` crate (nor by `openssl-sys`), so declare the
-    // two libssl entry points this needs.
+    // Not bound by the `openssl` crate (nor by `openssl-sys`), so declare the two libssl entry points this needs.
     unsafe extern "C" {
-        fn SSL_key_update(
-            ssl: *mut openssl_sys::SSL,
-            updatetype: std::os::raw::c_int,
-        ) -> std::os::raw::c_int;
+        fn SSL_key_update(ssl: *mut openssl_sys::SSL, updatetype: std::os::raw::c_int) -> std::os::raw::c_int;
         fn SSL_do_handshake(ssl: *mut openssl_sys::SSL) -> std::os::raw::c_int;
     }
     const SSL_KEY_UPDATE_NOT_REQUESTED: std::os::raw::c_int = 0;
@@ -7844,10 +7021,7 @@ fn ktls_peer_key_update_closes_as_tls_control() {
         false,
         |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
     );
-    let mut server = match Server::bind(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        proto,
-    ) {
+    let mut server = match Server::bind([truenas_ros::net::server::Listen::tls(addr)], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -7878,32 +7052,22 @@ fn ktls_peer_key_update_closes_as_tls_control() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
         let mut s = tls_connect(v4).expect("tls connect");
-        assert_eq!(
-            s.ssl().version_str(),
-            "TLSv1.3",
-            "KeyUpdate is a TLS 1.3 message"
-        );
-        // The control: the connection serves normally before the rekey, so a
-        // failure after it is the rekey and not the fixture.
+        assert_eq!(s.ssl().version_str(), "TLSv1.3", "KeyUpdate is a TLS 1.3 message");
+        // The control: the connection serves normally before the rekey, so a failure after it is the rekey and not the
+        // fixture.
         send_framed(&mut s, b"before-rekey").expect("send 1");
         assert_eq!(recv_framed(&mut s).expect("recv 1"), b"before-rekey");
 
         // Post-handshake KeyUpdate, flushed immediately.
         assert_eq!(
-            unsafe {
-                SSL_key_update(s.ssl().as_ptr(), SSL_KEY_UPDATE_NOT_REQUESTED)
-            },
+            unsafe { SSL_key_update(s.ssl().as_ptr(), SSL_KEY_UPDATE_NOT_REQUESTED) },
             1,
             "SSL_key_update"
         );
-        assert_eq!(
-            unsafe { SSL_do_handshake(s.ssl().as_ptr()) },
-            1,
-            "flush the KeyUpdate"
-        );
+        assert_eq!(unsafe { SSL_do_handshake(s.ssl().as_ptr()) }, 1, "flush the KeyUpdate");
 
-        // The request behind it rides the new keys. The server has already
-        // closed on the control record, so it is never answered.
+        // The request behind it rides the new keys. The server has already closed on the control record, so it is never
+        // answered.
         let _ = send_framed(&mut s, b"after-rekey");
         *answered2.lock().unwrap() = Some(recv_framed(&mut s).is_ok());
         thread::sleep(Duration::from_millis(150));
@@ -7930,17 +7094,14 @@ fn ktls_peer_key_update_closes_as_tls_control() {
 
 /// SECURITY: a kTLS body splice with no `request_timeout` is refused.
 ///
-/// That clock is the **only** bound one has. `tls_sw_splice_read` blocks an
-/// io-wq worker awaiting the next TLS record, which no linked timeout can
-/// reach - the kernel arms one only after the head op's `issue()` returns,
-/// and a blocking splice's does not return until it completes - so the
-/// standalone watchdog keyed on `request_timeout` is the whole mechanism.
-/// Unset, a peer that handshakes, declares a large body and goes silent
-/// holds its slot, an io-wq worker and its destination pipe's mutex
-/// indefinitely, immune to every other timeout.
+/// That clock is the **only** bound one has. `tls_sw_splice_read` blocks an io-wq worker awaiting the next TLS record,
+/// which no linked timeout can reach - the kernel arms one only after the head op's `issue()` returns, and a blocking
+/// splice's does not return until it completes - so the standalone watchdog keyed on `request_timeout` is the whole
+/// mechanism. Unset, a peer that handshakes, declares a large body and goes silent holds its slot, an io-wq worker and
+/// its destination pipe's mutex indefinitely, immune to every other timeout.
 ///
-/// Plain TCP is deliberately not refused: its `-EAGAIN` readiness-poll path
-/// is already clocked. The second half of this test is that denominator.
+/// Plain TCP is deliberately not refused: its `-EAGAIN` readiness-poll path is already clocked. The second half of this
+/// test is that denominator.
 #[test]
 fn ktls_splice_body_without_a_clock_is_refused() {
     use std::sync::Mutex;
@@ -7969,10 +7130,7 @@ fn ktls_splice_body_without_a_clock_is_refused() {
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     };
     // No `request_timeout`, which is the default.
-    let mut server = match Server::bind(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        proto,
-    ) {
+    let mut server = match Server::bind([truenas_ros::net::server::Listen::tls(addr)], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => {
             close_pipe();
@@ -8023,10 +7181,7 @@ fn ktls_splice_body_without_a_clock_is_refused() {
     server.serve_forever().expect("serve_forever");
     client.join().expect("client join");
     assert!(
-        reasons
-            .lock()
-            .unwrap()
-            .contains(&CloseReason::SpliceUnbounded),
+        reasons.lock().unwrap().contains(&CloseReason::SpliceUnbounded),
         "an unbounded kTLS splice must be refused, got {:?}",
         reasons.lock().unwrap()
     );
@@ -8035,19 +7190,16 @@ fn ktls_splice_body_without_a_clock_is_refused() {
 
 #[test]
 fn tcp_splice_body_over_ktls() {
-    // A body splices zero-copy off a SOFTWARE kTLS socket, in the clear: the
-    // kernel routes the splice through `tls_sw_splice_read`, which decrypts.
+    // A body splices zero-copy off a SOFTWARE kTLS socket, in the clear: the kernel routes the splice through
+    // `tls_sw_splice_read`, which decrypts.
     //
-    // The subtle case this pins down is the recvmsg->splice handoff. kTLS
-    // decrypts a whole TLS record at a time, so when the 5-byte header read
-    // lands inside a record that also carries body bytes, the kernel decrypts
-    // the entire record, hands us 5 bytes, and stashes the record's ~16 KiB
-    // plaintext remainder (all body) in its receive list; the splice must pick
-    // that up before pulling the next record or it would silently truncate.
+    // The subtle case this pins down is the recvmsg->splice handoff. kTLS decrypts a whole TLS record at a time, so
+    // when the 5-byte header read lands inside a record that also carries body bytes, the kernel decrypts the entire
+    // record, hands us 5 bytes, and stashes the record's ~16 KiB plaintext remainder (all body) in its receive list;
+    // the splice must pick that up before pulling the next record or it would silently truncate.
     //
-    // Force the straddle: the client writes header+body as ONE buffer, so TLS
-    // record 1 = [5-byte header][~16 KiB body prefix]. A bounded reader asserts
-    // the FULL body arrives, in order.
+    // Force the straddle: the client writes header+body as ONE buffer, so TLS record 1 = [5-byte header][~16 KiB body
+    // prefix]. A bounded reader asserts the FULL body arrives, in order.
     if ktls_openssl_unsupported() {
         return;
     }
@@ -8064,19 +7216,14 @@ fn tcp_splice_body_over_ktls() {
         header: splice_header(pipe_wr),
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     };
-    // `request_timeout` is not optional for a kTLS splice: it is the only
-    // clock that reaches one, so a server without it refuses the body
-    // (`CloseReason::SpliceUnbounded`). Generous here - nothing in this test
-    // stalls, and the sibling stall tests are where the value matters.
+    // `request_timeout` is not optional for a kTLS splice: it is the only clock that reaches one, so a server without
+    // it refuses the body (`CloseReason::SpliceUnbounded`). Generous here - nothing in this test stalls, and the
+    // sibling stall tests are where the value matters.
     let cfg = ServerConfig {
         request_timeout: Some(Duration::from_secs(10)),
         ..ServerConfig::default()
     };
-    let mut server = match Server::with_config(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        cfg,
-        proto,
-    ) {
+    let mut server = match Server::with_config([truenas_ros::net::server::Listen::tls(addr)], cfg, proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => {
             // SAFETY: closing the test-owned pipe fds on the skip path.
@@ -8107,8 +7254,8 @@ fn tcp_splice_body_over_ktls() {
     const BODY: usize = 200_000;
     let payload: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
 
-    // Bounded reader: drain up to BODY bytes off the pipe with a deadline (so a
-    // truncating splice fails the assertion instead of hanging).
+    // Bounded reader: drain up to BODY bytes off the pipe with a deadline (so a truncating splice fails the assertion
+    // instead of hanging).
     let expected = payload.clone();
     let reader_stop = stop.clone();
     let reader = thread::spawn(move || {
@@ -8122,13 +7269,7 @@ fn tcp_splice_body_over_ktls() {
         let deadline = Instant::now() + Duration::from_secs(10);
         while off < BODY && Instant::now() < deadline {
             // SAFETY: read into `got[off..]`, within bounds.
-            let n = unsafe {
-                libc::read(
-                    pipe_rd,
-                    got.as_mut_ptr().add(off).cast(),
-                    (BODY - off) as libc::size_t,
-                )
-            };
+            let n = unsafe { libc::read(pipe_rd, got.as_mut_ptr().add(off).cast(), (BODY - off) as libc::size_t) };
             if n > 0 {
                 off += n as usize;
             } else {
@@ -8137,9 +7278,8 @@ fn tcp_splice_body_over_ktls() {
         }
         // SAFETY: done with the read end.
         unsafe { libc::close(pipe_rd) };
-        // Graceful (not hard) shutdown so the now-idle connection is closed with
-        // a FIN, unblocking the client's read promptly instead of leaving it on
-        // its socket read-timeout.
+        // Graceful (not hard) shutdown so the now-idle connection is closed with a FIN, unblocking the client's read
+        // promptly instead of leaving it on its socket read-timeout.
         reader_stop.shutdown_graceful(Duration::from_secs(2));
         (off, got)
     });
@@ -8154,8 +7294,8 @@ fn tcp_splice_body_over_ktls() {
             frame.extend_from_slice(&payload);
             s.write_all(&frame)?;
             s.flush()?;
-            // Keep the connection open through the splice; unblocks when the
-            // reader triggers the graceful shutdown and the server closes us.
+            // Keep the connection open through the splice; unblocks when the reader triggers the graceful shutdown and
+            // the server closes us.
             let mut buf = Vec::new();
             let _ = s.read_to_end(&mut buf);
             Ok(())
@@ -8177,12 +7317,10 @@ fn tcp_splice_body_over_ktls() {
 
 #[test]
 fn ktls_splice_body_slow_but_progressing_survives() {
-    // The other half of the watchdog contract (the race the standalone-timeout
-    // design must NOT lose): a kTLS splice that keeps making progress - even
-    // slowly, spanning several `request_timeout` periods - must run to
-    // completion. The watchdog re-arms on progress (`splice_remaining` fell
-    // below its watermark) and only cancels on a full period of ZERO progress,
-    // so a steadily-fed transfer is never mistaken for a stall.
+    // The other half of the watchdog contract (the race the standalone-timeout design must NOT lose): a kTLS splice
+    // that keeps making progress - even slowly, spanning several `request_timeout` periods - must run to completion.
+    // The watchdog re-arms on progress (`splice_remaining` fell below its watermark) and only cancels on a full period
+    // of ZERO progress, so a steadily-fed transfer is never mistaken for a stall.
     use std::sync::Mutex;
     if ktls_openssl_unsupported() {
         return;
@@ -8205,11 +7343,7 @@ fn ktls_splice_body_slow_but_progressing_survives() {
         header: splice_header(pipe_wr),
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     };
-    let mut server = match Server::with_config(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        cfg,
-        proto,
-    ) {
+    let mut server = match Server::with_config([truenas_ros::net::server::Listen::tls(addr)], cfg, proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => {
             // SAFETY: closing the test-owned pipe fds on the skip path.
@@ -8242,9 +7376,8 @@ fn ktls_splice_body_slow_but_progressing_survives() {
     };
     let stop = server.shutdown_handle();
 
-    // Six chunks fed ~120ms apart (< the 200ms timeout, so never a full idle
-    // period), total wall time ~720ms = 3.6 timeout periods. A total-transfer
-    // bound would kill this; the inactivity watchdog must not.
+    // Six chunks fed ~120ms apart (< the 200ms timeout, so never a full idle period), total wall time ~720ms = 3.6
+    // timeout periods. A total-transfer bound would kill this; the inactivity watchdog must not.
     const CHUNK: usize = 4096;
     const CHUNKS: usize = 6;
     const BODY: usize = CHUNK * CHUNKS;
@@ -8263,13 +7396,7 @@ fn ktls_splice_body_slow_but_progressing_survives() {
         let deadline = Instant::now() + Duration::from_secs(10);
         while off < BODY && Instant::now() < deadline {
             // SAFETY: read into `got[off..]`, within bounds.
-            let n = unsafe {
-                libc::read(
-                    pipe_rd,
-                    got.as_mut_ptr().add(off).cast(),
-                    (BODY - off) as libc::size_t,
-                )
-            };
+            let n = unsafe { libc::read(pipe_rd, got.as_mut_ptr().add(off).cast(), (BODY - off) as libc::size_t) };
             if n > 0 {
                 off += n as usize;
             } else {
@@ -8305,16 +7432,10 @@ fn ktls_splice_body_slow_but_progressing_survives() {
     server.serve_forever().expect("serve_forever");
     client.join().expect("client join");
     let (off, got) = reader.join().expect("reader join");
-    assert_eq!(
-        off, BODY,
-        "slow-but-progressing splice was cut short at {off}"
-    );
+    assert_eq!(off, BODY, "slow-but-progressing splice was cut short at {off}");
     assert_eq!(got, expected, "spliced body content mismatch");
     assert!(
-        !reasons
-            .lock()
-            .unwrap()
-            .contains(&CloseReason::RequestTimeout),
+        !reasons.lock().unwrap().contains(&CloseReason::RequestTimeout),
         "a progressing transfer was wrongly reclaimed: {:?}",
         reasons.lock().unwrap()
     );
@@ -8324,16 +7445,13 @@ fn ktls_splice_body_slow_but_progressing_survives() {
 
 #[test]
 fn ktls_splice_body_stall_reclaimed() {
-    // SECURITY (slow-loris, kTLS splice): `tls_sw_splice_read` blocks an
-    // io-wq worker waiting for the next TLS record - it honors only
-    // SPLICE_F_NONBLOCK (which the server must not set) and, unlike
-    // `tcp_splice_read`, never the socket's O_NONBLOCK - so the plain-TCP
-    // EAGAIN -> readiness-poll path that carries the request clock NEVER runs
-    // for kTLS. The clock is therefore linked to the kTLS splice itself: a
-    // peer that completes the handshake, sends a SpliceBody header, and then
-    // goes silent must be reclaimed by `request_timeout` - not pin its pool
-    // slot plus a kernel io-wq thread until full shutdown (pool_size such
-    // clients would deny all service, immune to every other timeout).
+    // SECURITY (slow-loris, kTLS splice): `tls_sw_splice_read` blocks an io-wq worker waiting for the next TLS record -
+    // it honors only SPLICE_F_NONBLOCK (which the server must not set) and, unlike `tcp_splice_read`, never the
+    // socket's O_NONBLOCK - so the plain-TCP EAGAIN -> readiness-poll path that carries the request clock NEVER runs
+    // for kTLS. The clock is therefore linked to the kTLS splice itself: a peer that completes the handshake, sends a
+    // SpliceBody header, and then goes silent must be reclaimed by `request_timeout` - not pin its pool slot plus a
+    // kernel io-wq thread until full shutdown (pool_size such clients would deny all service, immune to every other
+    // timeout).
     use std::sync::Mutex;
     if ktls_openssl_unsupported() {
         return;
@@ -8356,11 +7474,7 @@ fn ktls_splice_body_stall_reclaimed() {
         header: splice_header(pipe_wr),
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     };
-    let mut server = match Server::with_config(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        cfg,
-        proto,
-    ) {
+    let mut server = match Server::with_config([truenas_ros::net::server::Listen::tls(addr)], cfg, proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => {
             // SAFETY: closing the test-owned pipe fds on the skip path.
@@ -8397,18 +7511,16 @@ fn ktls_splice_body_stall_reclaimed() {
         let _stop = ShutdownOnDrop(stop.clone());
         (|| -> io::Result<()> {
             let mut s = tls_connect(v4)?;
-            // SpliceBody header declaring 1 MiB, then silence: the kTLS
-            // splice blocks awaiting a record; only its linked clock can
-            // reclaim the slot.
+            // SpliceBody header declaring 1 MiB, then silence: the kTLS splice blocks awaiting a record; only its
+            // linked clock can reclaim the slot.
             let mut hdr = vec![b'S'];
             hdr.extend_from_slice(&(1024u32 * 1024).to_be_bytes());
             s.write_all(&hdr)?;
             s.flush()?;
             let t0 = Instant::now();
             let mut one = [0u8; 1];
-            // Server closes us at the clock: EOF, reset, or a TLS-layer
-            // error - anything but a hang (the underlying socket carries a
-            // 10s read timeout that would surface as an error here).
+            // Server closes us at the clock: EOF, reset, or a TLS-layer error - anything but a hang (the underlying
+            // socket carries a 10s read timeout that would surface as an error here).
             match s.read(&mut one) {
                 Ok(0) | Err(_) => {}
                 Ok(n) => panic!("unexpected {n} byte(s) from a stalled conn"),
@@ -8431,10 +7543,7 @@ fn ktls_splice_body_stall_reclaimed() {
     server.serve_forever().expect("serve_forever");
     client.join().expect("client join");
     assert!(
-        reasons
-            .lock()
-            .unwrap()
-            .contains(&CloseReason::RequestTimeout),
+        reasons.lock().unwrap().contains(&CloseReason::RequestTimeout),
         "stalled kTLS splice must close as RequestTimeout, got {:?}",
         reasons.lock().unwrap()
     );
@@ -8448,22 +7557,17 @@ fn ktls_splice_body_stall_reclaimed() {
 #[cfg(feature = "uring-fs")]
 #[test]
 fn server_builds_with_fs_pool() {
-    // A server with `fs_ops` set drives an fs reactor on the same ring, its
-    // op table sized `fs_ops + pool_size`. Open files are plain raw fds, not
-    // registered-table slots, so the connection pool stays `pool_size`.
-    // Constructing it exercises that path on a real ring; a plain echo still
-    // serves over the same ring.
+    // A server with `fs_ops` set drives an fs reactor on the same ring, its op table sized `fs_ops + pool_size`. Open
+    // files are plain raw fds, not registered-table slots, so the connection pool stays `pool_size`. Constructing it
+    // exercises that path on a real ring; a plain echo still serves over the same ring.
     let cfg = ServerConfig {
         pool_size: 16,
         fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
@@ -8484,19 +7588,14 @@ fn server_builds_with_fs_pool() {
 
 /// A graceful drain waits for a task, and stops as soon as it retires.
 ///
-/// The wait is deliberate - a task outlives the connection that spawned
-/// it - but the quiescence test has to be re-read somewhere the gauge
-/// falling can reach, or the drain sits out its whole grace period and
-/// leaves through the `Deadline` hard stop instead. The grace here is
-/// long and the task is short, so the two outcomes are seconds apart.
+/// The wait is deliberate - a task outlives the connection that spawned it - but the quiescence test has to be re-read
+/// somewhere the gauge falling can reach, or the drain sits out its whole grace period and leaves through the
+/// `Deadline` hard stop instead. The grace here is long and the task is short, so the two outcomes are seconds apart.
 ///
-/// **Bounded on both sides, because both failures are silent.** The
-/// upper bound catches a drain that hangs to its deadline. The lower
-/// one catches the opposite and worse mutation - a drain that stops
-/// ignoring tasks altogether, dropping their work on the floor - which
-/// on a `SIGTERM` with a long grace looks exactly like a clean
-/// shutdown. Without it, discarding the task gauge entirely leaves this
-/// test green.
+/// **Bounded on both sides, because both failures are silent.** The upper bound catches a drain that hangs to its
+/// deadline. The lower one catches the opposite and worse mutation - a drain that stops ignoring tasks altogether,
+/// dropping their work on the floor - which on a `SIGTERM` with a long grace looks exactly like a clean shutdown.
+/// Without it, discarding the task gauge entirely leaves this test green.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_graceful_drain_ends_when_its_last_task_retires() {
@@ -8509,9 +7608,8 @@ fn a_graceful_drain_ends_when_its_last_task_retires() {
         let Some(mut fs) = req.fs.take() else {
             return Response::Close;
         };
-        // Pending with no connection and no ring op: the shape a
-        // connection count cannot see. It outlives the reply below and
-        // the close that follows it.
+        // Pending with no connection and no ring op: the shape a connection count cannot see. It outlives the reply
+        // below and the close that follows it.
         drop(fs.spawn(|t| async move {
             let _ = t
                 .offload_fut(|| {
@@ -8524,11 +7622,7 @@ fn a_graceful_drain_ends_when_its_last_task_retires() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -8567,13 +7661,10 @@ fn a_graceful_drain_ends_when_its_last_task_retires() {
     );
 }
 
-/// The M4 headline: a static-file server. Each request names a file; the body
-/// handler opens it on the server's own ring under a per-connection
-/// [`Personality`], reads it, and replies with its contents - all inline on the
-/// loop thread via `Request::fs` and the `Deferred` reuse (open -> read -> reply,
-/// no worker thread, no blocking the ring). Two requests on one keep-alive
-/// connection prove the fixed-file slot is opened and freed per request rather
-/// than leaked.
+/// The M4 headline: a static-file server. Each request names a file; the body handler opens it on the server's own ring
+/// under a per-connection [`Personality`], reads it, and replies with its contents - all inline on the loop thread via
+/// `Request::fs` and the `Deferred` reuse (open -> read -> reply, no worker thread, no blocking the ring). Two requests
+/// on one keep-alive connection prove the fixed-file slot is opened and freed per request rather than leaked.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_static_file_server_open_read_reply() {
@@ -8586,8 +7677,8 @@ fn fs_static_file_server_open_read_reply() {
     std::fs::write(dir.path().join("hello.txt"), b"contents of hello").unwrap();
     std::fs::write(dir.path().join("second.txt"), b"the second file").unwrap();
 
-    // The reactor's own creds, minted after construction; the handler reads it
-    // through a shared cell (the closure is moved into the server first).
+    // The reactor's own creds, minted after construction; the handler reads it through a shared cell (the closure is
+    // moved into the server first).
     let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
     let anchor = match Anchor::open(dir.path()) {
         Ok(a) => a,
@@ -8624,8 +7715,7 @@ fn fs_static_file_server_open_read_reply() {
                     fs.close(file); // fire-and-forget: free the slot
                     match done.result() {
                         Ok(n) => {
-                            let mut buf =
-                                done.into_bufs().pop().unwrap_or_default();
+                            let mut buf = done.into_bufs().pop().unwrap_or_default();
                             buf.truncate(n as usize);
                             deferred.reply(echo_frame(&buf));
                         }
@@ -8638,11 +7728,7 @@ fn fs_static_file_server_open_read_reply() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -8656,8 +7742,7 @@ fn fs_static_file_server_open_read_reply() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -8680,13 +7765,11 @@ fn fs_static_file_server_open_read_reply() {
     assert_eq!(second, b"the second file");
 }
 
-/// A directory listing replies through the wake drain. The handler lists on the
-/// ring via `open_dir`/`next_batch`, both delivered by off-loop worker jobs
-/// that poke the wake, and answers with the entry count via its `Deferred`.
-/// The reply only arrives if `on_wake` drains the fs offload pool; without that
-/// drain the completion is stranded, the request never answers, and the client
-/// read times out. The socket read timeout makes that regression a failure
-/// rather than a hang.
+/// A directory listing replies through the wake drain. The handler lists on the ring via `open_dir`/`next_batch`, both
+/// delivered by off-loop worker jobs that poke the wake, and answers with the entry count via its `Deferred`.
+/// The reply only arrives if `on_wake` drains the fs offload pool; without that drain the completion is stranded, the
+/// request never answers, and the client read times out. The socket read timeout makes that regression a failure rather
+/// than a hang.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_dir_listing_replies_through_the_wake_drain() {
@@ -8720,16 +7803,14 @@ fn fs_dir_listing_replies_through_the_wake_drain() {
                 Ok(w) => Rc::new(w),
                 Err(_) => return deferred.close(),
             };
-            // Hold the walk alive through the batch delivery: the `keep` clone
-            // rides in the continuation, so the `DIR*` is not dropped mid-flight.
+            // Hold the walk alive through the batch delivery: the `keep` clone rides in the continuation, so the `DIR*`
+            // is not dropped mid-flight.
             let keep = Rc::clone(&walk);
             fs.next_batch(&walk, move |res, _fs| {
                 let _keep = keep;
                 match res {
                     Ok(batch) => {
-                        deferred.reply(echo_frame(
-                            batch.names.len().to_string().as_bytes(),
-                        ));
+                        deferred.reply(echo_frame(batch.names.len().to_string().as_bytes()));
                     }
                     Err(_) => deferred.close(),
                 }
@@ -8739,11 +7820,7 @@ fn fs_dir_listing_replies_through_the_wake_drain() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -8757,8 +7834,7 @@ fn fs_dir_listing_replies_through_the_wake_drain() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -8778,11 +7854,9 @@ fn fs_dir_listing_replies_through_the_wake_drain() {
     assert_eq!(reply, b"3", "listing counted the three entries and replied");
 }
 
-/// A server's lookup lane takes its bounds from `ServerConfig`, and its
-/// results reach the handler's `Deferred` through the wake drain. The first
-/// lookup waits for the second, which runs alongside it only if the lane
-/// has a second thread. At a ceiling of one it cannot, so the first gives
-/// up and the reply says they ran one at a time.
+/// A server's lookup lane takes its bounds from `ServerConfig`, and its results reach the handler's `Deferred` through
+/// the wake drain. The first lookup waits for the second, which runs alongside it only if the lane has a second thread.
+/// At a ceiling of one it cannot, so the first gives up and the reply says they ran one at a time.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_servers_lookup_lane_takes_its_bounds_from_the_config() {
@@ -8814,11 +7888,7 @@ fn a_servers_lookup_lane_takes_its_bounds_from_the_config() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -8854,9 +7924,9 @@ fn a_servers_lookup_lane_takes_its_bounds_from_the_config() {
     assert_eq!(reply, b"one at a time", "the lane kept to one thread");
 }
 
-/// `FsConn::flistxattr` enumerates a file's xattr names on-loop: it opens the
-/// file on the ring, offloads the `flistxattr` to the pool, and delivers the
-/// names on the loop, answered via `Deferred` (same drain path as the listing).
+/// `FsConn::flistxattr` enumerates a file's xattr names on-loop: it opens the file on the ring, offloads the
+/// `flistxattr` to the pool, and delivers the names on the loop, answered via `Deferred` (same drain path as the
+/// listing).
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_flistxattr_lists_file_xattrs() {
@@ -8868,15 +7938,11 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
     let dir = truenas_ros::tempdir().unwrap();
     let fp = dir.path().join("f.txt");
     std::fs::write(&fp, b"x").unwrap();
-    // Seed two user xattrs with a plain syscall (independent of fd-xattr
-    // support, which only gates the ring read/write ops). Through
-    // `set_user_xattr`, which holds the refusal to
-    // `TRUENAS_ROS_REQUIRE_XATTRS`: every assertion below is behind this
-    // probe, so a hand-rolled `libc::setxattr` with a silent `return`
-    // reports ok having tested nothing on a filesystem without xattrs.
-    if !set_user_xattr(&fp, b"user.a", b"1")
-        || !set_user_xattr(&fp, b"user.b", b"22")
-    {
+    // Seed two user xattrs with a plain syscall (independent of fd-xattr support, which only gates the ring read/write
+    // ops). Through `set_user_xattr`, which holds the refusal to `TRUENAS_ROS_REQUIRE_XATTRS`: every assertion below is
+    // behind this probe, so a hand-rolled `libc::setxattr` with a silent `return` reports ok having tested nothing on a
+    // filesystem without xattrs.
+    if !set_user_xattr(&fp, b"user.a", b"1") || !set_user_xattr(&fp, b"user.b", b"22") {
         return; // this fs refuses user xattrs
     }
 
@@ -8916,11 +7982,7 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -8934,8 +7996,7 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -8953,21 +8014,14 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
     server.serve_forever().expect("serve_forever flistxattr");
     let reply = client.join().unwrap().expect("client io");
     let text = String::from_utf8_lossy(&reply);
-    assert!(
-        text.contains("user.a"),
-        "flistxattr listed user.a: {text:?}"
-    );
-    assert!(
-        text.contains("user.b"),
-        "flistxattr listed user.b: {text:?}"
-    );
+    assert!(text.contains("user.a"), "flistxattr listed user.a: {text:?}");
+    assert!(text.contains("user.b"), "flistxattr listed user.b: {text:?}");
 }
 
-/// `FsConn::fstatfs`/`fstatfs_anchor` answer on-loop: each offloads to the
-/// pool (io_uring has no statfs opcode) and delivers through the completion
-/// sink. Both name the same filesystem, so their answers must agree - and the
-/// anchor form proves an `O_PATH` descriptor is accepted, which is what lets a
-/// caller ask a whole tree's capacity without opening anything inside it.
+/// `FsConn::fstatfs`/`fstatfs_anchor` answer on-loop: each offloads to the pool (io_uring has no statfs opcode) and
+/// delivers through the completion sink. Both name the same filesystem, so their answers must agree - and the anchor
+/// form proves an `O_PATH` descriptor is accepted, which is what lets a caller ask a whole tree's capacity without
+/// opening anything inside it.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
@@ -8995,26 +8049,21 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
         let who = *pc.get().expect("personality set before serving");
         let anchor = anchor.clone();
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
-        // `open` first, then the offloads chain behind it - the chain
-        // is what this test is about. (Every facade can open, an
-        // offload-delivery continuation's included; the gate that once
-        // said otherwise is gone.)
+        // `open` first, then the offloads chain behind it - the chain is what this test is about. (Every facade can
+        // open, an offload-delivery continuation's included; the gate that once said otherwise is gone.)
         fs.open(who, &anchor.clone(), c"f.txt", how, move |done, fs| {
             let Some(file) = done.file() else {
-                return deferred.reply(echo_frame(
-                    format!("OPEN {:?}", done.result()).as_bytes(),
-                ));
+                return deferred.reply(echo_frame(format!("OPEN {:?}", done.result()).as_bytes()));
             };
             fs.fstatfs(file, move |by_file, fs| {
                 let by_file = match by_file {
                     Ok(v) => v,
                     Err(e) => {
-                        return deferred
-                            .reply(echo_frame(format!("FILE {e}").as_bytes()));
+                        return deferred.reply(echo_frame(format!("FILE {e}").as_bytes()));
                     }
                 };
-                // offload -> offload: the second continuation still reaches
-                // the pool, and an O_PATH anchor is a valid target.
+                // offload -> offload: the second continuation still reaches the pool, and an O_PATH anchor is a valid
+                // target.
                 fs.fstatfs_anchor(&anchor, move |by_anchor, _fs| {
                     let msg = match by_anchor {
                         Ok(a) => {
@@ -9023,8 +8072,7 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
                                 && a.block_size() == by_file.block_size()
                                 && a.total_blocks() == by_file.total_blocks()
                                 && a.available_blocks() <= a.free_blocks()
-                                && a.total_bytes()
-                                    == a.total_blocks() * a.block_size();
+                                && a.total_bytes() == a.total_blocks() * a.block_size();
                             format!(
                                 "{} bs={} total={}",
                                 if ok { "agree" } else { "DISAGREE" },
@@ -9042,11 +8090,7 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -9060,8 +8104,7 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -9085,13 +8128,11 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
     );
 }
 
-/// `FsConn::fget_zfs_attrs`/`fset_zfs_attrs` on-loop: read the mask, set
-/// `IMMUTABLE`, read it back, and restore - each hop an offload delivered
-/// through the completion sink.
+/// `FsConn::fget_zfs_attrs`/`fset_zfs_attrs` on-loop: read the mask, set `IMMUTABLE`, read it back, and restore - each
+/// hop an offload delivered through the completion sink.
 ///
-/// Needs a real ZFS dataset; on tmpfs the ioctl is `ENOTTY`. Resolved the way
-/// `test/zfs.rs` does, and skipped loudly under `TRUENAS_ROS_REQUIRE_ZFS` so a
-/// runner that stopped provisioning one goes red rather than reporting a green
+/// Needs a real ZFS dataset; on tmpfs the ioctl is `ENOTTY`. Resolved the way `test/zfs.rs` does, and skipped loudly
+/// under `TRUENAS_ROS_REQUIRE_ZFS` so a runner that stopped provisioning one goes red rather than reporting a green
 /// suite that exercised nothing.
 #[cfg(feature = "uring-fs")]
 #[test]
@@ -9134,67 +8175,46 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
         let who = *pc.get().expect("personality set before serving");
         let anchor = anchor.clone();
         let how = OpenHow::new().flags(OFlag::O_RDWR);
-        fs.open(
-            who,
-            &anchor,
-            c"ros-fsconn-zfsattr.bin",
-            how,
-            move |done, fs| {
-                let Some(file) = done.file() else {
-                    return deferred.reply(echo_frame(
-                        format!("OPEN {:?}", done.result()).as_bytes(),
-                    ));
+        fs.open(who, &anchor, c"ros-fsconn-zfsattr.bin", how, move |done, fs| {
+            let Some(file) = done.file() else {
+                return deferred.reply(echo_frame(format!("OPEN {:?}", done.result()).as_bytes()));
+            };
+            let f2 = file.clone();
+            let f3 = file.clone();
+            fs.fget_zfs_attrs(file, move |before, fs| {
+                let before = match before {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return deferred.reply(echo_frame(format!("GET {e}").as_bytes()));
+                    }
                 };
-                let f2 = file.clone();
-                let f3 = file.clone();
-                fs.fget_zfs_attrs(file, move |before, fs| {
-                    let before = match before {
-                        Ok(v) => v,
-                        Err(e) => {
-                            return deferred.reply(echo_frame(
-                                format!("GET {e}").as_bytes(),
-                            ));
-                        }
-                    };
-                    fs.fset_zfs_attrs(
-                        f2,
-                        before | ZfsAttr::IMMUTABLE,
-                        move |set, fs| {
-                            if let Err(e) = set {
-                                return deferred.reply(echo_frame(
-                                    format!("SET {e}").as_bytes(),
-                                ));
-                            }
-                            fs.fget_zfs_attrs(f3.clone(), move |after, fs| {
-                                let locked = matches!(&after, Ok(a)
+                fs.fset_zfs_attrs(f2, before | ZfsAttr::IMMUTABLE, move |set, fs| {
+                    if let Err(e) = set {
+                        return deferred.reply(echo_frame(format!("SET {e}").as_bytes()));
+                    }
+                    fs.fget_zfs_attrs(f3.clone(), move |after, fs| {
+                        let locked = matches!(&after, Ok(a)
                                     if a.contains(ZfsAttr::IMMUTABLE));
-                                // Restore before answering, or the dataset is
-                                // left with an undeletable file.
-                                fs.fset_zfs_attrs(f3, before, move |r, _fs| {
-                                    let msg = if !locked {
-                                        format!("NOTLOCKED {after:?}")
-                                    } else if r.is_err() {
-                                        "UNLOCK-FAILED".to_string()
-                                    } else {
-                                        "locked-then-restored".to_string()
-                                    };
-                                    deferred.reply(echo_frame(msg.as_bytes()));
-                                });
-                            });
-                        },
-                    );
+                        // Restore before answering, or the dataset is left with an undeletable file.
+                        fs.fset_zfs_attrs(f3, before, move |r, _fs| {
+                            let msg = if !locked {
+                                format!("NOTLOCKED {after:?}")
+                            } else if r.is_err() {
+                                "UNLOCK-FAILED".to_string()
+                            } else {
+                                "locked-then-restored".to_string()
+                            };
+                            deferred.reply(echo_frame(msg.as_bytes()));
+                        });
+                    });
                 });
-            },
-        );
+            });
+        });
         Response::Defer(permit)
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -9208,8 +8228,7 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -9228,8 +8247,8 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
     let reply = client.join().unwrap().expect("client io");
     let text = String::from_utf8_lossy(&reply).into_owned();
     let _ = std::fs::remove_file(&fp);
-    // Unprivileged, setting IMMUTABLE is refused - which is the property
-    // under test, so assert that rather than treating it as a skip.
+    // Unprivileged, setting IMMUTABLE is refused - which is the property under test, so assert that rather than
+    // treating it as a skip.
     if text.starts_with("SET ") {
         assert!(
             text.contains("EPERM") && !is_root(),
@@ -9240,11 +8259,9 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
     assert_eq!(text, "locked-then-restored", "round trip through the pool");
 }
 
-/// The batched-blocking-offload consumer shape, end to end: the
-/// credential-checked open runs on the ring as a personality-stamped SQE,
-/// then ONE `FsConn::offload_result` job runs the whole blocking metadata
-/// tail - `statx` plus two xattr reads on the already-authorized fd (`File`
-/// is `AsFd`) - and the delivery arrives through the wake path's
+/// The batched-blocking-offload consumer shape, end to end: the credential-checked open runs on the ring as a
+/// personality-stamped SQE, then ONE `FsConn::offload_result` job runs the whole blocking metadata tail - `statx` plus
+/// two xattr reads on the already-authorized fd (`File` is `AsFd`) - and the delivery arrives through the wake path's
 /// `drain_fs_offloads` on an owner-scoped continuation facade.
 #[cfg(feature = "uring-fs")]
 #[test]
@@ -9258,9 +8275,7 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
     let dir = truenas_ros::tempdir().unwrap();
     let fp = dir.path().join("f.txt");
     std::fs::write(&fp, b"hello object").unwrap();
-    if !set_user_xattr(&fp, b"user.a", b"1")
-        || !set_user_xattr(&fp, b"user.b", b"22")
-    {
+    if !set_user_xattr(&fp, b"user.a", b"1") || !set_user_xattr(&fp, b"user.b", b"22") {
         return; // this fs refuses user xattrs
     }
 
@@ -9286,23 +8301,14 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
             };
             fs.offload_result(
                 move || {
-                    let st = statx(
-                        &file,
-                        c"",
-                        AtFlags::AT_EMPTY_PATH,
-                        StatxMask::BASIC_STATS,
-                    )?;
+                    let st = statx(&file, c"", AtFlags::AT_EMPTY_PATH, StatxMask::BASIC_STATS)?;
                     let a = fgetxattr(&file, "user.a")?;
                     let b = fgetxattr(&file, "user.b")?;
                     Ok((st.size(), a, b))
                 },
                 move |res, _fs| match res {
                     Ok((size, a, b)) => {
-                        let msg = format!(
-                            "{size}:{}:{}",
-                            String::from_utf8_lossy(&a),
-                            String::from_utf8_lossy(&b),
-                        );
+                        let msg = format!("{size}:{}:{}", String::from_utf8_lossy(&a), String::from_utf8_lossy(&b),);
                         deferred.reply(echo_frame(msg.as_bytes()));
                     }
                     Err(_) => deferred.close(),
@@ -9313,11 +8319,7 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -9331,8 +8333,7 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -9347,9 +8348,7 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
         stop.shutdown();
         reply
     });
-    server
-        .serve_forever()
-        .expect("serve_forever offload_result");
+    server.serve_forever().expect("serve_forever offload_result");
     let reply = client.join().unwrap().expect("client io");
     assert_eq!(
         String::from_utf8_lossy(&reply),
@@ -9358,8 +8357,8 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
     );
 }
 
-/// Read `name` off `path` with `libc::getxattr`, `None` on any failure -
-/// the out-of-band witness for the privileged-xattr policy test below.
+/// Read `name` off `path` with `libc::getxattr`, `None` on any failure - the out-of-band witness for the
+/// privileged-xattr policy test below.
 #[cfg(feature = "uring-fs")]
 fn get_xattr_raw(path: &Path, name: &std::ffi::CStr) -> Option<Vec<u8>> {
     use std::ffi::CString;
@@ -9367,14 +8366,7 @@ fn get_xattr_raw(path: &Path, name: &std::ffi::CStr) -> Option<Vec<u8>> {
     let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
     let mut buf = vec![0u8; 256];
     // SAFETY: valid NUL-terminated path/name and an owned out-buffer.
-    let n = unsafe {
-        libc::getxattr(
-            cpath.as_ptr(),
-            name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-        )
-    };
+    let n = unsafe { libc::getxattr(cpath.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
     if n < 0 {
         return None;
     }
@@ -9382,17 +8374,13 @@ fn get_xattr_raw(path: &Path, name: &std::ffi::CStr) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// `Server::set_privileged_xattrs` reaches the embedded reactor. With a
-/// policy allowing `trusted.test_`: a covered `fsetxattr` through the
-/// request facade lands (promoted to the reactor's own credentials), an
-/// **uncovered** `fremovexattr` stays `EPERM`, and a **covered**
-/// `fremovexattr` succeeds - the leg that bites, since that path is gated
-/// on the allowlist alone and fails `EPERM` under the default empty policy
-/// whether or not the caller is privileged. The `trusted.` namespace needs
-/// `CAP_SYS_ADMIN`: unprivileged, the covered write's refusal is itself the
-/// asserted property (the promotion escalates to the daemon's own identity,
-/// which has nothing to escalate to). The qemu lane runs as root and takes
-/// the full path.
+/// `Server::set_privileged_xattrs` reaches the embedded reactor. With a policy allowing `trusted.test_`: a covered
+/// `fsetxattr` through the request facade lands (promoted to the reactor's own credentials), an **uncovered**
+/// `fremovexattr` stays `EPERM`, and a **covered** `fremovexattr` succeeds - the leg that bites, since that path is
+/// gated on the allowlist alone and fails `EPERM` under the default empty policy whether or not the caller is
+/// privileged. The `trusted.` namespace needs `CAP_SYS_ADMIN`: unprivileged, the covered write's refusal is itself the
+/// asserted property (the promotion escalates to the daemon's own identity, which has nothing to escalate to). The qemu
+/// lane runs as root and takes the full path.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {
@@ -9426,52 +8414,30 @@ fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
         fs.open(who, &anchor, c"f.txt", how, move |done, fs| {
             let Some(file) = done.file() else {
-                return deferred.reply(echo_frame(
-                    format!("OPEN {:?}", done.result()).as_bytes(),
-                ));
+                return deferred.reply(echo_frame(format!("OPEN {:?}", done.result()).as_bytes()));
             };
             let f2 = file.clone();
             let f3 = file.clone();
-            fs.fsetxattr(
-                who,
-                file,
-                c"trusted.test_x",
-                b"v1".to_vec(),
-                0,
-                move |set, fs| {
-                    if let Err(e) = set.result() {
-                        return deferred
-                            .reply(echo_frame(format!("SET {e}").as_bytes()));
+            fs.fsetxattr(who, file, c"trusted.test_x", b"v1".to_vec(), 0, move |set, fs| {
+                if let Err(e) = set.result() {
+                    return deferred.reply(echo_frame(format!("SET {e}").as_bytes()));
+                }
+                fs.fremovexattr(f2, c"trusted.other", move |out, fs| {
+                    if out.is_ok() {
+                        return deferred.reply(echo_frame(b"UNCOVERED-REMOVED"));
                     }
-                    fs.fremovexattr(f2, c"trusted.other", move |out, fs| {
-                        if out.is_ok() {
-                            return deferred
-                                .reply(echo_frame(b"UNCOVERED-REMOVED"));
-                        }
-                        fs.fremovexattr(
-                            f3,
-                            c"trusted.test_x",
-                            move |cov, _fs| match cov {
-                                Ok(()) => deferred
-                                    .reply(echo_frame(b"policy-enforced")),
-                                Err(e) => deferred.reply(echo_frame(
-                                    format!("RM-COVERED {e}").as_bytes(),
-                                )),
-                            },
-                        );
+                    fs.fremovexattr(f3, c"trusted.test_x", move |cov, _fs| match cov {
+                        Ok(()) => deferred.reply(echo_frame(b"policy-enforced")),
+                        Err(e) => deferred.reply(echo_frame(format!("RM-COVERED {e}").as_bytes())),
                     });
-                },
-            );
+                });
+            });
         });
         Response::Defer(permit)
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -9490,8 +8456,7 @@ fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {
             .allow_prefix(c"trusted.test_")
             .expect("a trusted.-rooted prefix is accepted"),
     );
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -9517,8 +8482,8 @@ fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {
         return;
     }
     assert_eq!(text, "policy-enforced", "unexpected chain result");
-    // Out of band: the covered remove really removed - `trusted.test_x` is
-    // gone while the probe attribute survives (so absence is not ENOTSUP).
+    // Out of band: the covered remove really removed - `trusted.test_x` is gone while the probe attribute survives (so
+    // absence is not ENOTSUP).
     assert!(get_xattr_raw(&fp, c"trusted.probe").is_some());
     assert!(get_xattr_raw(&fp, c"trusted.test_x").is_none());
 }
@@ -9527,19 +8492,16 @@ fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {
 #[path = "support/zfs_dir.rs"]
 mod zfs_dir;
 
-/// `FsConn::fset_attrs` sets a mode and a ZFS attribute in one call through
-/// the embedded reactor, as `FsHandle::fset_attrs` does off it. Runs as root
-/// on ZFS, and `TRUENAS_ROS_REQUIRE_ZFS_SETATTR` fails a ZFS whose answer is
-/// `EOPNOTSUPP` for want of the handler of `system.truenas_setattr`.
+/// `FsConn::fset_attrs` sets a mode and a ZFS attribute in one call through the embedded reactor, as
+/// `FsHandle::fset_attrs` does off it. Runs as root on ZFS, and `TRUENAS_ROS_REQUIRE_ZFS_SETATTR` fails a ZFS whose
+/// answer is `EOPNOTSUPP` for want of the handler of `system.truenas_setattr`.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn the_embedded_reactor_sets_attributes_in_one_call() {
     use std::os::fd::AsFd;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::OnceLock;
-    use truenas_ros::sync_fs::{
-        Mode, OFlag, OpenHow, ZfsAttr, ZfsSetattr, fget_zfs_attrs,
-    };
+    use truenas_ros::sync_fs::{Mode, OFlag, OpenHow, ZfsAttr, ZfsSetattr, fget_zfs_attrs};
     use truenas_ros::uring_fs::{Anchor, Personality};
 
     if !root_or_skip("the_embedded_reactor_sets_attributes_in_one_call") {
@@ -9553,8 +8515,7 @@ fn the_embedded_reactor_sets_attributes_in_one_call() {
     std::fs::create_dir(&dir).unwrap();
     let fp = dir.join("f");
     std::fs::write(&fp, b"x").unwrap();
-    std::fs::set_permissions(&fp, std::fs::Permissions::from_mode(0o644))
-        .unwrap();
+    std::fs::set_permissions(&fp, std::fs::Permissions::from_mode(0o644)).unwrap();
     let anchor = Anchor::open(&dir).expect("anchor open");
 
     let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
@@ -9569,9 +8530,7 @@ fn the_embedded_reactor_sets_attributes_in_one_call() {
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
         fs.open(who, &anchor, c"f", how, move |done, fs| {
             let Some(file) = done.file() else {
-                return deferred.reply(echo_frame(
-                    format!("OPEN {:?}", done.result()).as_bytes(),
-                ));
+                return deferred.reply(echo_frame(format!("OPEN {:?}", done.result()).as_bytes()));
             };
             let set = ZfsSetattr::new()
                 .mode(Mode::from_bits_truncate(0o600))
@@ -9588,11 +8547,7 @@ fn the_embedded_reactor_sets_attributes_in_one_call() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -9606,8 +8561,7 @@ fn the_embedded_reactor_sets_attributes_in_one_call() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -9637,18 +8591,15 @@ fn the_embedded_reactor_sets_attributes_in_one_call() {
     assert_eq!(text, "set", "the set through the reactor");
     let mode = std::fs::metadata(&fp).unwrap().permissions().mode();
     let file = std::fs::File::open(&fp).unwrap();
-    let hidden = fget_zfs_attrs(file.as_fd())
-        .unwrap()
-        .contains(ZfsAttr::HIDDEN);
+    let hidden = fget_zfs_attrs(file.as_fd()).unwrap().contains(ZfsAttr::HIDDEN);
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!((mode & 0o7777, hidden), (0o600, true));
 }
 
-/// Serve the framed `request` on a ring with an fs table through `body`,
-/// which is handed the ring's own personality, and give the reply and the
-/// server's counters once it stopped. `None` on a box with no io_uring.
-// Under `--cfg loom` the crate's `Arc` is loom's, which `File::from_shared`
-// takes and a std `Arc` is not, and the loom lane runs no ring.
+/// Serve the framed `request` on a ring with an fs table through `body`, which is handed the ring's own personality,
+/// and give the reply and the server's counters once it stopped. `None` on a box with no io_uring.
+// Under `--cfg loom` the crate's `Arc` is loom's, which `File::from_shared` takes and a std `Arc` is not, and the loom
+// lane runs no ring.
 #[cfg(all(feature = "uring-fs", not(loom)))]
 fn one_fs_reply<B>(
     cfg: ServerConfig,
@@ -9656,22 +8607,15 @@ fn one_fs_reply<B>(
     body: B,
 ) -> Option<(Vec<u8>, truenas_ros::net::server::ServerStats)>
 where
-    B: Fn(Request<'_, ()>, truenas_ros::uring_fs::Personality) -> Response
-        + 'static,
+    B: Fn(Request<'_, ()>, truenas_ros::uring_fs::Personality) -> Response + 'static,
 {
     use std::sync::OnceLock;
     let pers = Arc::new(OnceLock::new());
     let pc = Arc::clone(&pers);
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
-        body: move |req: Request<'_, ()>| {
-            body(req, *pc.get().expect("personality set before serving"))
-        },
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
+        body: move |req: Request<'_, ()>| body(req, *pc.get().expect("personality set before serving")),
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let mut server = match Server::with_config([addr], cfg, protocol) {
@@ -9679,8 +8623,7 @@ where
         Err(e) if should_skip(&e) => return None,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -9700,14 +8643,9 @@ where
     Some((reply, stats.snapshot()))
 }
 
-/// What an owned write answered, and whether it gave back the very buffer
-/// it was handed with the bytes it held.
+/// What an owned write answered, and whether it gave back the very buffer it was handed with the bytes it held.
 #[cfg(all(feature = "uring-fs", not(loom)))]
-fn owned_write_verdict(
-    d: truenas_ros::uring_fs::FsDone,
-    storage: *const u8,
-    held: &[u8],
-) -> String {
+fn owned_write_verdict(d: truenas_ros::uring_fs::FsDone, storage: *const u8, held: &[u8]) -> String {
     let marked = d.was_refused();
     let res = match d.result() {
         Ok(n) => format!("ok {n}"),
@@ -9719,11 +8657,9 @@ fn owned_write_verdict(
     format!("{res} marked={marked} same={same}")
 }
 
-/// `FsConn::pwritev2_owned` writes just its range of a buffer at its offset
-/// on ZFS and gives the very buffer back through `FsDone::into_value`. A
-/// range past the buffer, an inverted one and an offset of `u64::MAX`,
-/// which io_uring reads as the file's position, are refused with a marked
-/// `EINVAL`, each with its buffer back and nothing written.
+/// `FsConn::pwritev2_owned` writes just its range of a buffer at its offset on ZFS and gives the very buffer back
+/// through `FsDone::into_value`. A range past the buffer, an inverted one and an offset of `u64::MAX`, which io_uring
+/// reads as the file's position, are refused with a marked `EINVAL`, each with its buffer back and nothing written.
 #[cfg(all(feature = "uring-fs", not(loom)))]
 #[test]
 fn an_owned_write_writes_its_range_and_gives_its_buffer_back() {
@@ -9739,13 +8675,7 @@ fn an_owned_write_writes_its_range_and_gives_its_buffer_back() {
     std::fs::create_dir(&dir).unwrap();
     let fp = dir.join("f");
     std::fs::write(&fp, b"0123456789abcdef").unwrap();
-    let held: Arc<std::os::fd::OwnedFd> = Arc::new(
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&fp)
-            .unwrap()
-            .into(),
-    );
+    let held: Arc<std::os::fd::OwnedFd> = Arc::new(std::fs::OpenOptions::new().write(true).open(&fp).unwrap().into());
     #[allow(clippy::reversed_empty_ranges)]
     let writes = [(2..6, 4), (6..9, 0), (5..3, 0), (0..2, u64::MAX)];
     let cfg = ServerConfig {
@@ -9763,28 +8693,18 @@ fn an_owned_write_writes_its_range_and_gives_its_buffer_back() {
         for (i, (range, off)) in writes.iter().cloned().enumerate() {
             let buf = b"..WXYZ..".to_vec();
             let storage = buf.as_ptr();
-            let (answers, deferred) =
-                (Rc::clone(&answers), Rc::clone(&deferred));
+            let (answers, deferred) = (Rc::clone(&answers), Rc::clone(&deferred));
             let file = File::from_shared(Arc::clone(&held));
             let flags = RwFlags::empty();
-            fs.pwritev2_owned(
-                who,
-                file,
-                buf,
-                range,
-                off,
-                flags,
-                move |d, _| {
-                    answers.borrow_mut()[i] =
-                        owned_write_verdict(d, storage, b"..WXYZ..");
-                    if answers.borrow().iter().all(|a| !a.is_empty())
-                        && let Some(deferred) = deferred.borrow_mut().take()
-                    {
-                        let text = answers.borrow().join("\n");
-                        deferred.reply(echo_frame(text.as_bytes()));
-                    }
-                },
-            );
+            fs.pwritev2_owned(who, file, buf, range, off, flags, move |d, _| {
+                answers.borrow_mut()[i] = owned_write_verdict(d, storage, b"..WXYZ..");
+                if answers.borrow().iter().all(|a| !a.is_empty())
+                    && let Some(deferred) = deferred.borrow_mut().take()
+                {
+                    let text = answers.borrow().join("\n");
+                    deferred.reply(echo_frame(text.as_bytes()));
+                }
+            });
         }
         Response::Defer(permit)
     });
@@ -9802,9 +8722,8 @@ fn an_owned_write_writes_its_range_and_gives_its_buffer_back() {
     assert_eq!(file, b"0123WXYZ89abcdef", "just the range, at its offset");
 }
 
-/// With both slots of a two-slot table held by reads parked on a FIFO,
-/// `FsConn::pwritev2_owned` is refused with a marked `EBUSY` and gives its
-/// buffer back as it came.
+/// With both slots of a two-slot table held by reads parked on a FIFO, `FsConn::pwritev2_owned` is refused with a
+/// marked `EBUSY` and gives its buffer back as it came.
 #[cfg(all(feature = "uring-fs", not(loom)))]
 #[test]
 fn an_owned_write_on_a_full_table_gives_its_buffer_back() {
@@ -9824,8 +8743,7 @@ fn an_owned_write_on_a_full_table_gives_its_buffer_back() {
     // SAFETY: a valid NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     let open = |p: &Path| -> Arc<std::os::fd::OwnedFd> {
-        // O_RDWR on a FIFO opens at once with a writer attached, so a read
-        // with no data parks and holds its slot.
+        // O_RDWR on a FIFO opens at once with a writer attached, so a read with no data parks and holds its slot.
         let f = std::fs::OpenOptions::new().read(true).write(true).open(p);
         Arc::new(f.unwrap().into())
     };
@@ -9859,18 +8777,13 @@ fn an_owned_write_on_a_full_table_gives_its_buffer_back() {
     let Some((reply, _)) = reply else {
         return;
     };
-    assert_eq!(
-        String::from_utf8_lossy(&reply),
-        "EBUSY marked=true same=true"
-    );
+    assert_eq!(String::from_utf8_lossy(&reply), "EBUSY marked=true same=true");
     assert_eq!(file, b"bytes", "nothing written");
 }
 
-/// `FsConn::pwritev2_window` writes windows of the request on ZFS, the
-/// first from the delivery's own facade and the second from that write's
-/// callback, after the delivery is over, while the second window alone
-/// keeps the receive buffer. The buffer goes back to the pool once the last
-/// window's share is gone.
+/// `FsConn::pwritev2_window` writes windows of the request on ZFS, the first from the delivery's own facade and the
+/// second from that write's callback, after the delivery is over, while the second window alone keeps the receive
+/// buffer. The buffer goes back to the pool once the last window's share is gone.
 #[cfg(all(feature = "uring-fs", not(loom)))]
 #[test]
 fn a_window_is_written_from_its_delivery_and_after_it() {
@@ -9884,13 +8797,7 @@ fn a_window_is_written_from_its_delivery_and_after_it() {
     std::fs::create_dir(&dir).unwrap();
     let fp = dir.join("f");
     std::fs::write(&fp, b"").unwrap();
-    let held: Arc<std::os::fd::OwnedFd> = Arc::new(
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&fp)
-            .unwrap()
-            .into(),
-    );
+    let held: Arc<std::os::fd::OwnedFd> = Arc::new(std::fs::OpenOptions::new().write(true).open(&fp).unwrap().into());
     let cfg = ServerConfig {
         pool_size: 4,
         fs_ops: 16,
@@ -9931,10 +8838,8 @@ fn a_window_is_written_from_its_delivery_and_after_it() {
     assert_eq!(stats.recv_bufs_lent, 0, "the buffer came home: {stats:?}");
 }
 
-/// With both slots of a two-slot table held by reads parked on a FIFO,
-/// `FsConn::pwritev2_window` is refused with a marked `EBUSY`, writes
-/// nothing, and its receive buffer goes back to the pool as the window
-/// drops.
+/// With both slots of a two-slot table held by reads parked on a FIFO, `FsConn::pwritev2_window` is refused with a
+/// marked `EBUSY`, writes nothing, and its receive buffer goes back to the pool as the window drops.
 #[cfg(all(feature = "uring-fs", not(loom)))]
 #[test]
 fn a_window_write_on_a_full_table_gives_its_buffer_back() {
@@ -9954,8 +8859,7 @@ fn a_window_write_on_a_full_table_gives_its_buffer_back() {
     // SAFETY: a valid NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     let open = |p: &Path| -> Arc<std::os::fd::OwnedFd> {
-        // O_RDWR on a FIFO opens at once with a writer attached, so a read
-        // with no data parks and holds its slot.
+        // O_RDWR on a FIFO opens at once with a writer attached, so a read with no data parks and holds its slot.
         let f = std::fs::OpenOptions::new().read(true).write(true).open(p);
         Arc::new(f.unwrap().into())
     };
@@ -9999,13 +8903,11 @@ fn a_window_write_on_a_full_table_gives_its_buffer_back() {
     assert_eq!(stats.recv_bufs_lent, 0, "the buffer came home: {stats:?}");
 }
 
-/// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient
-/// (root) credentials (`sqe.personality = 0`) - the sanctioned privileged-read
-/// path for a `trusted.*`/`security.*` attribute a request's own identity
-/// can't see. Here it reads a seeded `user.*` value end to end; the full
-/// privilege boundary (a non-root peer vs. a root-only xattr) isn't reproduced,
-/// since on this root dev host the peer identity is itself root - the point is
-/// exercising the `personality = 0` SQE path end to end.
+/// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient (root) credentials (`sqe.personality = 0`) -
+/// the sanctioned privileged-read path for a `trusted.*`/`security.*` attribute a request's own identity can't see.
+/// Here it reads a seeded `user.*` value end to end; the full privilege boundary (a non-root peer vs. a root-only
+/// xattr) isn't reproduced, since on this root dev host the peer identity is itself root - the point is exercising the
+/// `personality = 0` SQE path end to end.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_file_carries_personality_and_as_root() {
@@ -10017,8 +8919,8 @@ fn fs_file_carries_personality_and_as_root() {
     let dir = truenas_ros::tempdir().unwrap();
     let fpath = dir.path().join("f.txt");
     std::fs::write(&fpath, b"payload").unwrap();
-    // Seed an xattr to read back through the ambient-root path; skip if the
-    // filesystem refuses user xattrs (some `/tmp` configs).
+    // Seed an xattr to read back through the ambient-root path; skip if the filesystem refuses user xattrs (some `/tmp`
+    // configs).
     if !set_user_xattr(&fpath, b"user.tr_test", b"secret") {
         return;
     }
@@ -10046,37 +8948,26 @@ fn fs_file_carries_personality_and_as_root() {
                 deferred.close();
                 return;
             };
-            // Read the seeded xattr under ambient root (personality 0) - no
-            // `who`. On this root host the peer is itself root, so this
-            // exercises the `personality = 0` SQE path end to end rather than a
-            // privilege boundary.
+            // Read the seeded xattr under ambient root (personality 0) - no `who`. On this root host the peer is itself
+            // root, so this exercises the `personality = 0` SQE path end to end rather than a privilege boundary.
             let name = CString::new("user.tr_test").unwrap();
-            fs.fgetxattr_as_root(
-                file.clone(),
-                name.clone(),
-                vec![0u8; 64],
-                move |d, fs| {
-                    fs.close(file);
-                    match d.result() {
-                        Ok(n) => {
-                            let mut v = d.into_bufs().pop().unwrap_or_default();
-                            v.truncate(n as usize);
-                            deferred.reply(echo_frame(&v));
-                        }
-                        Err(_) => deferred.reply(echo_frame(b"xattr-err")),
+            fs.fgetxattr_as_root(file.clone(), name.clone(), vec![0u8; 64], move |d, fs| {
+                fs.close(file);
+                match d.result() {
+                    Ok(n) => {
+                        let mut v = d.into_bufs().pop().unwrap_or_default();
+                        v.truncate(n as usize);
+                        deferred.reply(echo_frame(&v));
                     }
-                },
-            );
+                    Err(_) => deferred.reply(echo_frame(b"xattr-err")),
+                }
+            });
         });
         Response::Defer(permit)
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -10090,8 +8981,7 @@ fn fs_file_carries_personality_and_as_root() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -10111,12 +9001,10 @@ fn fs_file_carries_personality_and_as_root() {
     assert_eq!(reply, b"secret");
 }
 
-/// `FsConn::fgetxattr_proc_as_root` reads an xattr of a file held `O_PATH`
-/// under the reactor's ambient (root) credentials, through the file's path
-/// under `/proc/thread-self/fd`, where `fgetxattr_as_root` refuses the
-/// descriptor itself with `EBADF`. As above, the peer on this root host is
-/// itself root, so the privilege boundary is pinned in `test/uring_fs.rs`,
-/// and this exercises the `personality = 0` `GETXATTR` path end to end.
+/// `FsConn::fgetxattr_proc_as_root` reads an xattr of a file held `O_PATH` under the reactor's ambient (root)
+/// credentials, through the file's path under `/proc/thread-self/fd`, where `fgetxattr_as_root` refuses the descriptor
+/// itself with `EBADF`. As above, the peer on this root host is itself root, so the privilege boundary is pinned in
+/// `test/uring_fs.rs`, and this exercises the `personality = 0` `GETXATTR` path end to end.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_file_held_o_path_reads_as_root_through_proc() {
@@ -10159,40 +9047,29 @@ fn fs_file_held_o_path_reads_as_root_through_proc() {
             let again = name.clone();
             let held = file.clone();
             fs.fgetxattr_as_root(file, name, vec![0u8; 64], move |d, fs| {
-                let refused =
-                    matches!(d.result(), Err(Error::Errno(Errno::EBADF)));
+                let refused = matches!(d.result(), Err(Error::Errno(Errno::EBADF)));
                 let file = held.clone();
-                fs.fgetxattr_proc_as_root(
-                    held,
-                    again,
-                    vec![0u8; 64],
-                    move |d, fs| {
-                        fs.close(file);
-                        let mut out = vec![if refused { b'1' } else { b'0' }];
-                        out.push(b':');
-                        match d.result() {
-                            Ok(n) => {
-                                let mut v =
-                                    d.into_bufs().pop().unwrap_or_default();
-                                v.truncate(n as usize);
-                                out.extend_from_slice(&v);
-                            }
-                            Err(_) => out.extend_from_slice(b"xattr-err"),
+                fs.fgetxattr_proc_as_root(held, again, vec![0u8; 64], move |d, fs| {
+                    fs.close(file);
+                    let mut out = vec![if refused { b'1' } else { b'0' }];
+                    out.push(b':');
+                    match d.result() {
+                        Ok(n) => {
+                            let mut v = d.into_bufs().pop().unwrap_or_default();
+                            v.truncate(n as usize);
+                            out.extend_from_slice(&v);
                         }
-                        deferred.reply(echo_frame(&out));
-                    },
-                );
+                        Err(_) => out.extend_from_slice(b"xattr-err"),
+                    }
+                    deferred.reply(echo_frame(&out));
+                });
             });
         });
         Response::Defer(permit)
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -10206,8 +9083,7 @@ fn fs_file_held_o_path_reads_as_root_through_proc() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -10221,9 +9097,7 @@ fn fs_file_held_o_path_reads_as_root_through_proc() {
         stop.shutdown();
         Ok(r)
     });
-    server
-        .serve_forever()
-        .expect("serve_forever proc as_root xattr");
+    server.serve_forever().expect("serve_forever proc as_root xattr");
     let reply = client.join().unwrap().expect("client io");
     // The descriptor was refused and the proc path read the value.
     assert_eq!(reply, b"1:secret");
@@ -10235,12 +9109,10 @@ mod xattr_probe;
 #[cfg(feature = "uring-fs")]
 use xattr_probe::set_user_xattr;
 
-/// The rest of the embedded op sweep over the ring: `renameat` (the
-/// `submit_path_op` two-anchor route), `ftruncate` (the `submit_fd_meta`
-/// route), and an `fgetxattr` read - each stamped with the per-connection
-/// personality, driven from the body handler and resolved through a
-/// `Deferred`. The two version-gated ops (`ftruncate` >= 6.9, fixed-file xattr
-/// >= 6.13) run only where the server reports support; `renameat` always does.
+/// The rest of the embedded op sweep over the ring: `renameat` (the `submit_path_op` two-anchor route), `ftruncate`
+/// (the `submit_fd_meta` route), and an `fgetxattr` read - each stamped with the per-connection personality, driven
+/// from the body handler and resolved through a `Deferred`. The two version-gated ops (`ftruncate` >= 6.9, fixed-file
+/// xattr >= 6.13) run only where the server reports support; `renameat` always does.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_metadata_ops_rename_truncate_xattr() {
@@ -10280,26 +9152,17 @@ fn fs_metadata_ops_rename_truncate_xattr() {
                         return;
                     };
                     let name = CString::new("user.color").unwrap();
-                    fs.fgetxattr(
-                        who,
-                        file.clone(),
-                        name.clone(),
-                        vec![0u8; 64],
-                        move |d, fs| {
-                            fs.close(file);
-                            match d.result() {
-                                Ok(n) => {
-                                    let mut v =
-                                        d.into_bufs().pop().unwrap_or_default();
-                                    v.truncate(n as usize);
-                                    deferred.reply(echo_frame(&v));
-                                }
-                                Err(_) => {
-                                    deferred.reply(echo_frame(b"xattr-err"))
-                                }
+                    fs.fgetxattr(who, file.clone(), name.clone(), vec![0u8; 64], move |d, fs| {
+                        fs.close(file);
+                        match d.result() {
+                            Ok(n) => {
+                                let mut v = d.into_bufs().pop().unwrap_or_default();
+                                v.truncate(n as usize);
+                                deferred.reply(echo_frame(&v));
                             }
-                        },
-                    );
+                            Err(_) => deferred.reply(echo_frame(b"xattr-err")),
+                        }
+                    });
                 });
             }
             b"truncate" => {
@@ -10341,11 +9204,7 @@ fn fs_metadata_ops_rename_truncate_xattr() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -10359,8 +9218,7 @@ fn fs_metadata_ops_rename_truncate_xattr() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let do_xattr = xattr_set;
     let do_truncate = true;
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
@@ -10395,10 +9253,7 @@ fn fs_metadata_ops_rename_truncate_xattr() {
     let (xattr, trunc, renamed) = client.join().unwrap().expect("client io");
 
     assert_eq!(renamed, b"renamed-ok");
-    assert!(
-        dir.path().join("renamed.txt").exists(),
-        "rename took effect"
-    );
+    assert!(dir.path().join("renamed.txt").exists(), "rename took effect");
     assert!(!orig.exists(), "orig.txt is gone after rename");
     if let Some(v) = xattr {
         assert_eq!(v, b"blue", "fgetxattr read the value back");
@@ -10406,20 +9261,16 @@ fn fs_metadata_ops_rename_truncate_xattr() {
     if let Some(t) = trunc {
         assert_eq!(t, b"ok");
         // ftruncate shrank orig.txt to 3 bytes before it was renamed.
-        let len = std::fs::metadata(dir.path().join("renamed.txt"))
-            .unwrap()
-            .len();
+        let len = std::fs::metadata(dir.path().join("renamed.txt")).unwrap().len();
         assert_eq!(len, 3, "ftruncate shrank the file to 3 bytes");
     }
 }
 
-/// The connection-close owned-file sweep. A handler opens a file on every
-/// request and **never closes it** - a deliberate leak. Across many sequential
-/// connections (each opening one file, then dropping), the process would run
-/// out of descriptors if the files were not reclaimed; the sweep closes each
-/// connection's still-open files as it closes, so every open succeeds. (Mirrors `tcp_sequential_slot_reuse`: a small pool with
-/// slack absorbs the asynchronous close, so one-at-a-time connections never
-/// outrun the sweep.)
+/// The connection-close owned-file sweep. A handler opens a file on every request and **never closes it** - a
+/// deliberate leak. Across many sequential connections (each opening one file, then dropping), the process would run
+/// out of descriptors if the files were not reclaimed; the sweep closes each connection's still-open files as it
+/// closes, so every open succeeds. (Mirrors `tcp_sequential_slot_reuse`: a small pool with slack absorbs the
+/// asynchronous close, so one-at-a-time connections never outrun the sweep.)
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_owned_files_swept_on_connection_close() {
@@ -10451,8 +9302,8 @@ fn fs_owned_files_swept_on_connection_close() {
         let path = CString::new("f.txt").unwrap();
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
         fs.open(who, &anchor, &path, how, move |done, _fs| {
-            // Deliberately DO NOT close the file: the connection-close sweep is
-            // the only thing that can reclaim its pool slot.
+            // Deliberately DO NOT close the file: the connection-close sweep is the only thing that can reclaim its
+            // pool slot.
             if done.file().is_some() {
                 deferred.reply(echo_frame(b"opened"));
             } else {
@@ -10463,11 +9314,7 @@ fn fs_owned_files_swept_on_connection_close() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -10481,16 +9328,15 @@ fn fs_owned_files_swept_on_connection_close() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<Vec<u8>>> {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        // Sequential connections, each opening one (never-closed) file, then
-        // closing - the sweep must reclaim its slot before the pool exhausts.
+        // Sequential connections, each opening one (never-closed) file, then closing - the sweep must reclaim its slot
+        // before the pool exhausts.
         let mut replies = Vec::with_capacity(N);
         for _ in 0..N {
             let mut s = connect_tcp(v4)?;
@@ -10513,22 +9359,16 @@ fn fs_owned_files_swept_on_connection_close() {
     }
 }
 
-/// A continuation may open, and doing so reclaims its slot like any
-/// other op.
+/// A continuation may open, and doing so reclaims its slot like any other op.
 ///
-/// This used to assert the opposite - that the facade refused - on the
-/// grounds that a file minted after `close_conn` had already swept the
-/// connection would hold its slot until server teardown. It does not.
-/// `close_owned_by` is gone; `cancel_owned_by` cancels in-flight *ops*
-/// so their parked fds are released, and the fds themselves close by
-/// `Arc`-drop whether or not anyone takes them. An `openat2` completes,
-/// so its entry is reaped either way.
+/// This used to assert the opposite - that the facade refused - on the grounds that a file minted after `close_conn`
+/// had already swept the connection would hold its slot until server teardown. It does not. `close_owned_by` is gone;
+/// `cancel_owned_by` cancels in-flight *ops* so their parked fds are released, and the fds themselves close by
+/// `Arc`-drop whether or not anyone takes them. An `openat2` completes, so its entry is reaped either way.
 ///
-/// The pool is deliberately smaller than the connection count, and each
-/// connection leaves its *first* file open while chaining a second from
-/// the completion. If a chained open leaked a slot, the later
-/// connections would find none and answer `open-err` - which is what
-/// makes this a measurement rather than a restatement.
+/// The pool is deliberately smaller than the connection count, and each connection leaves its *first* file open while
+/// chaining a second from the completion. If a chained open leaked a slot, the later connections would find none and
+/// answer `open-err` - which is what makes this a measurement rather than a restatement.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_continuation_may_open_and_its_slot_comes_back() {
@@ -10566,8 +9406,7 @@ fn fs_continuation_may_open_and_its_slot_comes_back() {
                 deferred.reply(echo_frame(b"open-err"));
                 return;
             }
-            // The first file stays open on purpose: this connection is
-            // holding a slot while it asks for another.
+            // The first file stays open on purpose: this connection is holding a slot while it asks for another.
             fs.open(who, &a2, &second, how, move |d, _fs| match d.file() {
                 Some(_) => deferred.reply(echo_frame(b"chained")),
                 None => deferred.reply(echo_frame(b"open-err")),
@@ -10577,11 +9416,7 @@ fn fs_continuation_may_open_and_its_slot_comes_back() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -10595,8 +9430,7 @@ fn fs_continuation_may_open_and_its_slot_comes_back() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -10616,9 +9450,9 @@ fn fs_continuation_may_open_and_its_slot_comes_back() {
     let replies = client.join().unwrap();
     assert_eq!(replies.len(), N);
     for (i, r) in replies.iter().enumerate() {
-        let b = r.as_ref().unwrap_or_else(|e| {
-            panic!("connection {i}: the chained open must answer, got {e:?}")
-        });
+        let b = r
+            .as_ref()
+            .unwrap_or_else(|e| panic!("connection {i}: the chained open must answer, got {e:?}"));
         assert_eq!(
             b, b"chained",
             "connection {i}: every connection past the pool must still find \
@@ -10633,18 +9467,14 @@ mod privilege;
 #[cfg(feature = "uring-fs")]
 use privilege::{is_root, root_or_skip};
 
-/// The end-to-end proof that a server acts as *authenticated peers*: the
-/// personality genuinely gates namespace access, it is not a stamp. The
-/// credential broker (spawned on the **server's** ring) registers an
-/// unprivileged uid; the handler then opens a root-owned `0600` file two ways --
-/// under the daemon's own personality it opens and reads back, under the peer's
-/// it is refused (`EACCES`, so `done.file()` is `None`). Pure `open` + `pread`,
-/// so it runs live wherever io_uring + root are available (no xattr / 6.13
-/// gate). The divergence is at **open** by design: DAC is checked there, not on
-/// each read of an already-open fd.
+/// The end-to-end proof that a server acts as *authenticated peers*: the personality genuinely gates namespace access,
+/// it is not a stamp. The credential broker (spawned on the **server's** ring) registers an unprivileged uid; the
+/// handler then opens a root-owned `0600` file two ways -- under the daemon's own personality it opens and reads back,
+/// under the peer's it is refused (`EACCES`, so `done.file()` is `None`). Pure `open` + `pread`, so it runs live
+/// wherever io_uring + root are available (no xattr / 6.13 gate). The divergence is at **open** by design: DAC is
+/// checked there, not on each read of an already-open fd.
 ///
-/// Root-only (the broker needs `CAP_SETUID` to become the peer); skipped
-/// otherwise.
+/// Root-only (the broker needs `CAP_SETUID` to become the peer); skipped otherwise.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_broker_personality_gates_open() {
@@ -10652,15 +9482,13 @@ fn fs_broker_personality_gates_open() {
     use std::os::unix::ffi::OsStrExt;
     use std::sync::OnceLock;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
-    use truenas_ros::uring_fs::{
-        Anchor, AsUser, CredBroker, Personality, RwFlags,
-    };
+    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality, RwFlags};
 
     if !root_or_skip("fs_broker_personality_gates_open") {
         return; // the broker cannot become another uid without CAP_SETUID
     }
-    // A uid/gid that owns nothing here - its personality has only what "other"
-    // grants, and "other" is nothing on a 0600 file.
+    // A uid/gid that owns nothing here - its personality has only what "other" grants, and "other" is nothing on a 0600
+    // file.
     const NOBODY_UID: u32 = 65_534;
     const NOBODY_GID: u32 = 65_534;
 
@@ -10672,10 +9500,8 @@ fn fs_broker_personality_gates_open() {
     // SAFETY: valid path; chmod cannot corrupt memory.
     assert_eq!(unsafe { libc::chmod(cpath.as_ptr(), 0o600) }, 0);
 
-    // (root-daemon personality, unprivileged-peer personality), minted after
-    // construction and read by the handler.
-    let cell: Arc<OnceLock<(Personality, Personality)>> =
-        Arc::new(OnceLock::new());
+    // (root-daemon personality, unprivileged-peer personality), minted after construction and read by the handler.
+    let cell: Arc<OnceLock<(Personality, Personality)>> = Arc::new(OnceLock::new());
     let anchor = match Anchor::open(dir.path()) {
         Ok(a) => a,
         Err(e) if should_skip(&e) => return,
@@ -10689,18 +9515,12 @@ fn fs_broker_personality_gates_open() {
         let Some(mut fs) = req.fs.take() else {
             return Response::Close;
         };
-        let (root_pers, peer_pers) =
-            *pc.get().expect("personalities set before serving");
+        let (root_pers, peer_pers) = *pc.get().expect("personalities set before serving");
         let anchor = anchor.clone();
         let ro = OpenHow::new().flags(OFlag::O_RDONLY);
-        // Open the 0600 file as the daemon (`as-root`) or the peer, then, if it
-        // opened, read it back - proving the daemon both opens AND reads while
-        // the peer is refused at open.
-        let who = if cmd == b"as-root" {
-            root_pers
-        } else {
-            peer_pers
-        };
+        // Open the 0600 file as the daemon (`as-root`) or the peer, then, if it opened, read it back - proving the
+        // daemon both opens AND reads while the peer is refused at open.
+        let who = if cmd == b"as-root" { root_pers } else { peer_pers };
         let path = CString::new("secret.txt").unwrap();
         fs.open(who, &anchor, &path, ro, move |done, fs| {
             let Some(file) = done.file() else {
@@ -10733,11 +9553,7 @@ fn fs_broker_personality_gates_open() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -10746,9 +9562,8 @@ fn fs_broker_personality_gates_open() {
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    // The ring must exist before the broker forks (it inherits the fd), and the
-    // broker must fork before any threads - so build, register, spawn, all
-    // before the client thread below.
+    // The ring must exist before the broker forks (it inherits the fd), and the broker must fork before any threads -
+    // so build, register, spawn, all before the client thread below.
     let mut server = match Server::with_config([addr], cfg, protocol) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
@@ -10794,14 +9609,12 @@ fn fs_broker_personality_gates_open() {
     );
 }
 
-/// A parent open checks that the caller may search the directory it starts
-/// from, as any lookup in it does, and asks nothing of the parent itself
-/// when it opens `O_PATH`. In a root-owned `0700` tree a peer is refused the
-/// parent of a `0700` directory and given the parent of a `0755` one, and
-/// the daemon is given both. The open across a mount is refused the same.
+/// A parent open checks that the caller may search the directory it starts from, as any lookup in it does, and asks
+/// nothing of the parent itself when it opens `O_PATH`. In a root-owned `0700` tree a peer is refused the parent of a
+/// `0700` directory and given the parent of a `0755` one, and the daemon is given both. The open across a mount is
+/// refused the same.
 ///
-/// Root-only, since the broker needs `CAP_SETUID` to become the peer.
-/// Skipped otherwise.
+/// Root-only, since the broker needs `CAP_SETUID` to become the peer. Skipped otherwise.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_parent_open_needs_search_on_the_directory() {
@@ -10809,9 +9622,7 @@ fn fs_parent_open_needs_search_on_the_directory() {
     use std::sync::OnceLock;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
-    use truenas_ros::uring_fs::{
-        Anchor, AsUser, CredBroker, FsConn, FsDone, Personality,
-    };
+    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, FsConn, FsDone, Personality};
 
     if !root_or_skip("fs_parent_open_needs_search_on_the_directory") {
         return;
@@ -10823,16 +9634,14 @@ fn fs_parent_open_needs_search_on_the_directory() {
     for (name, mode) in [("locked", 0o700), ("open", 0o755)] {
         let path = dir.path().join(name);
         std::fs::create_dir(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
-            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
     let anchors = (
         Anchor::open(&dir.path().join("locked")).expect("anchor"),
         Anchor::open(&dir.path().join("open")).expect("anchor"),
     );
 
-    let cell: Arc<OnceLock<(Personality, Personality)>> =
-        Arc::new(OnceLock::new());
+    let cell: Arc<OnceLock<(Personality, Personality)>> = Arc::new(OnceLock::new());
     let pc = Arc::clone(&cell);
     let body = move |mut req: Request<'_, ()>| -> Response {
         let cmd = req.body.take();
@@ -10840,15 +9649,13 @@ fn fs_parent_open_needs_search_on_the_directory() {
         let Some(mut fs) = req.fs.take() else {
             return Response::Close;
         };
-        let (root_pers, peer_pers) =
-            *pc.get().expect("personalities set before serving");
+        let (root_pers, peer_pers) = *pc.get().expect("personalities set before serving");
         let who = if cmd.ends_with(b"as root") {
             root_pers
         } else {
             peer_pers
         };
-        let anchor = if cmd.starts_with(b"locked") || cmd.starts_with(b"across")
-        {
+        let anchor = if cmd.starts_with(b"locked") || cmd.starts_with(b"across") {
             &anchors.0
         } else {
             &anchors.1
@@ -10857,9 +9664,7 @@ fn fs_parent_open_needs_search_on_the_directory() {
         let then = move |done: FsDone, _fs: &mut FsConn<'_>| {
             let answer = match done.result() {
                 Ok(_) => "opened".to_owned(),
-                Err(truenas_ros::Error::Errno(Errno::EACCES)) => {
-                    "denied".to_owned()
-                }
+                Err(truenas_ros::Error::Errno(Errno::EACCES)) => "denied".to_owned(),
                 Err(e) => format!("{e}"),
             };
             deferred.reply(echo_frame(answer.as_bytes()));
@@ -10873,11 +9678,7 @@ fn fs_parent_open_needs_search_on_the_directory() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -10886,8 +9687,8 @@ fn fs_parent_open_needs_search_on_the_directory() {
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    // The ring must exist before the broker forks, since the broker
-    // inherits its fd, and the broker must fork before any thread starts.
+    // The ring must exist before the broker forks, since the broker inherits its fd, and the broker must fork before
+    // any thread starts.
     let mut server = match Server::with_config([addr], cfg, protocol) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
@@ -10913,8 +9714,7 @@ fn fs_parent_open_needs_search_on_the_directory() {
         let _stop = ShutdownOnDrop(stop.clone());
         let mut s = connect_tcp(v4)?;
         let mut answers = Vec::new();
-        let cmds =
-            [&b"locked"[..], b"open", b"locked as root", b"across locked"];
+        let cmds = [&b"locked"[..], b"open", b"locked as root", b"across locked"];
         for cmd in cmds {
             send_framed(&mut s, cmd)?;
             answers.push(recv_framed(&mut s)?);
@@ -10939,11 +9739,9 @@ fn fs_parent_open_needs_search_on_the_directory() {
     );
 }
 
-/// `FsConn::reopen_proc` opens a file the ring holds `O_PATH` again as the
-/// peer, which a file of mode 0600 refuses, and
-/// `FsConn::reopen_proc_as_root` opens it as the ring owner, whose
-/// capabilities pass the check. Root-only, since the broker needs
-/// `CAP_SETUID` to become the peer. Skipped otherwise.
+/// `FsConn::reopen_proc` opens a file the ring holds `O_PATH` again as the peer, which a file of mode 0600 refuses, and
+/// `FsConn::reopen_proc_as_root` opens it as the ring owner, whose capabilities pass the check. Root-only, since the
+/// broker needs `CAP_SETUID` to become the peer. Skipped otherwise.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner() {
@@ -10951,13 +9749,9 @@ fn fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner() {
     use std::sync::OnceLock;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
-    use truenas_ros::uring_fs::{
-        Anchor, AsUser, CredBroker, FsConn, FsDone, Personality, ReopenAccess,
-    };
+    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, FsConn, FsDone, Personality, ReopenAccess};
 
-    if !root_or_skip(
-        "fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner",
-    ) {
+    if !root_or_skip("fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner") {
         return;
     }
     const NOBODY_UID: u32 = 65_534;
@@ -10965,20 +9759,11 @@ fn fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner() {
 
     let dir = truenas_ros::tempdir().unwrap();
     std::fs::write(dir.path().join("f"), b"held").unwrap();
-    std::fs::set_permissions(
-        dir.path().join("f"),
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
-    std::fs::set_permissions(
-        dir.path(),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    std::fs::set_permissions(dir.path().join("f"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let anchor = Anchor::open(dir.path()).expect("anchor");
 
-    let cell: Arc<OnceLock<(Personality, Personality)>> =
-        Arc::new(OnceLock::new());
+    let cell: Arc<OnceLock<(Personality, Personality)>> = Arc::new(OnceLock::new());
     let pc = Arc::clone(&cell);
     let body = move |mut req: Request<'_, ()>| -> Response {
         let cmd = req.body.take();
@@ -10986,8 +9771,7 @@ fn fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner() {
         let Some(mut fs) = req.fs.take() else {
             return Response::Close;
         };
-        let (root_pers, peer_pers) =
-            *pc.get().expect("personalities set before serving");
+        let (root_pers, peer_pers) = *pc.get().expect("personalities set before serving");
         let as_root = cmd == b"root";
         let how = OpenHow::new().flags(OFlag::O_PATH);
         let held = move |done: FsDone, fs: &mut FsConn<'_>| {
@@ -10995,9 +9779,7 @@ fn fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner() {
             let then = move |done: FsDone, _fs: &mut FsConn<'_>| {
                 let answer = match done.result() {
                     Ok(_) => "opened".to_owned(),
-                    Err(truenas_ros::Error::Errno(Errno::EACCES)) => {
-                        "denied".to_owned()
-                    }
+                    Err(truenas_ros::Error::Errno(Errno::EACCES)) => "denied".to_owned(),
                     Err(e) => format!("{e}"),
                 };
                 deferred.reply(echo_frame(answer.as_bytes()));
@@ -11014,11 +9796,7 @@ fn fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -11027,8 +9805,8 @@ fn fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner() {
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    // The ring must exist before the broker forks, since the broker
-    // inherits its fd, and the broker must fork before any thread starts.
+    // The ring must exist before the broker forks, since the broker inherits its fd, and the broker must fork before
+    // any thread starts.
     let mut server = match Server::with_config([addr], cfg, protocol) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
@@ -11076,22 +9854,17 @@ fn fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner() {
     );
 }
 
-/// `open_chain`'s whole point: a directory the caller could never
-/// traverse, opened as the daemon, with the file inside it still gated
-/// on the caller.
+/// `open_chain`'s whole point: a directory the caller could never traverse, opened as the daemon, with the file inside
+/// it still gated on the caller.
 ///
-/// This is the property the split credential exists for. A `0700`
-/// daemon-owned tree grants nothing, so opening something under it as
-/// the daemon proves nothing about the caller — the last step has to
-/// name the caller for the kernel to decide their access to the file
-/// they actually asked for.
+/// This is the property the split credential exists for. A `0700` daemon-owned tree grants nothing, so opening
+/// something under it as the daemon proves nothing about the caller — the last step has to name the caller for the
+/// kernel to decide their access to the file they actually asked for.
 ///
-/// Three chains over the same tree say it three ways: the daemon
-/// reaches the file; the peer is refused at the file even though the
-/// directory above it opened; and the peer is refused at the directory
-/// when it is the one traversing. The second is the one that matters —
-/// a chain that leaked the daemon's credential into the last step would
-/// hand the peer a file it may not read.
+/// Three chains over the same tree say it three ways: the daemon reaches the file; the peer is refused at the file even
+/// though the directory above it opened; and the peer is refused at the directory when it is the one traversing. The
+/// second is the one that matters — a chain that leaked the daemon's credential into the last step would hand the peer
+/// a file it may not read.
 ///
 /// Root-only (the broker needs `CAP_SETUID` to become the peer);
 /// skipped otherwise.
@@ -11102,9 +9875,7 @@ fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
     use std::os::unix::ffi::OsStrExt;
     use std::sync::OnceLock;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
-    use truenas_ros::uring_fs::{
-        Anchor, AsUser, CredBroker, OpenStep, Personality, StepPath,
-    };
+    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, OpenStep, Personality, StepPath};
 
     if !root_or_skip("fs_open_chain_gates_the_last_step") {
         return; // the broker cannot become another uid without CAP_SETUID
@@ -11113,9 +9884,8 @@ fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
     const NOBODY_GID: u32 = 65_534;
 
     let dir = truenas_ros::tempdir().unwrap();
-    // `private/` is the daemon-owned tree: 0700, so the peer cannot even
-    // traverse it. `obj` inside it is 0600, so the peer cannot read it
-    // either — two separate refusals, one per step.
+    // `private/` is the daemon-owned tree: 0700, so the peer cannot even traverse it. `obj` inside it is 0600, so the
+    // peer cannot read it either — two separate refusals, one per step.
     let private = dir.path().join("private");
     std::fs::create_dir(&private).unwrap();
     let obj = private.join("obj");
@@ -11126,8 +9896,7 @@ fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
         assert_eq!(unsafe { libc::chmod(c.as_ptr(), mode) }, 0);
     }
 
-    let cell: Arc<OnceLock<(Personality, Personality)>> =
-        Arc::new(OnceLock::new());
+    let cell: Arc<OnceLock<(Personality, Personality)>> = Arc::new(OnceLock::new());
     let anchor = match Anchor::open(dir.path()) {
         Ok(a) => a,
         Err(e) if should_skip(&e) => return,
@@ -11141,8 +9910,7 @@ fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
         let Some(mut fs) = req.fs.take() else {
             return Response::Close;
         };
-        let (root_pers, peer_pers) =
-            *pc.get().expect("personalities set before serving");
+        let (root_pers, peer_pers) = *pc.get().expect("personalities set before serving");
         let anchor = anchor.clone();
         // Who walks the directory, and who opens the file under it.
         let (dir_who, leaf_who) = match cmd.as_slice() {
@@ -11156,8 +9924,7 @@ fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
                 OpenStep {
                     path: StepPath::Fixed(c"private".to_owned()),
                     who: dir_who,
-                    how: OpenHow::new()
-                        .flags(OFlag::O_PATH | OFlag::O_DIRECTORY),
+                    how: OpenHow::new().flags(OFlag::O_PATH | OFlag::O_DIRECTORY),
                 },
                 OpenStep {
                     path: StepPath::Fixed(c"obj".to_owned()),
@@ -11177,11 +9944,7 @@ fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -11237,32 +10000,23 @@ fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
          decides, and a chain that leaked the daemon's would hand over a \
          file the peer may not read"
     );
-    assert_eq!(
-        got[2], b"denied",
-        "the peer cannot traverse the 0700 directory either"
-    );
+    assert_eq!(got[2], b"denied", "the peer cannot traverse the 0700 directory either");
 }
 
-/// The multi-reactor shape: rings created on the main thread before the
-/// broker forks, servers built on worker threads after it, and the peer's
-/// personality minted on each ring before the thread that owns it has even
-/// mapped it. The broker's personalities then gate opens on every ring
-/// exactly as they do on a server that built its own ring, which is the
-/// proof that `setup_ring` + `with_ring` is the same server, constructed in
-/// two halves on two threads.
+/// The multi-reactor shape: rings created on the main thread before the broker forks, servers built on worker threads
+/// after it, and the peer's personality minted on each ring before the thread that owns it has even mapped it. The
+/// broker's personalities then gate opens on every ring exactly as they do on a server that built its own ring, which
+/// is the proof that `setup_ring` + `with_ring` is the same server, constructed in two halves on two threads.
 ///
-/// A ring created **before** the thread that will serve on it, mapped and
-/// driven by that thread, serves real requests.
+/// A ring created **before** the thread that will serve on it, mapped and driven by that thread, serves real requests.
 ///
-/// This is the unprivileged half of the multi-reactor recipe: `setup_ring`
-/// builds each ring on this thread with no other thread alive, then each
-/// worker takes one and calls `Server::with_ring`, which does the mapping on
-/// the thread that will drive it. Nothing here needs a credential broker, so
-/// it runs on `ci.yml`'s unprivileged runner - the job that gates merges,
-/// where `fs_broker_serves_rings_mapped_on_worker_threads` can only skip.
+/// This is the unprivileged half of the multi-reactor recipe: `setup_ring` builds each ring on this thread with no
+/// other thread alive, then each worker takes one and calls `Server::with_ring`, which does the mapping on the thread
+/// that will drive it. Nothing here needs a credential broker, so it runs on `ci.yml`'s unprivileged runner - the job
+/// that gates merges, where `fs_broker_serves_rings_mapped_on_worker_threads` can only skip.
 ///
-/// Two rings, so the per-ring construction is exercised more than once and
-/// the servers are proven independent rather than aliased.
+/// Two rings, so the per-ring construction is exercised more than once and the servers are proven independent rather
+/// than aliased.
 #[test]
 fn rings_created_before_the_threads_that_serve_them() {
     use std::sync::mpsc;
@@ -11289,8 +10043,7 @@ fn rings_created_before_the_threads_that_serve_them() {
     for (i, ring) in rings.into_iter().enumerate() {
         let (addr, tx) = (addr.clone(), tx.clone());
         workers.push(thread::spawn(move || {
-            // Answer with this ring's index, so a reply proves which server
-            // served it and two rings cannot be one.
+            // Answer with this ring's index, so a reply proves which server served it and two rings cannot be one.
             let body = move |mut req: Request<'_, ()>| -> Response {
                 let got = req.body.take();
                 let mut out = got;
@@ -11299,15 +10052,11 @@ fn rings_created_before_the_threads_that_serve_them() {
             };
             let protocol = Protocol {
                 accept: |_: Incoming<'_>| Some(()),
-                header: length_prefix_header::<()>(
-                    PrefixWidth::U32,
-                    Endian::Big,
-                    false,
-                ),
+                header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
                 body,
             };
-            let mut server = Server::with_ring([addr], cfg, protocol, ring)
-                .expect("with_ring on a ring created by another thread");
+            let mut server =
+                Server::with_ring([addr], cfg, protocol, ring).expect("with_ring on a ring created by another thread");
             let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
                 panic!("expected Tcp");
             };
@@ -11337,12 +10086,10 @@ fn rings_created_before_the_threads_that_serve_them() {
     }
 }
 
-/// Root-only, because the **broker** half needs `CAP_SETUID` to become
-/// another uid. The skip is loud: `TRUENAS_ROS_REQUIRE_CRED_BROKER=1` (armed
-/// in the QEMU job, which runs as root) turns a mis-provisioned runner red
-/// instead of green. The unprivileged half of the same feature - a ring
-/// created on one thread and mapped, built and driven on another - is covered
-/// without privilege by `rings_created_before_the_threads_that_serve_them`.
+/// Root-only, because the **broker** half needs `CAP_SETUID` to become another uid. The skip is loud:
+/// `TRUENAS_ROS_REQUIRE_CRED_BROKER=1` (armed in the QEMU job, which runs as root) turns a mis-provisioned runner red
+/// instead of green. The unprivileged half of the same feature - a ring created on one thread and mapped, built and
+/// driven on another - is covered without privilege by `rings_created_before_the_threads_that_serve_them`.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_broker_serves_rings_mapped_on_worker_threads() {
@@ -11351,9 +10098,7 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
     use std::sync::OnceLock;
     use std::sync::mpsc;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
-    use truenas_ros::uring_fs::{
-        Anchor, AsUser, CredBroker, Personality, RwFlags,
-    };
+    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality, RwFlags};
 
     if !is_root() {
         assert!(
@@ -11386,8 +10131,7 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
 
-    // Every ring first, on this thread, with no other thread alive yet; then
-    // the broker over all of them.
+    // Every ring first, on this thread, with no other thread alive yet; then the broker over all of them.
     let mut rings = Vec::new();
     for _ in 0..RINGS {
         match setup_ring([addr.clone()], &cfg) {
@@ -11396,9 +10140,8 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
             Err(e) => panic!("setup_ring: {e}"),
         }
     }
-    // One more ring, deliberately *not* handed to the broker: the
-    // pairing check has to refuse a reactor this broker does not serve,
-    // or it is not a pairing check.
+    // One more ring, deliberately *not* handed to the broker: the pairing check has to refuse a reactor this broker
+    // does not serve, or it is not a pairing check.
     let outsider = match setup_ring([addr.clone()], &cfg) {
         Ok(r) => r,
         Err(e) if should_skip(&e) => return,
@@ -11415,15 +10158,13 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
     );
     drop(outsider);
 
-    // Each worker mints the peer on its still-unmapped ring, maps it, builds
-    // the server around it, and reports its address and stop handle before
-    // serving.
+    // Each worker mints the peer on its still-unmapped ring, maps it, builds the server around it, and reports its
+    // address and stop handle before serving.
     let (tx, rx) = mpsc::channel::<(usize, SocketAddrV4, ShutdownHandle)>();
     let mut workers = Vec::new();
     for (i, ring) in rings.into_iter().enumerate() {
-        // By ring, not by position: a personality is meaningful only on
-        // the ring that minted it, and `i` here is a second list beside
-        // the first. The positional form must agree with it.
+        // By ring, not by position: a personality is meaningful only on the ring that minted it, and `i` here is a
+        // second list beside the first. The positional form must agree with it.
         let creds = broker.handle_for(&ring).expect("broker handle");
         assert_eq!(
             creds.ring(),
@@ -11434,8 +10175,7 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
         let addr = addr.clone();
         let tx = tx.clone();
         workers.push(thread::spawn(move || {
-            let cell: Arc<OnceLock<(Personality, Personality)>> =
-                Arc::new(OnceLock::new());
+            let cell: Arc<OnceLock<(Personality, Personality)>> = Arc::new(OnceLock::new());
             let pc = Arc::clone(&cell);
             let body = move |mut req: Request<'_, ()>| -> Response {
                 let cmd = req.body.take();
@@ -11443,15 +10183,10 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
                 let Some(mut fs) = req.fs.take() else {
                     return Response::Close;
                 };
-                let (root_pers, peer_pers) =
-                    *pc.get().expect("personalities set before serving");
+                let (root_pers, peer_pers) = *pc.get().expect("personalities set before serving");
                 let anchor = anchor.clone();
                 let ro = OpenHow::new().flags(OFlag::O_RDONLY);
-                let who = if cmd == b"as-root" {
-                    root_pers
-                } else {
-                    peer_pers
-                };
+                let who = if cmd == b"as-root" { root_pers } else { peer_pers };
                 let path = CString::new("secret.txt").unwrap();
                 fs.open(who, &anchor, &path, ro, move |done, fs| {
                     let Some(file) = done.file() else {
@@ -11469,15 +10204,12 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
                             match d.result() {
                                 Ok(n) => {
                                     let mut out = b"read:".to_vec();
-                                    let mut v =
-                                        d.into_bufs().pop().unwrap_or_default();
+                                    let mut v = d.into_bufs().pop().unwrap_or_default();
                                     v.truncate(n as usize);
                                     out.extend_from_slice(&v);
                                     deferred.reply(echo_frame(&out));
                                 }
-                                Err(_) => {
-                                    deferred.reply(echo_frame(b"read-err"))
-                                }
+                                Err(_) => deferred.reply(echo_frame(b"read-err")),
                             }
                         },
                     );
@@ -11486,20 +10218,15 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
             };
             let protocol = Protocol {
                 accept: |_: Incoming<'_>| Some(()),
-                header: length_prefix_header::<()>(
-                    PrefixWidth::U32,
-                    Endian::Big,
-                    false,
-                ),
+                header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
                 body,
             };
-            // The broker needs only the fd: the peer is minted on this ring
-            // before this thread maps it.
+            // The broker needs only the fd: the peer is minted on this ring before this thread maps it.
             let peer_pers = creds
                 .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
                 .expect("register peer on a ring not yet mapped");
-            let mut server = Server::with_ring([addr], cfg, protocol, ring)
-                .expect("with_ring on a ring created by another thread");
+            let mut server =
+                Server::with_ring([addr], cfg, protocol, ring).expect("with_ring on a ring created by another thread");
             let root_pers = server.register_self().expect("register_self");
             cell.set((root_pers, peer_pers)).unwrap();
             let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
@@ -11538,14 +10265,12 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
     }
 }
 
-/// Real privilege boundary for `fgetxattr_as_root`: a `trusted.*` attribute is
-/// invisible to an unprivileged reader (the kernel hides it without
-/// `CAP_SYS_ADMIN`, returning `ENODATA`), while the ambient-root path
-/// (`personality = 0`) holds the capability and returns the value. The peer
-/// opens a world-readable file, then reads the attribute both ways.
+/// Real privilege boundary for `fgetxattr_as_root`: a `trusted.*` attribute is invisible to an unprivileged reader (the
+/// kernel hides it without `CAP_SYS_ADMIN`, returning `ENODATA`), while the ambient-root path (`personality = 0`) holds
+/// the capability and returns the value. The peer opens a world-readable file, then reads the attribute both ways.
 ///
-/// Root-only (the broker needs `CAP_SETUID`); skipped otherwise, and skipped if
-/// the fs refuses `trusted.*` or the kernel lacks fd-xattr (< 6.13).
+/// Root-only (the broker needs `CAP_SETUID`); skipped otherwise, and skipped if the fs refuses `trusted.*` or the
+/// kernel lacks fd-xattr (< 6.13).
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_as_root_reads_trusted_xattr_across_privilege() {
@@ -11563,27 +10288,20 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
     const NOBODY_GID: u32 = 65_534;
 
     let dir = truenas_ros::tempdir().unwrap();
-    // `tempdir` creates the scratch directory 0700; the unprivileged peer
-    // must traverse it to reach the file, and DAC on the path is not the
-    // boundary under test.
-    std::fs::set_permissions(
-        dir.path(),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    // `tempdir` creates the scratch directory 0700; the unprivileged peer must traverse it to reach the file, and DAC
+    // on the path is not the boundary under test.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let f = dir.path().join("t.txt");
     std::fs::write(&f, b"body").unwrap();
     let cpath = CString::new(f.as_os_str().as_bytes()).unwrap();
-    // World-readable so the unprivileged peer can OPEN it - the boundary under
-    // test is the xattr `CAP_SYS_ADMIN` check, not DAC on open.
+    // World-readable so the unprivileged peer can OPEN it - the boundary under test is the xattr `CAP_SYS_ADMIN` check,
+    // not DAC on open.
     // SAFETY: valid path; chmod cannot corrupt memory.
     assert_eq!(unsafe { libc::chmod(cpath.as_ptr(), 0o644) }, 0);
-    // Seed a `trusted.*` attribute (root/CAP_SYS_ADMIN only); skip if the fs
-    // refuses it. Through `set_user_xattr`, as the privileged-xattr fixture
-    // above already is: the one assertion this test makes sits at its end,
-    // so a hand-rolled `libc::setxattr` with a silent `return` reports ok
-    // having tested nothing - with `TRUENAS_ROS_REQUIRE_XATTRS` armed, which
-    // `qemu-4-test.sh` arms naming this very probe.
+    // Seed a `trusted.*` attribute (root/CAP_SYS_ADMIN only); skip if the fs refuses it. Through `set_user_xattr`, as
+    // the privileged-xattr fixture above already is: the one assertion this test makes sits at its end, so a
+    // hand-rolled `libc::setxattr` with a silent `return` reports ok having tested nothing - with
+    // `TRUENAS_ROS_REQUIRE_XATTRS` armed, which `qemu-4-test.sh` arms naming this very probe.
     if !set_user_xattr(&f, b"trusted.tr_test", b"cap") {
         return; // filesystem refuses trusted.* here
     }
@@ -11613,49 +10331,31 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
             };
             let name = CString::new("trusted.tr_test").unwrap();
             // (1) As the unprivileged peer: trusted.* is hidden -> ENODATA.
-            fs.fgetxattr(
-                peer,
-                file.clone(),
-                name.clone(),
-                vec![0u8; 32],
-                move |d1, fs| {
-                    let peer_failed = d1.result().is_err();
-                    let name2 = CString::new("trusted.tr_test").unwrap();
-                    // (2) As ambient root: CAP_SYS_ADMIN -> the value.
-                    fs.fgetxattr_as_root(
-                        file,
-                        name2.clone(),
-                        vec![0u8; 32],
-                        move |d2, _fs| {
-                            let mut out = Vec::new();
-                            out.push(if peer_failed { b'1' } else { b'0' });
-                            out.push(b':');
-                            match d2.result() {
-                                Ok(n) => {
-                                    let mut v = d2
-                                        .into_bufs()
-                                        .pop()
-                                        .unwrap_or_default();
-                                    v.truncate(n as usize);
-                                    out.extend_from_slice(&v);
-                                }
-                                Err(_) => out.extend_from_slice(b"root-err"),
-                            }
-                            deferred.reply(echo_frame(&out));
-                        },
-                    );
-                },
-            );
+            fs.fgetxattr(peer, file.clone(), name.clone(), vec![0u8; 32], move |d1, fs| {
+                let peer_failed = d1.result().is_err();
+                let name2 = CString::new("trusted.tr_test").unwrap();
+                // (2) As ambient root: CAP_SYS_ADMIN -> the value.
+                fs.fgetxattr_as_root(file, name2.clone(), vec![0u8; 32], move |d2, _fs| {
+                    let mut out = Vec::new();
+                    out.push(if peer_failed { b'1' } else { b'0' });
+                    out.push(b':');
+                    match d2.result() {
+                        Ok(n) => {
+                            let mut v = d2.into_bufs().pop().unwrap_or_default();
+                            v.truncate(n as usize);
+                            out.extend_from_slice(&v);
+                        }
+                        Err(_) => out.extend_from_slice(b"root-err"),
+                    }
+                    deferred.reply(echo_frame(&out));
+                });
+            });
         });
         Response::Defer(permit)
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -11704,14 +10404,12 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
     );
 }
 
-/// An fd opened for a connection torn down **mid-chain** is reclaimed when the
-/// connection closes. A handler opens a FIFO and submits a read that blocks
-/// forever (no writer sends data), then the peer disconnects before the read
-/// completes. Plain-fd files close by `Arc`-drop, but an in-flight op parks the
-/// fd until its CQE - so the connection-teardown sweep (`cancel_owned_by`)
-/// cancels the op; it completes `ECANCELED`, the parked `Arc` drops, and the fd
-/// closes without waiting for whole-server teardown. Validates the Arc-model
-/// replacement for the old `close_owned_by`.
+/// An fd opened for a connection torn down **mid-chain** is reclaimed when the connection closes. A handler opens a
+/// FIFO and submits a read that blocks forever (no writer sends data), then the peer disconnects before the read
+/// completes. Plain-fd files close by `Arc`-drop, but an in-flight op parks the fd until its CQE - so the
+/// connection-teardown sweep (`cancel_owned_by`) cancels the op; it completes `ECANCELED`, the parked `Arc` drops, and
+/// the fd closes without waiting for whole-server teardown. Validates the Arc-model replacement for the old
+/// `close_owned_by`.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_fd_reclaimed_on_connection_close_midchain() {
@@ -11730,11 +10428,10 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
     if unsafe { libc::mkfifo(cfifo.as_ptr(), 0o600) } != 0 {
         return;
     }
-    // Hold the FIFO open O_RDWR so the handler's O_RDONLY open succeeds without
-    // blocking and its reads block (no data is ever written).
+    // Hold the FIFO open O_RDWR so the handler's O_RDONLY open succeeds without blocking and its reads block (no data
+    // is ever written).
     // SAFETY: valid path; O_RDWR|O_NONBLOCK on a FIFO does not block.
-    let keep =
-        unsafe { libc::open(cfifo.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+    let keep = unsafe { libc::open(cfifo.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
     assert!(keep >= 0, "open fifo O_RDWR");
 
     let opened: Arc<OnceLock<RawFd>> = Arc::new(OnceLock::new());
@@ -11764,9 +10461,8 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
                 return;
             };
             let _ = oc.set(file.as_raw_fd());
-            // Reply now, then submit a read that never completes (FIFO, no
-            // data): it parks the file's `Arc` in the op entry. The peer will
-            // disconnect with this read still in flight.
+            // Reply now, then submit a read that never completes (FIFO, no data): it parks the file's `Arc` in the op
+            // entry. The peer will disconnect with this read still in flight.
             deferred.reply(echo_frame(b"opened"));
             fs.preadv2(
                 who,
@@ -11783,11 +10479,7 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -11801,8 +10493,7 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -11816,8 +10507,8 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
         drop(s); // disconnect mid-chain, read still in flight
         let fd = *oc2.get().expect("handler recorded the fd");
         let link = format!("/proc/self/fd/{fd}");
-        // Poll for reclamation: the fd is reclaimed iff /proc/self/fd/N stops
-        // resolving to the FIFO (closed, or reused for a different file).
+        // Poll for reclamation: the fd is reclaimed iff /proc/self/fd/N stops resolving to the FIFO (closed, or reused
+        // for a different file).
         let mut leaked = true;
         for _ in 0..80 {
             thread::sleep(Duration::from_millis(10));
@@ -11843,13 +10534,11 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
     );
 }
 
-/// `FsConn::mkdir_path` builds a missing tree on-loop and hands back the
-/// deepest directory as a real descriptor.
+/// `FsConn::mkdir_path` builds a missing tree on-loop and hands back the deepest directory as a real descriptor.
 ///
-/// Two requests, because the two paths through it differ: the first walks
-/// a tree that does not exist, the second takes the fast path over the
-/// tree the first made. The reply is the `fsync` of the returned handle,
-/// which an `O_PATH` directory would answer `EBADF`.
+/// Two requests, because the two paths through it differ: the first walks a tree that does not exist, the second takes
+/// the fast path over the tree the first made. The reply is the `fsync` of the returned handle, which an `O_PATH`
+/// directory would answer `EBADF`.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_mkdir_path_builds_a_tree_and_answers_a_real_directory() {
@@ -11889,11 +10578,7 @@ fn fs_conn_mkdir_path_builds_a_tree_and_answers_a_real_directory() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -11907,16 +10592,14 @@ fn fs_conn_mkdir_path_builds_a_tree_and_answers_a_real_directory() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>)> {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        // Shut down on every exit: one that skipped it would strand
-        // `serve_forever` and hang rather than fail.
+        // Shut down on every exit: one that skipped it would strand `serve_forever` and hang rather than fail.
         let out = (|| {
             let mut s = connect_tcp(v4)?;
             s.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -11938,24 +10621,19 @@ fn fs_conn_mkdir_path_builds_a_tree_and_answers_a_real_directory() {
     assert!(dir.path().join("a/b/c").is_dir(), "the tree was created");
 }
 
-/// `FsConn::mkdir_path` refuses a path whose components it cannot rebuild,
-/// and refuses it on **shape** rather than on whether the kernel resolves
-/// it.
+/// `FsConn::mkdir_path` refuses a path whose components it cannot rebuild, and refuses it on **shape** rather than on
+/// whether the kernel resolves it.
 ///
-/// `a/../b` is the case worth pinning: `openat2` under `CONFINED_RESOLVE`
-/// resolves it, so a probe-first order would answer it with a directory
-/// wherever the tree happened to exist and refuse it everywhere else - one
-/// path meaning two things. A walk that has to create `b` cannot know what
-/// `a/..` names, so the answer is the same either way: refused, before
-/// anything is submitted.
+/// `a/../b` is the case worth pinning: `openat2` under `CONFINED_RESOLVE` resolves it, so a probe-first order would
+/// answer it with a directory wherever the tree happened to exist and refuse it everywhere else - one path meaning two
+/// things. A walk that has to create `b` cannot know what `a/..` names, so the answer is the same either way: refused,
+/// before anything is submitted.
 ///
-/// An invalid argument answers `on_done` before `mkdir_path` returns,
-/// with `EINVAL` and the refusal mark - so the handler replies to the
-/// peer instead of the connection being shed over a caller bug, and the
-/// callback runs inline while the handler is still on its way to
-/// `Response::Defer`. That ordering is the other thing this pins: a
-/// `Deferred::reply` made before the `Defer(permit)` verdict is
-/// processed rides the injection queue and lands once the park exists.
+/// An invalid argument answers `on_done` before `mkdir_path` returns, with `EINVAL` and the refusal mark - so the
+/// handler replies to the peer instead of the connection being shed over a caller bug, and the callback runs inline
+/// while the handler is still on its way to `Response::Defer`. That ordering is the other thing this pins: a
+/// `Deferred::reply` made before the `Defer(permit)` verdict is processed rides the injection queue and lands once the
+/// park exists.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
@@ -11965,8 +10643,7 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
     use truenas_ros::uring_fs::{Anchor, Personality};
 
     let dir = truenas_ros::tempdir().unwrap();
-    // `a` exists, so `a/../b` is a path the kernel WOULD resolve if the
-    // walk ever let it near `openat2`.
+    // `a` exists, so `a/../b` is a path the kernel WOULD resolve if the walk ever let it near `openat2`.
     std::fs::create_dir(dir.path().join("a")).unwrap();
     let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
     let anchor = match Anchor::open(dir.path()) {
@@ -11986,9 +10663,8 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
         let how = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY);
         let mode = Mode::from_bits_truncate(0o755);
         fs.mkdir_path(who, &anchor, c"a/../b", mode, how, move |d, _fs| {
-            // Fired inline, before `mkdir_path` returned: the screen
-            // answers rather than dropping, and the reply below is
-            // injected ahead of the `Defer` verdict being processed.
+            // Fired inline, before `mkdir_path` returned: the screen answers rather than dropping, and the reply below
+            // is injected ahead of the `Defer` verdict being processed.
             let verdict = match d.result() {
                 Err(truenas_ros::Error::Errno(e)) if d.was_refused() => {
                     format!("refused:{e:?}")
@@ -12001,11 +10677,7 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -12019,8 +10691,7 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -12036,9 +10707,7 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
         stop.shutdown();
         out
     });
-    server
-        .serve_forever()
-        .expect("serve_forever mkdir_path refusal");
+    server.serve_forever().expect("serve_forever mkdir_path refusal");
     let got = client.join().unwrap().expect("client io");
     assert_eq!(
         got.expect("the handler answered instead of shedding the peer"),
@@ -12050,20 +10719,17 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
         "a refused path creates nothing"
     );
 }
-/// `FsConn::mkdir_path` answers with a directory or with nothing: a `how`
-/// that would make the final open produce a *file* is refused.
+/// `FsConn::mkdir_path` answers with a directory or with nothing: a `how` that would make the final open produce a
+/// *file* is refused.
 ///
-/// `O_CREAT` is the case that bites. The probe opens the whole path, so
-/// with `a/b` present and `c` missing it would create a regular file `c`
-/// and hand it back as though the tree had been built - success, wrong
-/// object, nothing on the wire to say so. The kernel does refuse
-/// `O_DIRECTORY | O_CREAT` (`build_open_flags`, `fs/open.c:1278-1284`),
+/// `O_CREAT` is the case that bites. The probe opens the whole path, so with `a/b` present and `c` missing it would
+/// create a regular file `c` and hand it back as though the tree had been built - success, wrong object, nothing on the
+/// wire to say so. The kernel does refuse `O_DIRECTORY | O_CREAT` (`build_open_flags`, `fs/open.c:1278-1284`),
 /// but only at the syscall, by which point the walk has created the tree;
 /// the refusal here happens before anything is submitted.
 ///
-/// `O_TMPFILE` is the case that hides: it is `__O_TMPFILE | O_DIRECTORY`,
-/// so forcing `O_DIRECTORY` does not exclude it and a naive
-/// `flags & O_TMPFILE` test matches every plain directory open.
+/// `O_TMPFILE` is the case that hides: it is `__O_TMPFILE | O_DIRECTORY`, so forcing `O_DIRECTORY` does not exclude it
+/// and a naive `flags & O_TMPFILE` test matches every plain directory open.
 ///
 /// Both refusals answer the callback inline with a marked `EINVAL`;
 /// the handler replies, and the peer keeps its connection.
@@ -12077,8 +10743,8 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
     use truenas_ros::uring_fs::{Anchor, Personality};
 
     let dir = truenas_ros::tempdir().unwrap();
-    // The parents exist and the leaf does not - exactly the shape where an
-    // `O_CREAT` probe would succeed by creating a regular file.
+    // The parents exist and the leaf does not - exactly the shape where an `O_CREAT` probe would succeed by creating a
+    // regular file.
     std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
     let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
     let anchor = match Anchor::open(dir.path()) {
@@ -12102,18 +10768,13 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
             0 => OFlag::O_RDONLY | OFlag::O_CREAT,
             _ => OFlag::O_RDWR | OFlag::O_TMPFILE,
         };
-        let how = OpenHow::new()
-            .flags(flags)
-            .mode(Mode::from_bits_truncate(0o644));
+        let how = OpenHow::new().flags(flags).mode(Mode::from_bits_truncate(0o644));
         let mode = Mode::from_bits_truncate(0o755);
         fs.mkdir_path(who, &anchor, c"a/b/c", mode, how, move |d, _fs| {
-            // Fired inline with the marked refusal; see the sibling
-            // test for the ordering this rides on.
+            // Fired inline with the marked refusal; see the sibling test for the ordering this rides on.
             let ok = matches!(
                 d.result(),
-                Err(truenas_ros::Error::Errno(
-                    truenas_ros::errno::Errno::EINVAL
-                ))
+                Err(truenas_ros::Error::Errno(truenas_ros::errno::Errno::EINVAL))
             ) && d.was_refused();
             deferred.reply(echo_frame(if ok { b"refused" } else { b"wrong" }));
         });
@@ -12121,11 +10782,7 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
     };
     let protocol = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body,
     };
     let cfg = ServerConfig {
@@ -12139,8 +10796,7 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -12160,9 +10816,7 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
         stop.shutdown();
         out
     });
-    server
-        .serve_forever()
-        .expect("serve_forever mkdir_path how");
+    server.serve_forever().expect("serve_forever mkdir_path how");
     let answered = client.join().unwrap().expect("client io");
     assert_eq!(
         answered,
@@ -12180,16 +10834,13 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
 
 // ---- the registered recv-buffer pool --------------------------------------
 
-/// Registering the ring is best-effort - a kernel that refuses leaves the
-/// server running with connections owning their buffers - so every pooled
-/// test has to say out loud that it got a pool. Without this they all pass
-/// against the fallback and prove nothing about the ring.
+/// Registering the ring is best-effort - a kernel that refuses leaves the server running with connections owning their
+/// buffers - so every pooled test has to say out loud that it got a pool. Without this they all pass against the
+/// fallback and prove nothing about the ring.
 fn assert_pool_registered(s: &truenas_ros::net::server::ServerStats) {
-    // Named separately, because the two reasons for `recv_bufs_total == 0`
-    // want different actions from whoever reads the failure: a kernel with
-    // no provided-buffer rings is environmental, and `RLIMIT_MEMLOCK`
-    // refusing their region is `ulimit -l` on this host - which the
-    // per-uid accounting makes reachable from an unrelated process.
+    // Named separately, because the two reasons for `recv_bufs_total == 0` want different actions from whoever reads
+    // the failure: a kernel with no provided-buffer rings is environmental, and `RLIMIT_MEMLOCK` refusing their region
+    // is `ulimit -l` on this host - which the per-uid accounting makes reachable from an unrelated process.
     assert_eq!(
         s.buf_rings_refused_memlock, 0,
         "RLIMIT_MEMLOCK refused a buffer ring - raise `ulimit -l`: {s:?}"
@@ -12201,15 +10852,12 @@ fn assert_pool_registered(s: &truenas_ros::net::server::ServerStats) {
     );
 }
 
-/// Concurrent connections over a pool, each sending several messages, with
-/// `max_request_bytes` low enough that a pool buffer is a few KiB rather than
-/// a megabyte. Proves the whole acquisition path: `IOSQE_BUFFER_SELECT` on the
-/// arm, the buffer id off the completion, framing and delivery out of pool
-/// memory, and the hand-back.
+/// Concurrent connections over a pool, each sending several messages, with `max_request_bytes` low enough that a pool
+/// buffer is a few KiB rather than a megabyte. Proves the whole acquisition path: `IOSQE_BUFFER_SELECT` on the arm, the
+/// buffer id off the completion, framing and delivery out of pool memory, and the hand-back.
 ///
-/// The bytes are the point. A buffer adopted at the wrong offset, or released
-/// while still holding a pipelined remainder, corrupts the echo rather than
-/// failing an assertion about the pool.
+/// The bytes are the point. A buffer adopted at the wrong offset, or released while still holding a pipelined
+/// remainder, corrupts the echo rather than failing an assertion about the pool.
 #[test]
 fn a_pooled_server_echoes_what_an_owned_one_does() {
     const N: usize = 12;
@@ -12220,11 +10868,8 @@ fn a_pooled_server_echoes_what_an_owned_one_does() {
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -12241,20 +10886,18 @@ fn a_pooled_server_echoes_what_an_owned_one_does() {
             .map(|_i| {
                 thread::spawn(move || {
                     let s = connect_tcp(v4)?;
-                    // Sizes that straddle the 4 KiB scanning read, so a
-                    // message spans several recvs into the same buffer.
+                    // Sizes that straddle the 4 KiB scanning read, so a message spans several recvs into the same
+                    // buffer.
                     let msgs: Vec<Vec<u8>> = (0..PER_CONN)
                         .map(|j| (b'a' + (j as u8), 500 + j * 900))
                         .map(|(b, n)| vec![b; n])
                         .collect();
-                    let refs: Vec<&[u8]> =
-                        msgs.iter().map(Vec::as_slice).collect();
+                    let refs: Vec<&[u8]> = msgs.iter().map(Vec::as_slice).collect();
                     framed_roundtrips(s, &refs).map(|e| (msgs, e))
                 })
             })
             .collect();
-        let out: Vec<_> =
-            clients.into_iter().map(|c| c.join().unwrap()).collect();
+        let out: Vec<_> = clients.into_iter().map(|c| c.join().unwrap()).collect();
         stop.shutdown();
         out
     });
@@ -12265,17 +10908,15 @@ fn a_pooled_server_echoes_what_an_owned_one_does() {
         assert_eq!(got, sent, "echo must be byte-identical over a pool");
     }
 
-    // Every connection is gone, so every buffer is back. A pool that leaks
-    // one leaks it forever: `BufPool::rebalance` retires a group only at
-    // `lent() == 0`, so the pool could then never shrink either.
+    // Every connection is gone, so every buffer is back. A pool that leaks one leaks it forever: `BufPool::rebalance`
+    // retires a group only at `lent() == 0`, so the pool could then never shrink either.
     let s = stats.snapshot();
     assert_pool_registered(&s);
     assert_eq!(s.recv_bufs_lent, 0, "buffers outstanding after every close");
 }
 
-/// The recv pool starts at what its config buys: capped by the lease depth
-/// or the byte cap, or the byte budget over the buffer size. Read before
-/// any traffic.
+/// The recv pool starts at what its config buys: capped by the lease depth or the byte cap, or the byte budget over the
+/// buffer size. Read before any traffic.
 #[test]
 fn the_recv_pool_is_sized_by_its_config() {
     const CONNS: u32 = 2;
@@ -12298,13 +10939,9 @@ fn the_recv_pool_is_sized_by_its_config() {
             buf_pool_max_bytes: cap,
             ..ServerConfig::default()
         };
-        let addr =
-            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-        let server = match Server::with_config(
-            [addr],
-            cfg,
-            length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-        ) {
+        let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+        {
             Ok(s) => s,
             Err(e) if should_skip(&e) => return,
             Err(e) => panic!("bind: {e}"),
@@ -12318,17 +10955,15 @@ fn the_recv_pool_is_sized_by_its_config() {
     }
 }
 
-/// The property the pool exists for: a connection parked between requests
-/// holds no buffer, so buffer memory tracks concurrent *arrivals* and not the
-/// connection count.
+/// The property the pool exists for: a connection parked between requests holds no buffer, so buffer memory tracks
+/// concurrent *arrivals* and not the connection count.
 ///
-/// Measured with more idle connections than the pool starts with buffers -
-/// which an owned-buffer server would need one apiece for, and which a pool
-/// that held them across the idle gap would have to grow to cover.
+/// Measured with more idle connections than the pool starts with buffers - which an owned-buffer server would need one
+/// apiece for, and which a pool that held them across the idle gap would have to grow to cover.
 #[test]
 fn an_idle_pooled_connection_holds_no_buffer() {
-    // Each buffer carries a chunk of slack, so the budget buys fewer than
-    // `BUDGET / BUF`, and `IDLE` connections outnumber them.
+    // Each buffer carries a chunk of slack, so the budget buys fewer than `BUDGET / BUF`, and `IDLE` connections
+    // outnumber them.
     const BUF: usize = 64 * 1024;
     const BUDGET: usize = 16 * BUF;
     const IDLE: usize = BUDGET / BUF + 1;
@@ -12339,11 +10974,8 @@ fn an_idle_pooled_connection_holds_no_buffer() {
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -12363,8 +10995,7 @@ fn an_idle_pooled_connection_holds_no_buffer() {
 
     let coordinator = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
-        // Open them all, round-trip once each so each has certainly been
-        // served, then hold them open and idle.
+        // Open them all, round-trip once each so each has certainly been served, then hold them open and idle.
         let mut held = Vec::new();
         for i in 0..IDLE {
             let mut s = connect_tcp(v4).expect("connect");
@@ -12373,8 +11004,8 @@ fn an_idle_pooled_connection_holds_no_buffer() {
             assert_eq!(echo, format!("req-{i}").into_bytes());
             held.push(s);
         }
-        // All served, all parked on an idle recv. The last reply's send
-        // completion can still be in flight, so settle rather than sample.
+        // All served, all parked on an idle recv. The last reply's send completion can still be in flight, so settle
+        // rather than sample.
         let deadline = Instant::now() + Duration::from_secs(5);
         let idle = loop {
             let s = stats.snapshot();
@@ -12405,17 +11036,14 @@ fn an_idle_pooled_connection_holds_no_buffer() {
     );
 }
 
-/// The pool under kTLS, where the recv is a `RECVMSG` carrying a control
-/// buffer for the record type rather than a plain `RECV`.
+/// The pool under kTLS, where the recv is a `RECVMSG` carrying a control buffer for the record type rather than a plain
+/// `RECV`.
 ///
-/// Worth its own test because the two features meet in the kernel's msghdr
-/// import: `io_recvmsg_copy_hdr` skips `io_net_import_vec` entirely when
-/// `REQ_F_BUFFER_SELECT` is set (`io_uring/net.c:746-751`), so the iovec this
-/// side supplies is never read for its address - but `io_msg_copy_hdr` still
-/// copies the iovec *struct* to take its length
-/// (`net.c:327-339`, `-EINVAL` above one segment) and still honours
-/// `msg_control`. A payload spanning several TLS records exercises the
-/// resume-at-an-offset continuation into a buffer the kernel chose.
+/// Worth its own test because the two features meet in the kernel's msghdr import: `io_recvmsg_copy_hdr` skips
+/// `io_net_import_vec` entirely when `REQ_F_BUFFER_SELECT` is set (`io_uring/net.c:746-751`), so the iovec this side
+/// supplies is never read for its address - but `io_msg_copy_hdr` still copies the iovec *struct* to take its length
+/// (`net.c:327-339`, `-EINVAL` above one segment) and still honours `msg_control`. A payload spanning several TLS
+/// records exercises the resume-at-an-offset continuation into a buffer the kernel chose.
 #[test]
 fn a_pooled_connection_still_reads_over_ktls() {
     if ktls_openssl_unsupported() {
@@ -12435,11 +11063,7 @@ fn a_pooled_connection_still_reads_over_ktls() {
         false,
         |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
     );
-    let mut server = match Server::with_config(
-        [truenas_ros::net::server::Listen::tls(addr)],
-        cfg,
-        proto,
-    ) {
+    let mut server = match Server::with_config([truenas_ros::net::server::Listen::tls(addr)], cfg, proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -12468,8 +11092,8 @@ fn a_pooled_connection_still_reads_over_ktls() {
                 send_framed(&mut s, msg)?;
                 assert_eq!(recv_framed(&mut s)?, msg, "kTLS echo over a pool");
             }
-            // Well past the 16 KiB TLS record cap, so the exact read
-            // completes short and resumes at an offset into the pool buffer.
+            // Well past the 16 KiB TLS record cap, so the exact read completes short and resumes at an offset into the
+            // pool buffer.
             let big = vec![0x5au8; 40 * 1024];
             send_framed(&mut s, &big)?;
             assert_eq!(recv_framed(&mut s)?, big, "multi-record body");
@@ -12486,29 +11110,24 @@ fn a_pooled_connection_still_reads_over_ktls() {
     assert!(s.requests >= 3, "requests: {s:?}");
 }
 
-/// A message larger than a pool buffer promotes to owned storage and is
-/// served whole, rather than being refused for outgrowing its buffer.
+/// A message larger than a pool buffer promotes to owned storage and is served whole, rather than being refused for
+/// outgrowing its buffer.
 ///
-/// This is what lets the buffer size be a free parameter instead of
-/// `max_request_bytes`: the copy is bounded by the buffer, and the
-/// connection returns to the pool once the message is consumed.
+/// This is what lets the buffer size be a free parameter instead of `max_request_bytes`: the copy is bounded by the
+/// buffer, and the connection returns to the pool once the message is consumed.
 #[test]
 fn a_message_larger_than_a_pool_buffer_promotes_and_still_echoes() {
     let cfg = ServerConfig {
         pool_size: 8,
         max_request_bytes: 4 * 1024 * 1024,
-        // Placement would divert the big body into its own allocation and
-        // the accumulate buffer would never have to grow - which is a real
-        // path, but not this one.
+        // Placement would divert the big body into its own allocation and the accumulate buffer would never have to
+        // grow - which is a real path, but not this one.
         body_placement_threshold: None,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config(
-        [addr],
-        cfg,
-        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
-    ) {
+    let mut server = match Server::with_config([addr], cfg, length_prefixed(PrefixWidth::U32, Endian::Big, false, echo))
+    {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind: {e}"),
@@ -12522,9 +11141,8 @@ fn a_message_larger_than_a_pool_buffer_promotes_and_still_echoes() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
         let s = connect_tcp(v4).expect("connect");
-        // Well past the pooled buffer, then a small one after it: the
-        // second proves the connection went back to the pool rather than
-        // being left owning the promoted buffer.
+        // Well past the pooled buffer, then a small one after it: the second proves the connection went back to the
+        // pool rather than being left owning the promoted buffer.
         let big = vec![0xa5u8; 512 * 1024];
         let msgs: Vec<&[u8]> = vec![&big, b"after"];
         let echoes = framed_roundtrips(s, &msgs).expect("client io");
@@ -12542,10 +11160,8 @@ fn a_message_larger_than_a_pool_buffer_promotes_and_still_echoes() {
     assert_eq!(s.recv_bufs_lent, 0, "buffer outstanding at close: {s:?}");
 }
 
-/// A framer that consumes its own header, then declares a body with
-/// `header_len: 0` - the shape a streaming codec has for every message
-/// after the first, and the one that puts a placed body read on a
-/// connection with nothing buffered.
+/// A framer that consumes its own header, then declares a body with `header_len: 0` - the shape a streaming codec has
+/// for every message after the first, and the one that puts a placed body read on a connection with nothing buffered.
 fn split_header(buf: &[u8], pending: &mut usize) -> Framing {
     if *pending > 0 {
         // Header already delivered and drained: the body stands alone.
@@ -12565,26 +11181,22 @@ fn split_header(buf: &[u8], pending: &mut usize) -> Framing {
     }
 }
 
-/// A placed body reads into its own allocation, so it must not also be
-/// handed a pool buffer.
+/// A placed body reads into its own allocation, so it must not also be handed a pool buffer.
 ///
-/// The kernel clamps a selecting read to the length of the buffer it picks
-/// (`io_ring_buffer_select`, `io_uring/kbuf.c`), so an exact read longer
-/// than a pool buffer completes short of what the frame declared - which the
-/// reactor can only read as a truncated message, and the connection dies
-/// mid-request.
+/// The kernel clamps a selecting read to the length of the buffer it picks (`io_ring_buffer_select`,
+/// `io_uring/kbuf.c`), so an exact read longer than a pool buffer completes short of what the frame declared - which
+/// the reactor can only read as a truncated message, and the connection dies mid-request.
 ///
-/// It takes a `header_len: 0` frame to reach: with a header buffered the
-/// connection is already holding a claim and asks for nothing. That is why
-/// this carries its own framer rather than reusing the length-prefixed one.
+/// It takes a `header_len: 0` frame to reach: with a header buffered the connection is already holding a claim and asks
+/// for nothing. That is why this carries its own framer rather than reusing the length-prefixed one.
 #[test]
 fn a_placed_body_never_takes_a_pool_buffer() {
     const N: usize = 512 * 1024;
     let cfg = ServerConfig {
         pool_size: 8,
         max_request_bytes: 4 * 1024 * 1024,
-        // Low enough that the body below is placed, and far below the
-        // message size, so a buffer taken here would be far too small.
+        // Low enough that the body below is placed, and far below the message size, so a buffer taken here would be far
+        // too small.
         body_placement_threshold: Some(8 * 1024),
         ..ServerConfig::default()
     };
@@ -12593,8 +11205,7 @@ fn a_placed_body_never_takes_a_pool_buffer() {
         accept: |_: Incoming<'_>| Some(0usize),
         header: split_header,
         body: |req: Request<'_, usize>| {
-            // The body message clears the pending count; the header-only
-            // message that set it replies with nothing.
+            // The body message clears the pending count; the header-only message that set it replies with nothing.
             if req.body.is_empty() {
                 return Response::Reply(Vec::new());
             }
@@ -12636,17 +11247,14 @@ fn a_placed_body_never_takes_a_pool_buffer() {
     assert_eq!(s.recv_bufs_lent, 0, "buffer outstanding at close: {s:?}");
 }
 
-/// A burst of file bodies wider than the ring's current buffer count must
-/// grow the ring and serve every one - never shed.
+/// A burst of file bodies wider than the ring's current buffer count must grow the ring and serve every one - never
+/// shed.
 ///
-/// The kernel picks a provided buffer when the read completes, so a burst
-/// can always outrun what is posted and the shortage arrives as `-ENOBUFS`
-/// on the pump read's completion. Treating that as a read failure closes
-/// the connection mid-body; it is pressure, and the answer is to grow (or,
-/// if the pool cannot, to re-issue the read with an owned buffer). The
-/// barrier makes the burst genuinely simultaneous: every client fires its
-/// request in the same instant against a ring that starts with fewer
-/// buffers than their first reads want.
+/// The kernel picks a provided buffer when the read completes, so a burst can always outrun what is posted and the
+/// shortage arrives as `-ENOBUFS` on the pump read's completion. Treating that as a read failure closes the connection
+/// mid-body; it is pressure, and the answer is to grow (or, if the pool cannot, to re-issue the read with an owned
+/// buffer). The barrier makes the burst genuinely simultaneous: every client fires its request in the same instant
+/// against a ring that starts with fewer buffers than their first reads want.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
@@ -12665,8 +11273,7 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
     const SIZE: usize = CHUNKS_PER_BODY * CHUNK;
 
     let dir = truenas_ros::tempdir().unwrap();
-    std::fs::write(dir.path().join("obj"), vec![0x42u8; SIZE])
-        .expect("fixture");
+    std::fs::write(dir.path().join("obj"), vec![0x42u8; SIZE]).expect("fixture");
 
     // One open through a standalone fs host, cloned per request.
     let mut afs = match UringFs::new(FsConfig::default()) {
@@ -12681,12 +11288,7 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
     let (ftx, frx) = mpsc::channel();
     thread::scope(|sc| {
         sc.spawn(move || {
-            let r = handle.open(
-                who,
-                &anchor,
-                c"obj",
-                OpenHow::new().flags(OFlag::O_RDONLY),
-            );
+            let r = handle.open(who, &anchor, c"obj", OpenHow::new().flags(OFlag::O_RDONLY));
             let _ = ftx.send(r);
             stop_fs.shutdown();
         });
@@ -12706,20 +11308,13 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
     let (sent_srv, held_srv) = (Arc::clone(&sent), Arc::clone(&held));
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |_req: Request<'_, ()>| {
-            // Hold the reactor until every request is on the wire, so the
-            // body reads go out in one submission, ahead of any growth.
-            // Spread across batches, grow-ahead keeps the ring from dry.
+            // Hold the reactor until every request is on the wire, so the body reads go out in one submission, ahead of
+            // any growth. Spread across batches, grow-ahead keeps the ring from dry.
             if !held_srv.swap(true, Ordering::Relaxed) {
                 let deadline = Instant::now() + Duration::from_secs(10);
-                while sent_srv.load(Ordering::Acquire) < CONNS
-                    && Instant::now() < deadline
-                {
+                while sent_srv.load(Ordering::Acquire) < CONNS && Instant::now() < deadline {
                     thread::sleep(Duration::from_millis(1));
                 }
             }
@@ -12766,17 +11361,13 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
                     let mut got = vec![0u8; CHUNK];
                     for _ in 0..CHUNKS_PER_BODY {
                         s.read_exact(&mut got)?;
-                        assert!(
-                            got.iter().all(|&b| b == 0x42),
-                            "body corrupted under buffer pressure"
-                        );
+                        assert!(got.iter().all(|&b| b == 0x42), "body corrupted under buffer pressure");
                     }
                     Ok(())
                 })
             })
             .collect();
-        let results: Vec<_> =
-            clients.into_iter().map(|c| c.join().unwrap()).collect();
+        let results: Vec<_> = clients.into_iter().map(|c| c.join().unwrap()).collect();
         stop.shutdown();
         results
     });
@@ -12794,10 +11385,7 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
         .collect();
     assert!(shed.is_empty(), "bodies shed as read failures: {shed:?}");
     let s = stats.snapshot();
-    assert_eq!(
-        s.recv_bufs_lent, 0,
-        "buffers outstanding after close: {s:?}"
-    );
+    assert_eq!(s.recv_bufs_lent, 0, "buffers outstanding after close: {s:?}");
     // The premise: some read found the ring dry.
     assert!(
         s.buf_shortages > 0,
@@ -12805,24 +11393,17 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
     );
 }
 
-/// A pump completion that closes the connection must still return its
-/// buffer to the ring.
+/// A pump completion that closes the connection must still return its buffer to the ring.
 ///
-/// Every completion carrying `IORING_CQE_F_BUFFER` consumed its
-/// descriptor: the kernel puts the kbuf with no guard on the result
-/// (`io_req_rw_complete`, `io_uring/rw.c:591`), and an EOF read is the
-/// measured proof - it completes `res = 0` with the flag set and the
-/// ring's head advanced. So the truncated-body close (`n == 0`, the file
-/// shrank under a committed `Content-Length`) is a completion that both
-/// carries a buffer and abandons the transfer: exactly the exit class that
-/// must requeue. Skipping it strands the id - the pool still counts it
-/// posted, so it neither re-posts it nor grows to replace it - while
-/// `recv_bufs_lent` stays innocently at zero, and the ring drains one
-/// abandoned body at a time until every read comes back `-ENOBUFS`. The same
-/// duty holds on the racier exits of that class (a completion landing on a
-/// closing or recycled slot), which share this arm's fix but cannot be
-/// scheduled deterministically from a test; `rw.c:591` is the authority
-/// that they owe the id all the same.
+/// Every completion carrying `IORING_CQE_F_BUFFER` consumed its descriptor: the kernel puts the kbuf with no guard on
+/// the result (`io_req_rw_complete`, `io_uring/rw.c:591`), and an EOF read is the measured proof - it completes `res =
+/// 0` with the flag set and the ring's head advanced. So the truncated-body close (`n == 0`, the file shrank under a
+/// committed `Content-Length`) is a completion that both carries a buffer and abandons the transfer: exactly the exit
+/// class that must requeue. Skipping it strands the id - the pool still counts it posted, so it neither re-posts it nor
+/// grows to replace it - while `recv_bufs_lent` stays innocently at zero, and the ring drains one abandoned body at a
+/// time until every read comes back `-ENOBUFS`. The same duty holds on the racier exits of that class (a completion
+/// landing on a closing or recycled slot), which share this arm's fix but cannot be scheduled deterministically from a
+/// test; `rw.c:591` is the authority that they owe the id all the same.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_truncated_body_close_returns_its_buffer() {
@@ -12834,10 +11415,9 @@ fn a_truncated_body_close_returns_its_buffer() {
     const POOL_SIZE: u32 = 32;
 
     let dir = truenas_ros::tempdir().unwrap();
-    // Half a chunk on disk, four chunks declared: read one short chunk,
-    // then hit EOF - a completion with a buffer and nothing in it.
-    std::fs::write(dir.path().join("obj"), vec![0x51u8; CHUNK / 2])
-        .expect("fixture");
+    // Half a chunk on disk, four chunks declared: read one short chunk, then hit EOF - a completion with a buffer and
+    // nothing in it.
+    std::fs::write(dir.path().join("obj"), vec![0x51u8; CHUNK / 2]).expect("fixture");
 
     let mut afs = match UringFs::new(FsConfig::default()) {
         Ok(f) => f,
@@ -12851,12 +11431,7 @@ fn a_truncated_body_close_returns_its_buffer() {
     let (ftx, frx) = mpsc::channel();
     thread::scope(|sc| {
         sc.spawn(move || {
-            let r = handle.open(
-                who,
-                &anchor,
-                c"obj",
-                OpenHow::new().flags(OFlag::O_RDONLY),
-            );
+            let r = handle.open(who, &anchor, c"obj", OpenHow::new().flags(OFlag::O_RDONLY));
             let _ = ftx.send(r);
             stop_fs.shutdown();
         });
@@ -12876,11 +11451,7 @@ fn a_truncated_body_close_returns_its_buffer() {
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |_req: Request<'_, ()>| Response::ReplyFile {
             head: b"H".to_vec(),
             file: file.clone(),
@@ -12908,22 +11479,15 @@ fn a_truncated_body_close_returns_its_buffer() {
         let _stop = ShutdownOnDrop(stop.clone());
         for i in 0..rounds {
             let mut s = connect_tcp(v4).expect("connect");
-            // A ring of stranded ids never delivers the body: a stall
-            // fails the round instead of hanging the test.
-            s.set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("read timeout");
+            // A ring of stranded ids never delivers the body: a stall fails the round instead of hanging the test.
+            s.set_read_timeout(Some(Duration::from_secs(5))).expect("read timeout");
             s.write_all(&1u32.to_be_bytes()).expect("len");
             s.write_all(b"g").expect("req");
-            // The server sends the head and the short chunk, then closes
-            // mid-body on the EOF. Drain to the reset/EOF.
+            // The server sends the head and the short chunk, then closes mid-body on the EOF. Drain to the reset/EOF.
             let mut sink = Vec::new();
             if let Err(e) = s.read_to_end(&mut sink) {
                 assert!(
-                    !matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                    ),
+                    !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
                     "round {i}: the body stalled after {} bytes - the ring \
                      ran out of buffers",
                     sink.len()
@@ -12955,10 +11519,9 @@ fn a_truncated_body_close_returns_its_buffer() {
     assert_eq!(s.recv_bufs_lent, 0, "buffers outstanding: {s:?}");
 }
 
-/// A two-phase length-prefixed framer: deliver the 4-byte prefix, then ask
-/// for the payload with `Framing::Need`. The payload read therefore starts
-/// with nothing buffered and no claim held, which is the state that reaches
-/// the pool-buffer decision.
+/// A two-phase length-prefixed framer: deliver the 4-byte prefix, then ask for the payload with `Framing::Need`. The
+/// payload read therefore starts with nothing buffered and no claim held, which is the state that reaches the
+/// pool-buffer decision.
 fn need_payload(buf: &[u8], pending: &mut usize) -> Framing {
     if *pending > 0 {
         if buf.len() < *pending {
@@ -12983,14 +11546,11 @@ fn need_payload(buf: &[u8], pending: &mut usize) -> Framing {
 
 /// An exact read larger than one pool buffer takes an owned buffer.
 ///
-/// `frame_step` admits a `Framing::Need(n)` up to `max_request_bytes` and
-/// turns it into an *exact* `ReadHeader`, and `ReadHeader` carries no
-/// placement flag - so without the size test at the arm this read is armed
-/// with `IOSQE_BUFFER_SELECT`, the kernel clamps it to the buffer it picked
-/// (`io_ring_buffer_select`, `io_uring/kbuf.c`), and the connection dies
-/// `TruncatedMessage` having answered nothing. Default config: the pool
-/// buffer is 266 240 bytes and `max_request_bytes` is 1 MiB, so every
-/// `Need` between them is in this window.
+/// `frame_step` admits a `Framing::Need(n)` up to `max_request_bytes` and turns it into an *exact* `ReadHeader`, and
+/// `ReadHeader` carries no placement flag - so without the size test at the arm this read is armed with
+/// `IOSQE_BUFFER_SELECT`, the kernel clamps it to the buffer it picked (`io_ring_buffer_select`, `io_uring/kbuf.c`),
+/// and the connection dies `TruncatedMessage` having answered nothing. Default config: the pool buffer is 266 240 bytes
+/// and `max_request_bytes` is 1 MiB, so every `Need` between them is in this window.
 #[test]
 fn an_exact_read_over_the_pool_buffer_takes_an_owned_one() {
     const N: usize = 512 * 1024;
@@ -13044,39 +11604,30 @@ fn an_exact_read_over_the_pool_buffer_takes_an_owned_one() {
     });
     assert_eq!(got.len(), N, "the whole payload came back");
     assert!(got.iter().all(|&b| b == 0x77), "and unmangled");
-    assert_eq!(
-        s.recv_bufs_lent, 0,
-        "the pool settles back to nothing lent: {s:?}"
-    );
+    assert_eq!(s.recv_bufs_lent, 0, "the pool settles back to nothing lent: {s:?}");
 }
 
 /// A redelivery must not be handed the *read-ahead* frame.
 ///
-/// `Deferred::redeliver` documents that the handler runs again "with an
-/// empty frame (the original bytes were consumed at first delivery)".
-/// Nothing enforced it. Above the default read-ahead cap the pump can have
-/// framed the next pipelined request already - `set_frame(header_len,
-/// body_len)` recorded, its body still in flight - and the redelivery then
-/// built that message's `Body` out of a buffer holding only its header:
-/// `Body::inline(&rest[..body_len])` with `rest` empty, an out-of-range
-/// slice that panics the reactor thread and takes `serve_forever` with it.
-/// Bounds checks ship, so release panicked too.
+/// `Deferred::redeliver` documents that the handler runs again "with an empty frame (the original bytes were consumed
+/// at first delivery)". Nothing enforced it. Above the default read-ahead cap the pump can have framed the next
+/// pipelined request already - `set_frame(header_len, body_len)` recorded, its body still in flight - and the
+/// redelivery then built that message's `Body` out of a buffer holding only its header:
+/// `Body::inline(&rest[..body_len])` with `rest` empty, an out-of-range slice that panics the reactor thread and takes
+/// `serve_forever` with it. Bounds checks ship, so release panicked too.
 ///
-/// Even short of the panic the state was wrong: `deliver_one`'s epilogue
-/// drains `frame_len().min(buffered)`, so a foreign frame ate the next
-/// request's header and desynced the stream.
+/// Even short of the panic the state was wrong: `deliver_one`'s epilogue drains `frame_len().min(buffered)`, so a
+/// foreign frame ate the next request's header and desynced the stream.
 ///
-/// The in-tree http codec never reaches this (`Phase::Parked` holds
-/// pipelined bytes unframed), so the control has to be a framer that does
-/// what `Protocol::header` allows: frame whatever is buffered.
+/// The in-tree http codec never reaches this (`Phase::Parked` holds pipelined bytes unframed), so the control has to be
+/// a framer that does what `Protocol::header` allows: frame whatever is buffered.
 #[test]
 fn a_redelivery_does_not_take_the_read_ahead_frame() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let cfg = ServerConfig {
-        // Read-ahead is the precondition: at the default cap of one the pump
-        // stops while the first request is outstanding and never frames the
-        // second.
+        // Read-ahead is the precondition: at the default cap of one the pump stops while the first request is
+        // outstanding and never frames the second.
         max_in_flight_requests: 2,
         ..ServerConfig::default()
     };
@@ -13084,17 +11635,12 @@ fn a_redelivery_does_not_take_the_read_ahead_frame() {
     let seen2 = Arc::clone(&seen);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
             let nth = seen2.fetch_add(1, Ordering::SeqCst);
             match nth {
-                // The first request parks, and is answered off-thread by a
-                // redelivery long enough afterwards for the peer's second
-                // request head to have landed and been framed.
+                // The first request parks, and is answered off-thread by a redelivery long enough afterwards for the
+                // peer's second request head to have landed and been framed.
                 0 => {
                     let (deferred, permit) = req.responder.defer();
                     thread::spawn(move || {
@@ -13103,8 +11649,7 @@ fn a_redelivery_does_not_take_the_read_ahead_frame() {
                     });
                     Response::Defer(permit)
                 }
-                // The redelivery: an empty frame, whatever the pump has
-                // recorded for the request behind it.
+                // The redelivery: an empty frame, whatever the pump has recorded for the request behind it.
                 1 => {
                     assert!(
                         req.body.is_empty(),
@@ -13113,8 +11658,8 @@ fn a_redelivery_does_not_take_the_read_ahead_frame() {
                     );
                     Response::Reply(echo_frame(b"first"))
                 }
-                // The pipelined request, delivered from its own frame once
-                // its body arrives - intact, not short a header.
+                // The pipelined request, delivered from its own frame once its body arrives - intact, not short a
+                // header.
                 _ => Response::Reply(echo_frame(&req.body)),
             }
         },
@@ -13135,8 +11680,8 @@ fn a_redelivery_does_not_take_the_read_ahead_frame() {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"A")?;
             thread::sleep(Duration::from_millis(50));
-            // The second request's *header* only: the pump frames it and
-            // arms an exact read for a body that has not been sent.
+            // The second request's *header* only: the pump frames it and arms an exact read for a body that has not
+            // been sent.
             s.write_all(&8u32.to_be_bytes())?;
             s.flush()?;
             thread::sleep(Duration::from_millis(250)); // the redelivery lands
@@ -13152,25 +11697,19 @@ fn a_redelivery_does_not_take_the_read_ahead_frame() {
 
     server.serve_forever().expect("serve_forever");
     client.join().expect("thread join").expect("client io");
-    assert_eq!(
-        seen.load(Ordering::SeqCst),
-        3,
-        "park, redelivery, pipelined"
-    );
+    assert_eq!(seen.load(Ordering::SeqCst), 3, "park, redelivery, pipelined");
 }
 
 /// A redelivery must not retire the receipt budget of the message behind it.
 ///
-/// The budget belongs to whatever is *arriving*. A redelivered request was
-/// consumed - and its own budget retired - at its first delivery, so the
-/// only budget armed when a worker's `redeliver` lands belongs to a later
-/// message the read-ahead has begun. Cancelling it there restarts the one
-/// bound `max_receipt_time` exists to make un-restartable, and when the
-/// next read is already in flight (an exact body read) nothing re-arms it
-/// at all: the trickling peer is then never reclaimed.
+/// The budget belongs to whatever is *arriving*. A redelivered request was consumed - and its own budget retired - at
+/// its first delivery, so the only budget armed when a worker's `redeliver` lands belongs to a later message the
+/// read-ahead has begun. Cancelling it there restarts the one bound `max_receipt_time` exists to make un-restartable,
+/// and when the next read is already in flight (an exact body read) nothing re-arms it at all: the trickling peer is
+/// then never reclaimed.
 ///
-/// The trickle is half `request_timeout`, so that clock is satisfied
-/// throughout and the close reason names which one fired.
+/// The trickle is half `request_timeout`, so that clock is satisfied throughout and the close reason names which one
+/// fired.
 #[test]
 fn a_redelivery_does_not_retire_the_next_message_budget() {
     use std::sync::Mutex;
@@ -13187,17 +11726,12 @@ fn a_redelivery_does_not_retire_the_next_message_budget() {
     let seen2 = Arc::clone(&seen);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
             if seen2.fetch_add(1, Ordering::SeqCst) == 0 {
                 let (deferred, permit) = req.responder.defer();
                 thread::spawn(move || {
-                    // After the second request's budget is armed and its
-                    // exact body read is in flight.
+                    // After the second request's budget is armed and its exact body read is in flight.
                     thread::sleep(Duration::from_millis(400));
                     deferred.redeliver();
                 });
@@ -13236,9 +11770,8 @@ fn a_redelivery_does_not_retire_the_next_message_budget() {
                 }
                 thread::sleep(Duration::from_millis(150));
             }
-            // The redelivery's own reply rides out while the second request
-            // is still trickling; drain to EOF rather than asserting the
-            // connection was silent.
+            // The redelivery's own reply rides out while the second request is still trickling; drain to EOF rather
+            // than asserting the connection was silent.
             s.set_read_timeout(Some(Duration::from_secs(5)))?;
             let mut sink = [0u8; 256];
             loop {
@@ -13270,34 +11803,26 @@ fn a_redelivery_does_not_retire_the_next_message_budget() {
 
 /// A spliced body is bounded per window, not whole.
 ///
-/// `max_receipt_time` is a rate floor: `ServerConfig` promises "each window
-/// is its own message, so an upload of any size is admitted", and tells the
-/// operator to pick it "from the slowest client worth serving, not from the
-/// largest upload". A buffered body earns that by construction - the framer
-/// splits anything above `STREAM_WINDOW` into windows, each its own message
-/// with its own budget. A spliced body is one message however large, so a
-/// budget armed once for the whole transfer made wall clock cap upload
-/// *size*.
+/// `max_receipt_time` is a rate floor: `ServerConfig` promises "each window is its own message, so an upload of any
+/// size is admitted", and tells the operator to pick it "from the slowest client worth serving, not from the largest
+/// upload". A buffered body earns that by construction - the framer splits anything above `STREAM_WINDOW` into windows,
+/// each its own message with its own budget. A spliced body is one message however large, so a budget armed once for
+/// the whole transfer made wall clock cap upload *size*.
 ///
-/// Here: six windows, each moved in under a third of the budget, but the
-/// whole body needing longer than one budget. Every gap is far inside both
-/// inactivity clocks, so nothing but a total bound can reap this - and a
-/// total bound is what this must not be.
+/// Here: six windows, each moved in under a third of the budget, but the whole body needing longer than one budget.
+/// Every gap is far inside both inactivity clocks, so nothing but a total bound can reap this - and a total bound is
+/// what this must not be.
 ///
-/// Run over both header shapes, because the renewal reads a mark that only
-/// the splice path sets. A header the framer reads in **two** exact steps
-/// arms the budget itself - the second read has bytes buffered, so
-/// `submit_recv` does not classify it idle - and a mark tied to whichever
-/// call armed the budget is then never set for the body at all: `moved`
-/// stays zero, no window is ever earned, and the transfer is bounded whole
-/// again. A one-read header hides that entirely, which is why it cannot be
-/// the only case here.
+/// Run over both header shapes, because the renewal reads a mark that only the splice path sets. A header the framer
+/// reads in **two** exact steps arms the budget itself - the second read has bytes buffered, so `submit_recv` does not
+/// classify it idle - and a mark tied to whichever call armed the budget is then never set for the body at all: `moved`
+/// stays zero, no window is ever earned, and the transfer is bounded whole again. A one-read header hides that
+/// entirely, which is why it cannot be the only case here.
 ///
 /// And with a window larger than the body, which must be reaped.
 ///
-/// The pipe is drained continuously; at 768 KiB the body is many times a
-/// pipe's capacity, so without a reader the splice would block on
-/// backpressure and the test would measure that instead.
+/// The pipe is drained continuously; at 768 KiB the body is many times a pipe's capacity, so without a reader the
+/// splice would block on backpressure and the test would measure that instead.
 #[test]
 fn a_large_spliced_body_is_bounded_per_window_not_whole() {
     use std::sync::Mutex;
@@ -13305,8 +11830,8 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
     const WINDOW: usize = 128 * 1024;
     const WINDOWS: usize = 6;
     const BODY: usize = WINDOW * WINDOWS;
-    /// Gap between windows: inside `request_timeout`, so the readiness poll
-    /// is re-armed on every one and can never be what reaps this.
+    /// Gap between windows: inside `request_timeout`, so the readiness poll is re-armed on every one and can never be
+    /// what reaps this.
     const GAP: Duration = Duration::from_millis(150);
 
     // A window larger than the body is never earned.
@@ -13322,24 +11847,20 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
 
         let reasons = Arc::new(Mutex::new(Vec::new()));
         let cfg = ServerConfig {
-            // One window every 150 ms, so no window is remotely near the
-            // budget - but six of them take ~900 ms, and a budget armed once
-            // for the whole transfer fires at 500 ms, mid-body.
+            // One window every 150 ms, so no window is remotely near the budget - but six of them take ~900 ms, and a
+            // budget armed once for the whole transfer fires at 500 ms, mid-body.
             max_receipt_time: Some(Duration::from_millis(500)),
-            // Above the per-window gap, so the readiness poll is re-armed by
-            // every window and cannot be what reaps this. `ServerConfig` also
-            // requires the receipt budget to exceed it.
+            // Above the per-window gap, so the readiness poll is re-armed by every window and cannot be what reaps
+            // this. `ServerConfig` also requires the receipt budget to exceed it.
             request_timeout: Some(Duration::from_millis(400)),
             idle_timeout: None,
             receipt_window_bytes: window,
             ..ServerConfig::default()
         };
-        let addr =
-            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-        // The same 5-byte `[tag][len BE]` header as `splice_header`, read in
-        // one exact step or two. Both are well-formed: `frame_step` requires
-        // a splice framer to read its header with exact `Framing::Need`, so
-        // that the whole header and nothing past it is buffered.
+        let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        // The same 5-byte `[tag][len BE]` header as `splice_header`, read in one exact step or two. Both are
+        // well-formed: `frame_step` requires a splice framer to read its header with exact `Framing::Need`, so that the
+        // whole header and nothing past it is buffered.
         let header = move |buf: &[u8], _s: &mut ()| -> Framing {
             if split_header && buf.is_empty() {
                 return Framing::Need(1); // the tag, then the length
@@ -13347,8 +11868,7 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
             if buf.len() < 5 {
                 return Framing::Need(5 - buf.len());
             }
-            let len =
-                u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+            let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
             match buf[0] {
                 b'S' => Framing::SpliceBody {
                     header_len: 5,
@@ -13398,13 +11918,7 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
                 let mut sink = vec![0u8; 64 * 1024];
                 while draining.load(std::sync::atomic::Ordering::Relaxed) {
                     // SAFETY: `pipe_rd` is a live read end owned by this test.
-                    let n = unsafe {
-                        libc::read(
-                            pipe_rd,
-                            sink.as_mut_ptr().cast(),
-                            sink.len(),
-                        )
-                    };
+                    let n = unsafe { libc::read(pipe_rd, sink.as_mut_ptr().cast(), sink.len()) };
                     if n <= 0 {
                         break;
                     }
@@ -13426,8 +11940,8 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
                     s.flush()?;
                     thread::sleep(GAP);
                 }
-                // Alive? Then the transfer was never reaped, and the budget
-                // was retired with the message rather than left armed.
+                // Alive? Then the transfer was never reaped, and the budget was retired with the message rather than
+                // left armed.
                 splice_frame(&mut s, b'C', b"ping")?;
                 assert_eq!(recv_framed(&mut s)?, b"ping");
                 Ok(())
@@ -13444,13 +11958,11 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
             libc::close(pipe_rd);
         }
         let _ = drain.join();
-        // The client completing its ping is half the proof: a connection
-        // reaped mid-transfer cannot answer one, so `client io` fails first.
+        // The client completing its ping is half the proof: a connection reaped mid-transfer cannot answer one, so
+        // `client io` fails first.
         let served = client.join().expect("thread join");
-        // The other half. Not an equality against `[PeerClosed]`: whether the
-        // peer-close is observed before `shutdown` tears the loop down is a
-        // race with no bearing on the budget, and it is lost in a release
-        // build.
+        // The other half. Not an equality against `[PeerClosed]`: whether the peer-close is observed before `shutdown`
+        // tears the loop down is a race with no bearing on the budget, and it is lost in a release build.
         let got = reasons.lock().unwrap().clone();
         if !renews {
             assert!(
@@ -13473,17 +11985,14 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
 
 /// The receipt budget covers a spliced body, in both directions.
 ///
-/// `arm_receipt_deadline` is reachable only from `submit_recv`, which a
-/// `Framing::SpliceBody` body never enters, so the one clock that progress
-/// cannot restart did not reach the splice path at all - the two that do
-/// (`request_timeout` on the readiness poll, the kTLS watchdog) are both
-/// inactivity bounds any arriving byte re-arms. And where a multi-read
-/// header had armed one, nothing retired it: there is no `deliver_one` on
-/// this path, so the budget outlived the message it belonged to and reaped
-/// a connection that had transferred its body on time.
+/// `arm_receipt_deadline` is reachable only from `submit_recv`, which a `Framing::SpliceBody` body never enters, so the
+/// one clock that progress cannot restart did not reach the splice path at all - the two that do (`request_timeout` on
+/// the readiness poll, the kTLS watchdog) are both inactivity bounds any arriving byte re-arms. And where a multi-read
+/// header had armed one, nothing retired it: there is no `deliver_one` on this path, so the budget outlived the message
+/// it belonged to and reaped a connection that had transferred its body on time.
 ///
-/// Both halves on the plain-TCP splice, which is the same code as the kTLS
-/// one up to the blocking-vs-poll difference (see `submit_splice_recv`).
+/// Both halves on the plain-TCP splice, which is the same code as the kTLS one up to the blocking-vs-poll difference
+/// (see `submit_splice_recv`).
 #[test]
 fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
     use std::sync::Mutex;
@@ -13497,14 +12006,12 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
         let cfg = ServerConfig {
             request_timeout: Some(Duration::from_millis(300)),
             max_receipt_time: Some(Duration::from_millis(700)),
-            // Unset, so a connection that has finished its message and gone
-            // quiet has no other clock that could reap it: the healthy case
-            // fails loudly if the budget is still armed.
+            // Unset, so a connection that has finished its message and gone quiet has no other clock that could reap
+            // it: the healthy case fails loudly if the budget is still armed.
             idle_timeout: None,
             ..ServerConfig::default()
         };
-        let addr =
-            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
         let proto = Protocol {
             accept: |_: Incoming<'_>| Some(()),
             header: splice_header(pipe_wr),
@@ -13533,8 +12040,7 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
         };
         let stop = server.shutdown_handle();
 
-        // 64 bytes: well inside a pipe's capacity, so no reader is needed
-        // and nothing here can block on backpressure.
+        // 64 bytes: well inside a pipe's capacity, so no reader is needed and nothing here can block on backpressure.
         const BODY: usize = 64;
         let client = thread::spawn(move || {
             let _stop = ShutdownOnDrop(stop.clone());
@@ -13545,10 +12051,8 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
                 s.write_all(&hdr)?;
                 s.flush()?;
                 if trickle {
-                    // One byte per 150 ms - half `request_timeout`, so the
-                    // readiness poll is re-armed on every byte and never
-                    // fires, while the body needs 9.6 s against a 700 ms
-                    // budget.
+                    // One byte per 150 ms - half `request_timeout`, so the readiness poll is re-armed on every byte and
+                    // never fires, while the body needs 9.6 s against a 700 ms budget.
                     for _ in 0..BODY {
                         if s.write_all(b"x").is_err() || s.flush().is_err() {
                             break; // reaped under us, which is the point
@@ -13558,8 +12062,8 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
                 } else {
                     s.write_all(&[b'x'; BODY])?;
                     s.flush()?;
-                    // The message is over. Stay quiet for longer than the
-                    // budget: a budget left armed reaps this connection.
+                    // The message is over. Stay quiet for longer than the budget: a budget left armed reaps this
+                    // connection.
                     thread::sleep(Duration::from_millis(1200));
                     // Still alive? Then the framing survived too.
                     splice_frame(&mut s, b'C', b"ping")?;
@@ -13571,9 +12075,7 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
                 match s.read(&mut sink) {
                     Ok(0) => Ok(()),
                     Ok(n) => panic!("answered {n} bytes to a trickled body"),
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
-                        Ok(())
-                    }
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Ok(()),
                     Err(e) => panic!("the slot was never reclaimed: {e}"),
                 }
             })();
@@ -13598,18 +12100,15 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
                  armed, since no other clock on this path is a total bound"
             );
         } else {
-            // The healthy connection ends twice over: the client's FIN goes
-            // out when its closure returns, and its `shutdown` request
-            // follows immediately. Which the loop reaches first is a race
-            // with no bearing on the budget - and the teardown winning
-            // before the hook runs leaves nothing recorded at all - so this
-            // names the benign endings rather than one of them. What may
-            // not appear is the budget: this connection finished on time.
+            // The healthy connection ends twice over: the client's FIN goes out when its closure returns, and its
+            // `shutdown` request follows immediately. Which the loop reaches first is a race with no bearing on the
+            // budget - and the teardown winning before the hook runs leaves nothing recorded at all - so this names the
+            // benign endings rather than one of them. What may not appear is the budget: this connection finished on
+            // time.
             assert!(
                 matches!(
                     got.as_slice(),
-                    [] | [CloseReason::PeerClosed]
-                        | [CloseReason::ShuttingDown]
+                    [] | [CloseReason::PeerClosed] | [CloseReason::ShuttingDown]
                 ),
                 "{what}: the budget must be retired when the body completes \
                  - ReceiptTimeout here is a healthy connection reaped for \
@@ -13619,22 +12118,17 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
     }
 }
 
-/// A reply the handler declared final keeps the pump gate shut even when a
-/// body is still streaming ahead of it.
+/// A reply the handler declared final keeps the pump gate shut even when a body is still streaming ahead of it.
 ///
-/// `Connection::has_deferred_close` is that gate ("both mean no further
-/// request may be admitted"), and `Response::ReplyFile { close: true }`
-/// arriving while another body streams is what sets it. But
-/// `take_queued_file_reply` cleared the flag for whichever deferred body
-/// came off the queue next, on the grounds that installing it arms
-/// `close_on_flush` from its own `close` - true only when THAT body is the
-/// one that carried the close. With the close on a later deferred body the
-/// gate reopened for the whole read-ahead window, and every request the
-/// handler then answered was discarded unsent by `drop_queued_file_reply`
-/// when the final body retired.
+/// `Connection::has_deferred_close` is that gate ("both mean no further request may be admitted"), and
+/// `Response::ReplyFile { close: true }` arriving while another body streams is what sets it. But
+/// `take_queued_file_reply` cleared the flag for whichever deferred body came off the queue next, on the grounds that
+/// installing it arms `close_on_flush` from its own `close` - true only when THAT body is the one that carried the
+/// close. With the close on a later deferred body the gate reopened for the whole read-ahead window, and every request
+/// the handler then answered was discarded unsent by `drop_queued_file_reply` when the final body retired.
 ///
-/// The control is the parameter: with the close on the active tail, or on
-/// the first deferred body, the gate holds and the handler stops on time.
+/// The control is the parameter: with the close on the active tail, or on the first deferred body, the gate holds and
+/// the handler stops on time.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
@@ -13648,12 +12142,10 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
     const REQS: usize = 5;
 
     let dir = truenas_ros::tempdir().unwrap();
-    std::fs::write(dir.path().join("obj"), vec![0x42u8; SIZE])
-        .expect("fixture");
+    std::fs::write(dir.path().join("obj"), vec![0x42u8; SIZE]).expect("fixture");
 
-    // `close_at` is the 0-based request whose `ReplyFile` is declared
-    // final: 0 is the active tail, 1 the first deferred body, 2 the second.
-    // The handler must run exactly `close_at + 1` times in every case.
+    // `close_at` is the 0-based request whose `ReplyFile` is declared final: 0 is the active tail, 1 the first deferred
+    // body, 2 the second. The handler must run exactly `close_at + 1` times in every case.
     for close_at in [0usize, 1, 2] {
         let mut afs = match UringFs::new(FsConfig::default()) {
             Ok(f) => f,
@@ -13667,12 +12159,7 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
         let (ftx, frx) = mpsc::channel();
         thread::scope(|sc| {
             sc.spawn(move || {
-                let r = handle.open(
-                    who,
-                    &anchor,
-                    c"obj",
-                    OpenHow::new().flags(OFlag::O_RDONLY),
-                );
+                let r = handle.open(who, &anchor, c"obj", OpenHow::new().flags(OFlag::O_RDONLY));
                 let _ = ftx.send(r);
                 stop_fs.shutdown();
             });
@@ -13684,9 +12171,8 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
             pool_size: 4,
             fs_ops: 8,
             fs_body_chunk: CHUNK,
-            // Read-ahead is the precondition: at the default cap of one the
-            // pump never frames a second request, so no body is ever
-            // deferred behind another.
+            // Read-ahead is the precondition: at the default cap of one the pump never frames a second request, so no
+            // body is ever deferred behind another.
             max_in_flight_requests: 8,
             ..ServerConfig::default()
         };
@@ -13694,11 +12180,7 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
         let seen2 = Arc::clone(&seen);
         let proto = Protocol {
             accept: |_: Incoming<'_>| Some(()),
-            header: length_prefix_header::<()>(
-                PrefixWidth::U32,
-                Endian::Big,
-                false,
-            ),
+            header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
             body: move |_req: Request<'_, ()>| {
                 let nth = seen2.fetch_add(1, Ordering::SeqCst);
                 Response::ReplyFile {
@@ -13710,8 +12192,7 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
                 }
             },
         };
-        let addr =
-            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
         let mut server = match Server::with_config([addr], cfg, proto) {
             Ok(s) => s,
             Err(e) if should_skip(&e) => return,
@@ -13724,8 +12205,8 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
         let client = thread::spawn(move || -> io::Result<(usize, bool)> {
             let _stop = ShutdownOnDrop(stop.clone());
             let mut s = connect_tcp(v4)?;
-            // Every request in one write, so all of them are in the socket
-            // buffer before the first body starts streaming.
+            // Every request in one write, so all of them are in the socket buffer before the first body starts
+            // streaming.
             let mut wire = Vec::new();
             for _ in 0..REQS {
                 wire.extend_from_slice(&1u32.to_be_bytes());
@@ -13734,23 +12215,16 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
             s.write_all(&wire)?;
             s.flush()?;
             let mut got = Vec::new();
-            // The gate shuts before the refused requests are read off the
-            // socket, so they are still in the receive queue when the
-            // connection closes - and the kernel answers a close with
-            // unread data by sending RST rather than FIN (`tcp_close`,
-            // net/ipv4/tcp.c:3165-3170, `TCP_ABORT_ON_CLOSE`). Whether any
-            // are left is a timing question rather than a property of the
-            // code under test: a host whose pump framed every pipelined
-            // request before the gate shut closes cleanly, one that did
-            // not gets the reset. Both endings are healthy here.
+            // The gate shuts before the refused requests are read off the socket, so they are still in the receive
+            // queue when the connection closes - and the kernel answers a close with unread data by sending RST rather
+            // than FIN (`tcp_close`, net/ipv4/tcp.c:3165-3170, `TCP_ABORT_ON_CLOSE`). Whether any are left is a timing
+            // question rather than a property of the code under test: a host whose pump framed every pipelined request
+            // before the gate shut closes cleanly, one that did not gets the reset. Both endings are healthy here.
             //
-            // The reset is not free - it aborts the connection instead of
-            // draining it, so bytes the server had queued but not yet
-            // delivered are lost and the peer sees a truncated stream,
-            // measured here at exactly one chunk short. So the byte count
-            // is only checked exactly on the clean ending; `seen`, which
-            // the server counts, is the claim this test makes and holds
-            // either way.
+            // The reset is not free - it aborts the connection instead of draining it, so bytes the server had queued
+            // but not yet delivered are lost and the peer sees a truncated stream, measured here at exactly one chunk
+            // short. So the byte count is only checked exactly on the clean ending; `seen`, which the server counts, is
+            // the claim this test makes and holds either way.
             let clean = match s.read_to_end(&mut got) {
                 Ok(_) => true,
                 Err(e) if e.kind() == io::ErrorKind::ConnectionReset => false,
@@ -13781,44 +12255,32 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
 
 /// A peer that half-closes after its request still gets its response.
 ///
-/// `shutdown(SHUT_WR)` is politeness, not departure: the client has said it
-/// will send nothing more and is waiting to read. It completes the parked
-/// read-ahead recv with `res == 0`, which is `CloseReason::PeerClosed` - and
-/// the "does this connection still owe work?" guard was applied to
-/// `IdleTimeout` alone, so the connection was torn down with the reply owed.
-/// `closing` then makes `kick_send` swallow the queued reply,
-/// `drain_injections` drop the worker outcome and `on_pump_read` drop every
-/// file-body chunk: a correctly framed request answered with zero bytes.
+/// `shutdown(SHUT_WR)` is politeness, not departure: the client has said it will send nothing more and is waiting to
+/// read. It completes the parked read-ahead recv with `res == 0`, which is `CloseReason::PeerClosed` - and the "does
+/// this connection still owe work?" guard was applied to `IdleTimeout` alone, so the connection was torn down with the
+/// reply owed. `closing` then makes `kick_send` swallow the queued reply, `drain_injections` drop the worker outcome
+/// and `on_pump_read` drop every file-body chunk: a correctly framed request answered with zero bytes.
 ///
-/// `cap` is the control and the trigger in one. At the default read-ahead of
-/// one nothing arms a second recv while a reply is owed, so the FIN is not
-/// seen until after - which is why nothing in tree meets this and why the
-/// first iteration passes on the unfixed code. Above one it is met at once.
-/// The handler defers for the same reason: an inline reply has already been
-/// sent by the time the FIN lands.
+/// `cap` is the control and the trigger in one. At the default read-ahead of one nothing arms a second recv while a
+/// reply is owed, so the FIN is not seen until after - which is why nothing in tree meets this and why the first
+/// iteration passes on the unfixed code. Above one it is met at once. The handler defers for the same reason: an inline
+/// reply has already been sent by the time the FIN lands.
 #[test]
 fn a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply() {
     use std::io::{Read, Write};
     for cap in [1usize, 4] {
-        let addr =
-            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
         let cfg = ServerConfig {
             max_in_flight_requests: cap,
             ..Default::default()
         };
-        // The reply must still be OWED when the FIN lands, so the handler
-        // defers: an inline echo has already answered by then.
+        // The reply must still be OWED when the FIN lands, so the handler defers: an inline echo has already answered
+        // by then.
         let proto = Protocol {
             accept: |_: Incoming<'_>| Some(()),
-            header: length_prefix_header::<()>(
-                PrefixWidth::U32,
-                Endian::Big,
-                false,
-            ),
+            header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
             body: |req: Request<'_, ()>| {
-                let Request {
-                    body, responder, ..
-                } = req;
+                let Request { body, responder, .. } = req;
                 let input = body.to_vec();
                 let (deferred, permit) = responder.defer();
                 thread::spawn(move || {
@@ -13854,46 +12316,33 @@ fn a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply() {
         });
         server.serve_forever().expect("serve_forever");
         let n = client.join().expect("join").expect("client");
-        assert_eq!(
-            n, 9,
-            "cap={cap}: a half-closed peer got {n} bytes of a 9-byte reply"
-        );
+        assert_eq!(n, 9, "cap={cap}: a half-closed peer got {n} bytes of a 9-byte reply");
     }
 }
 
-/// A half-closed peer whose owed work completes with **nothing to send** must
-/// still have its connection closed.
+/// A half-closed peer whose owed work completes with **nothing to send** must still have its connection closed.
 ///
-/// `peer_closed` retires the recv side and leaves the close to the send path.
-/// A one-way request - `Deferred::reply(Vec::new())`, the `Injected::Done`
-/// arm - retires `outstanding` and queues no PDU, so no send ever completes
-/// and that path never runs. The pump then re-arms a read, the FIN
-/// re-completes it at once, and the `peer_closed` arm in `on_recv_complete`
-/// returned without closing: the pool slot and the fd were held for the life
-/// of the server, on a peer that had already said goodbye.
+/// `peer_closed` retires the recv side and leaves the close to the send path. A one-way request -
+/// `Deferred::reply(Vec::new())`, the `Injected::Done` arm - retires `outstanding` and queues no PDU, so no send ever
+/// completes and that path never runs. The pump then re-arms a read, the FIN re-completes it at once, and the
+/// `peer_closed` arm in `on_recv_complete` returned without closing: the pool slot and the fd were held for the life of
+/// the server, on a peer that had already said goodbye.
 ///
-/// `cap` is the trigger, as in
-/// `a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply`: at the
-/// default read-ahead of one nothing arms a second recv while the request is
-/// in flight, so the FIN is not seen until after and the connection closes
-/// the ordinary way.
+/// `cap` is the trigger, as in `a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply`: at the default
+/// read-ahead of one nothing arms a second recv while the request is in flight, so the FIN is not seen until after and
+/// the connection closes the ordinary way.
 #[test]
 fn a_half_closed_peer_closes_when_its_one_way_request_finishes() {
     use std::io::{Read, Write};
     for cap in [1usize, 4] {
-        let addr =
-            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
         let cfg = ServerConfig {
             max_in_flight_requests: cap,
             ..Default::default()
         };
         let proto = Protocol {
             accept: |_: Incoming<'_>| Some(()),
-            header: length_prefix_header::<()>(
-                PrefixWidth::U32,
-                Endian::Big,
-                false,
-            ),
+            header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
             body: |req: Request<'_, ()>| {
                 let Request { responder, .. } = req;
                 let (deferred, permit) = responder.defer();
@@ -13924,9 +12373,8 @@ fn a_half_closed_peer_closes_when_its_one_way_request_finishes() {
             s.write_all(&wire)?;
             s.flush()?;
             s.shutdown(std::net::Shutdown::Write)?;
-            // The server owes a one-way reply; once it has answered it,
-            // nothing can arrive on this connection ever again, so the
-            // server must close. EOF is that close; a timeout is the leak.
+            // The server owes a one-way reply; once it has answered it, nothing can arrive on this connection ever
+            // again, so the server must close. EOF is that close; a timeout is the leak.
             let mut buf = [0u8; 1];
             let eof = matches!(s.read(&mut buf), Ok(0));
             stop.shutdown();
@@ -13942,11 +12390,9 @@ fn a_half_closed_peer_closes_when_its_one_way_request_finishes() {
     }
 }
 
-/// A file lease a body handler takes on the ring reaches the server's break
-/// handler once another opens the file for writing, and the handler's
-/// release lets that opener go at once rather than after
-/// `lease-break-time`. On a temp folder, and on a ZFS dataset where one is
-/// provisioned, which takes leases as any file system does
+/// A file lease a body handler takes on the ring reaches the server's break handler once another opens the file for
+/// writing, and the handler's release lets that opener go at once rather than after `lease-break-time`. On a temp
+/// folder, and on a ZFS dataset where one is provisioned, which takes leases as any file system does
 /// (`generic_setlease` in `zpl_file.c`).
 #[cfg(feature = "uring-fs")]
 #[test]
@@ -13981,11 +12427,7 @@ fn a_file_lease_break_reaches_the_server_s_handler() {
         };
         let protocol = Protocol {
             accept: |_: Incoming<'_>| Some(()),
-            header: length_prefix_header::<()>(
-                PrefixWidth::U32,
-                Endian::Big,
-                false,
-            ),
+            header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
             body,
         };
         let cfg = ServerConfig {
@@ -13993,8 +12435,7 @@ fn a_file_lease_break_reaches_the_server_s_handler() {
             fs_ops: 8,
             ..ServerConfig::default()
         };
-        let addr =
-            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
         let mut server = match Server::with_config([addr], cfg, protocol) {
             Ok(s) => s,
             Err(e) if should_skip(&e) => return,
@@ -14033,10 +12474,9 @@ fn a_file_lease_break_reaches_the_server_s_handler() {
 
 // ---- the bytes a ring holds out of its body pool ---------------------------
 
-/// The ring's count of held bytes follows a placed body from its claim into
-/// the handler, which sees it counted until it takes the body or drops it
-/// untaken, and a reply marked recycled until it is sent, so a request after
-/// both finds the count back at 0.
+/// The ring's count of held bytes follows a placed body from its claim into the handler, which sees it counted until it
+/// takes the body or drops it untaken, and a reply marked recycled until it is sent, so a request after both finds the
+/// count back at 0.
 #[test]
 fn held_bytes_follow_a_placed_body_and_a_recycled_reply() {
     use std::cell::{OnceCell, RefCell};
@@ -14051,11 +12491,7 @@ fn held_bytes_follow_a_placed_body_and_a_recycled_reply() {
     let (handler_seam, handler_seen) = (Rc::clone(&seam), Rc::clone(&seen));
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |mut req: Request<'_, ()>| {
             let r = handler_seam.get().expect("filled before serving");
             let at_delivery = r.held();
@@ -14069,9 +12505,7 @@ fn held_bytes_follow_a_placed_body_and_a_recycled_reply() {
                 _ => {}
             }
             handler_seen.borrow_mut().push((at_delivery, r.held()));
-            reply.extend_from_slice(&echo_frame(
-                &(at_delivery as u64).to_be_bytes(),
-            ));
+            reply.extend_from_slice(&echo_frame(&(at_delivery as u64).to_be_bytes()));
             Response::ReplyVectored {
                 segments: vec![SendBuf::recycled(reply)],
                 close: false,
@@ -14103,8 +12537,7 @@ fn held_bytes_follow_a_placed_body_and_a_recycled_reply() {
                 body[1] = 0;
                 send_framed(&mut s, &body)?;
                 recv_framed(&mut s)?;
-                // A small request after the reply was read, whose handler
-                // sees whatever the ring still counts.
+                // A small request after the reply was read, whose handler sees whatever the ring still counts.
                 send_framed(&mut s, b"p")?;
                 let held = recv_framed(&mut s)?;
                 assert_eq!(held, 0u64.to_be_bytes(), "after {}", tag as char);
@@ -14120,10 +12553,7 @@ fn held_bytes_follow_a_placed_body_and_a_recycled_reply() {
     assert_eq!(seen.len(), 6, "three bodies and three probes");
     for (i, &(at, after)) in seen.iter().enumerate() {
         if i % 2 == 0 {
-            assert!(
-                at >= BODY,
-                "a placed body is counted from its claim: {at}"
-            );
+            assert!(at >= BODY, "a placed body is counted from its claim: {at}");
             assert_eq!(after, 0, "and comes off as it leaves the reactor");
         } else {
             assert_eq!((at, after), (0, 0), "nothing held between requests");
@@ -14132,11 +12562,9 @@ fn held_bytes_follow_a_placed_body_and_a_recycled_reply() {
     assert_eq!(recycler.held(), 0, "and nothing once the ring is idle");
 }
 
-/// A reply given to `Deferred::reply_recycled` counts from that call,
-/// before the loop has it, and stays counted once the loop queues it until
-/// it is sent, with no turn where neither side counts it. One that reaches
-/// no request leaves the count as it goes home, and an empty one goes as
-/// `Done` and adds nothing.
+/// A reply given to `Deferred::reply_recycled` counts from that call, before the loop has it, and stays counted once
+/// the loop queues it until it is sent, with no turn where neither side counts it. One that reaches no request leaves
+/// the count as it goes home, and an empty one goes as `Done` and adds nothing.
 #[test]
 fn a_deferred_recycled_reply_counts_from_its_hand_off() {
     use std::cell::{OnceCell, RefCell};
@@ -14144,20 +12572,15 @@ fn a_deferred_recycled_reply_counts_from_its_hand_off() {
     use truenas_ros::net::server::BodyRecycler;
 
     const ROOM: usize = 64 * 1024;
-    let seam: Rc<OnceCell<(BodyRecycler, ControlHandle)>> =
-        Rc::new(OnceCell::new());
-    // `(held, room)` as the handler saw them after each hand-off, and as
-    // the control hook saw them once the loop queued the reply.
+    let seam: Rc<OnceCell<(BodyRecycler, ControlHandle)>> = Rc::new(OnceCell::new());
+    // `(held, room)` as the handler saw them after each hand-off, and as the control hook saw them once the loop queued
+    // the reply.
     let handed: Rc<RefCell<Vec<(usize, usize)>>> = Rc::default();
     let queued: Rc<RefCell<Vec<(usize, usize)>>> = Rc::default();
     let (h_seam, h_handed) = (Rc::clone(&seam), Rc::clone(&handed));
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
+        header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: move |req: Request<'_, ()>| {
             let (r, control) = h_seam.get().expect("filled before serving");
             let framed = || {
@@ -14175,33 +12598,26 @@ fn a_deferred_recycled_reply_counts_from_its_hand_off() {
                 }
             };
             if spill {
-                // Closed in the loop's drain ahead of the reply, so the
-                // reply reaches no request.
+                // Closed in the loop's drain ahead of the reply, so the reply reaches no request.
                 req.responder.push_handle().close();
             }
-            let room = if reply.is_empty() {
-                0
-            } else {
-                reply.capacity()
-            };
+            let room = if reply.is_empty() { 0 } else { reply.capacity() };
             let (deferred, permit) = req.responder.defer();
             deferred.reply_recycled(reply);
             h_handed.borrow_mut().push((r.held(), room));
             if room > 0 && !spill {
-                // Reached in the same drain right after the reply, so the
-                // hook sees it queued and not yet sent.
+                // Reached in the same drain right after the reply, so the hook sees it queued and not yet sent.
                 control.send(Box::new(room));
             }
             Response::Defer(permit)
         },
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server =
-        match Server::with_config([addr], ServerConfig::default(), proto) {
-            Ok(s) => s,
-            Err(e) if should_skip(&e) => return,
-            Err(e) => panic!("bind: {e}"),
-        };
+    let mut server = match Server::with_config([addr], ServerConfig::default(), proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
     let recycler = server.body_recycler().expect("a server keeps a body pool");
     let (hook_recycler, hook_queued) = (recycler.clone(), Rc::clone(&queued));
     server.set_control_hook(move |m| {
@@ -14260,11 +12676,9 @@ fn a_deferred_recycled_reply_counts_from_its_hand_off() {
     assert_eq!(recycler.held(), 0, "and nothing once the ring is idle");
 }
 
-/// Placed bodies past `held_cap` wait and go on in the order they arrived,
-/// one at a time as the consumer gives bytes back, so the ring passes the
-/// cap by one body at most, and every body arrives whole. A body larger
-/// than the cap goes on once the count is under it. A read that waits
-/// longer than `max_receipt_time` is not closed for it, since only the
+/// Placed bodies past `held_cap` wait and go on in the order they arrived, one at a time as the consumer gives bytes
+/// back, so the ring passes the cap by one body at most, and every body arrives whole. A body larger than the cap goes
+/// on once the count is under it. A read that waits longer than `max_receipt_time` is not closed for it, since only the
 /// peer's own time counts.
 #[test]
 fn placed_bodies_past_the_held_cap_wait_their_turn() {
@@ -14328,15 +12742,14 @@ fn placed_bodies_past_the_held_cap_wait_their_turn() {
     };
     let recycler = server.body_recycler().expect("a server keeps a body pool");
     seam.set(recycler.clone()).expect("set once");
-    // Each control message releases the body held longest, giving its
-    // bytes back and answering whether it arrived whole.
+    // Each control message releases the body held longest, giving its bytes back and answering whether it arrived
+    // whole.
     let (c_stash, c_recycler) = (Rc::clone(&stash), recycler.clone());
     server.set_control_hook(move |_| {
         if let Some((deferred, body)) = c_stash.borrow_mut().pop_front() {
             c_recycler.give_back(body.capacity());
             let tag = body[0];
-            let whole =
-                body.len() == size(tag) && body[1..].iter().all(|&b| b == tag);
+            let whole = body.len() == size(tag) && body[1..].iter().all(|&b| b == tag);
             deferred.reply(echo_frame(&[tag, u8::from(whole)]));
         }
     });
@@ -14356,8 +12769,7 @@ fn placed_bodies_past_the_held_cap_wait_their_turn() {
                     thread::sleep(Duration::from_millis(80) * u32::from(tag));
                     let mut s = connect_tcp(v4)?;
                     let n = size(tag);
-                    // The header in two parts, so its second read is part
-                    // of the message and arms the receipt budget.
+                    // The header in two parts, so its second read is part of the message and arms the receipt budget.
                     s.write_all(format!("Content-Length: {n}\r\n").as_bytes())?;
                     thread::sleep(Duration::from_millis(20));
                     s.write_all(b"\r\n")?;
@@ -14373,15 +12785,12 @@ fn placed_bodies_past_the_held_cap_wait_their_turn() {
                 thread::sleep(Duration::from_millis(5));
             }
         };
-        // Two bodies take the count past the cap, and the rest wait well
-        // past their receipt budget.
+        // Two bodies take the count past the cap, and the rest wait well past their receipt budget.
         wait_for(2);
-        thread::sleep(
-            Duration::from_millis(80) * u32::from(PEERS) + receipt * 2,
-        );
+        thread::sleep(Duration::from_millis(80) * u32::from(PEERS) + receipt * 2);
         assert_eq!(gate.load(Ordering::SeqCst), 2, "the rest wait");
-        // Each release once the body the last one let go on has arrived,
-        // so no two held bodies go on together and finish in either order.
+        // Each release once the body the last one let go on has arrived, so no two held bodies go on together and
+        // finish in either order.
         for released in 0..usize::from(PEERS) {
             wait_for((released + 2).min(usize::from(PEERS)));
             control.send(Box::new(()));
@@ -14410,11 +12819,10 @@ fn placed_bodies_past_the_held_cap_wait_their_turn() {
     );
 }
 
-/// Turns the consumer queues and placed bodies held back at the cap go on
-/// in one queue, in the order they came, one at a time while each takes the
-/// count to the cap, so a stream of turns keeps no body back and a stream
-/// of bodies keeps no turn back. The hook runs once for each turn, from the
-/// loop and never inside the call that queued it, and only under the cap.
+/// Turns the consumer queues and placed bodies held back at the cap go on in one queue, in the order they came, one at
+/// a time while each takes the count to the cap, so a stream of turns keeps no body back and a stream of bodies keeps
+/// no turn back. The hook runs once for each turn, from the loop and never inside the call that queued it, and only
+/// under the cap.
 #[test]
 fn turns_and_placed_bodies_go_on_in_the_order_they_came() {
     use std::cell::{Cell, OnceCell, RefCell};
@@ -14422,8 +12830,8 @@ fn turns_and_placed_bodies_go_on_in_the_order_they_came() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use truenas_ros::net::server::BodyRecycler;
 
-    // Past a receive buffer of the default size, so each is placed, and
-    // past the cap, so each takes the count to it alone.
+    // Past a receive buffer of the default size, so each is placed, and past the cap, so each takes the count to it
+    // alone.
     const BODY: usize = 512 * 1024;
     const CAP: usize = 256 * 1024;
     let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
@@ -14433,11 +12841,9 @@ fn turns_and_placed_bodies_go_on_in_the_order_they_came() {
     // What the client waits on, the bodies framed and the hook's runs.
     let framed = Arc::new(AtomicUsize::new(0));
     let ran = Arc::new(AtomicUsize::new(0));
-    let (h_seam, h_went, h_runs) =
-        (Rc::clone(&seam), Rc::clone(&went), Rc::clone(&runs));
+    let (h_seam, h_went, h_runs) = (Rc::clone(&seam), Rc::clone(&went), Rc::clone(&runs));
     let h_framed = Arc::clone(&framed);
-    let mut framing =
-        length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false);
+    let mut framing = length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
         header: move |bytes: &[u8], state: &mut ()| {
@@ -14485,10 +12891,8 @@ fn turns_and_placed_bodies_go_on_in_the_order_they_came() {
         Err(e) => panic!("bind: {e}"),
     };
     let recycler = server.body_recycler().expect("a server keeps a body pool");
-    seam.set(recycler.clone())
-        .unwrap_or_else(|_| panic!("set once"));
-    let (k_went, k_runs, k_ran) =
-        (Rc::clone(&went), Rc::clone(&runs), Arc::clone(&ran));
+    seam.set(recycler.clone()).unwrap_or_else(|_| panic!("set once"));
+    let (k_went, k_runs, k_ran) = (Rc::clone(&went), Rc::clone(&runs), Arc::clone(&ran));
     server.set_held_hook(move || {
         assert!(recycler.held() < CAP, "a turn goes on only under the cap");
         k_runs.set(k_runs.get() + 1);

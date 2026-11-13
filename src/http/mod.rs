@@ -1,116 +1,79 @@
-//! `http` - an HTTP/1.1 **codec** over the [`net::server`](crate::net::server)
-//! protocol seam. A framer plus request/response vocabulary; not a server --
-//! the io_uring reactor stays in charge of every socket.
+//! `http` - an HTTP/1.1 **codec** over the [`net::server`](crate::net::server) protocol seam. A framer plus
+//! request/response vocabulary; not a server -- the io_uring reactor stays in charge of every socket.
 //!
 //! # Design
 //!
-//! The module plugs into [`Protocol`](crate::net::server::Protocol) exactly
-//! like a length-prefixed protocol would: [`protocol`](protocol()) builds the
-//! `accept`/`header`/`body` handler triple from an HTTP-shaped handler you
-//! supply. The head tokenizer is `httparse` (sans-io, allocation-free, the
-//! same parser hyper embeds); everything above tokens is implemented here:
+//! The module plugs into [`Protocol`](crate::net::server::Protocol) exactly like a length-prefixed protocol would:
+//! [`protocol`](protocol()) builds the `accept`/`header`/`body` handler triple from an HTTP-shaped handler you supply.
+//! The head tokenizer is `httparse` (sans-io, allocation-free, the same parser hyper embeds); everything above tokens
+//! is implemented here:
 //!
-//! - **Framing** (`framer`): a per-connection state machine mapping HTTP
-//!   message boundaries onto [`Framing`](crate::net::server::Framing)
-//!   verdicts - scan (`More`) until the head completes, then declare the
-//!   body from `Content-Length`, or walk a `Transfer-Encoding: chunked`
-//!   stream (`chunked`) until its terminal chunk lands.
-//! - **`Expect: 100-continue`** as a two-message dance: the head is delivered
-//!   as a zero-body message, the glue replies with raw interim bytes
-//!   (`Response::Reply` sends verbatim), and the framer then frames the body
-//!   as a second message against the stashed head. No reactor extension
-//!   needed.
-//! - **Deferred completion** ([`protocol_deferrable`]): a handler may
-//!   **park** a request ([`HttpRequest::defer`]) while a worker thread
-//!   resolves what it needs; the retained request is redelivered on the
-//!   server thread - re-running the handler once state is warm
-//!   ([`HttpDeferred::redrive`]) or serializing a worker-built response
-//!   ([`HttpDeferred::reply`]) - so the reactor never blocks and response
-//!   policy never runs off-thread. Rides the reactor's
-//!   [`Response::Defer`](crate::net::server::Response::Defer) machinery.
-//! - **Filesystem access** (`protocol_fs`, with the `uring-fs` feature): the
-//!   same deferrable handler is additionally handed the reactor's
-//!   per-request fs facade, so an HTTP service can open, stat, and read on
-//!   the server's own ring under a per-request personality - parking the
-//!   request while ops run and completing it through the captured
+//! - **Framing** (`framer`): a per-connection state machine mapping HTTP message boundaries onto
+//!   [`Framing`](crate::net::server::Framing) verdicts - scan (`More`) until the head completes, then declare the body
+//!   from `Content-Length`, or walk a `Transfer-Encoding: chunked` stream (`chunked`) until its terminal chunk lands.
+//! - **`Expect: 100-continue`** as a two-message dance: the head is delivered as a zero-body message, the glue replies
+//!   with raw interim bytes (`Response::Reply` sends verbatim), and the framer then frames the body as a second message
+//!   against the stashed head. No reactor extension needed.
+//! - **Deferred completion** ([`protocol_deferrable`]): a handler may **park** a request ([`HttpRequest::defer`]) while
+//!   a worker thread resolves what it needs; the retained request is redelivered on the server thread - re-running the
+//!   handler once state is warm ([`HttpDeferred::redrive`]) or serializing a worker-built response
+//!   ([`HttpDeferred::reply`]) - so the reactor never blocks and response policy never runs off-thread. Rides the
+//!   reactor's [`Response::Defer`](crate::net::server::Response::Defer) machinery.
+//! - **Filesystem access** (`protocol_fs`, with the `uring-fs` feature): the same deferrable handler is additionally
+//!   handed the reactor's per-request fs facade, so an HTTP service can open, stat, and read on the server's own ring
+//!   under a per-request personality - parking the request while ops run and completing it through the captured
 //!   [`HttpDeferred`].
-//! - **Streamed bodies** ([`protocol_streaming`]): a chunked body may be
-//!   delivered a chunk at a time rather than once when its terminal chunk
-//!   lands, and a `Content-Length` body above one window a window at a
-//!   time, so the largest body an endpoint accepts stops being a buffer
-//!   size. The handler walks [`Stage::Open`] -> [`Stage::Window`]* ->
-//!   [`Stage::End`]. No reactor extension needed: an intermediate window is
-//!   answered with an empty `Reply`, which already means "answered, nothing
-//!   to send, keep serving", and a handler that must wait on a write parks
-//!   with [`HttpRequest::defer_stream`] and resolves with
-//!   [`HttpStreamDeferred::resume`] - a park that retains no window and
-//!   re-runs no handler, so a write straight from the receive buffer
-//!   (`FsConn::pwritev2_from`) stays copy-free end to end.
-//! - **Keep-alive**: HTTP/1.1 persists unless `Connection: close`; HTTP/1.0
-//!   closes unless `Connection: keep-alive`. Close maps onto
-//!   [`Response::ReplyClose`](crate::net::server::Response::ReplyClose) --
-//!   the flush-then-close farewell the reactor already implements.
-//! - **Serialization** (`response`): status line, headers, IMF-fixdate
-//!   `Date`, automatic `Content-Length`, HEAD body elision - with
-//!   [`HttpResponse::head_content_length`] the one way a handler may
-//!   declare a length itself, honored only on a HEAD, where the protocol
-//!   sends no bytes for it to contradict. Header names, values, and bodies
-//!   are `Cow<'static, _>` - responses built from literals allocate nothing
-//!   until serialization.
-//! - **Hardening**: request-smuggling screens (duplicate `Content-Length` ->
-//!   400; `Transfer-Encoding` where `chunked` is absent, repeated, or
-//!   non-final -> 400; codings before a final `chunked` -> 501; TE on
-//!   HTTP/1.0 -> 400; a lone `Content-Length` alongside `TE: chunked` is
-//!   ignored - TE wins, RFC 9112 sec. 6.3's receiver rule, and the shape real
-//!   botocore requests have), `Host` enforcement (missing on HTTP/1.1, or
-//!   duplicated -> 400), head-size cap (431), body cap (413), chunk-line and
-//!   trailer caps (400/431), version check (505). On the write side, the
-//!   response-splitting guards: non-token header names, names the codec
-//!   writes itself, and values with a byte outside RFC 9110's field-value
-//!   grammar are dropped — at [`HttpResponse::header`], or at
-//!   [`ScreenedHeader::new`] for a field built ahead of its response —
-//!   out-of-range statuses become 500, and bodyless statuses
-//!   (1xx/204/304) never carry content.
+//! - **Streamed bodies** ([`protocol_streaming`]): a chunked body may be delivered a chunk at a time rather than once
+//!   when its terminal chunk lands, and a `Content-Length` body above one window a window at a time, so the largest
+//!   body an endpoint accepts stops being a buffer size. The handler walks [`Stage::Open`] -> [`Stage::Window`]* ->
+//!   [`Stage::End`]. No reactor extension needed: an intermediate window is answered with an empty `Reply`, which
+//!   already means "answered, nothing to send, keep serving", and a handler that must wait on a write parks with
+//!   [`HttpRequest::defer_stream`] and resolves with [`HttpStreamDeferred::resume`] - a park that retains no window and
+//!   re-runs no handler, so a write straight from the receive buffer (`FsConn::pwritev2_from`) stays copy-free end to
+//!   end.
+//! - **Keep-alive**: HTTP/1.1 persists unless `Connection: close`; HTTP/1.0 closes unless `Connection: keep-alive`.
+//!   Close maps onto [`Response::ReplyClose`](crate::net::server::Response::ReplyClose) -- the flush-then-close
+//!   farewell the reactor already implements.
+//! - **Serialization** (`response`): status line, headers, IMF-fixdate `Date`, automatic `Content-Length`, HEAD body
+//!   elision - with [`HttpResponse::head_content_length`] the one way a handler may declare a length itself, honored
+//!   only on a HEAD, where the protocol sends no bytes for it to contradict. Header names, values, and bodies are
+//!   `Cow<'static, _>` - responses built from literals allocate nothing until serialization.
+//! - **Hardening**: request-smuggling screens (duplicate `Content-Length` -> 400; `Transfer-Encoding` where `chunked`
+//!   is absent, repeated, or non-final -> 400; codings before a final `chunked` -> 501; TE on HTTP/1.0 -> 400; a lone
+//!   `Content-Length` alongside `TE: chunked` is ignored - TE wins, RFC 9112 sec. 6.3's receiver rule, and the shape
+//!   real botocore requests have), `Host` enforcement (missing on HTTP/1.1, or duplicated -> 400), head-size cap (431),
+//!   body cap (413), chunk-line and trailer caps (400/431), version check (505). On the write side, the
+//!   response-splitting guards: non-token header names, names the codec writes itself, and values with a byte outside
+//!   RFC 9110's field-value grammar are dropped — at [`HttpResponse::header`], or at [`ScreenedHeader::new`] for a
+//!   field built ahead of its response — out-of-range statuses become 500, and bodyless statuses (1xx/204/304) never
+//!   carry content.
 //!
 //! # Scope (v1)
 //!
-//! `Content-Length` and `Transfer-Encoding: chunked` bodies, buffered inline
-//! up to [`HttpConfig::max_body`] (for chunked, the *decoded* size, enforced
-//! mid-stream; the wire form gets a fixed extra framing allowance). The
-//! defaults are sized so head + body + allowance together fit the reactor's
-//! own default message cap (raise them in step; see
+//! `Content-Length` and `Transfer-Encoding: chunked` bodies, buffered inline up to [`HttpConfig::max_body`] (for
+//! chunked, the *decoded* size, enforced mid-stream; the wire form gets a fixed extra framing allowance). The defaults
+//! are sized so head + body + allowance together fit the reactor's own default message cap (raise them in step; see
 //! [`HttpConfig::min_request_bytes`]).
 //!
-//! A body can instead be **streamed** ([`protocol_streaming`]), where
-//! [`HttpConfig::max_body`] no longer bounds the bodies it streams: one of
-//! those is never held, so the bound is the one the builder supplies --
-//! measured as each chunk is declared for chunked, and against the declared
-//! length for `Content-Length`. A known-length body at or under one window
-//! still arrives whole (one pool-buffered delivery is already its cheapest
-//! form); above that it streams exactly as chunked does. That whole delivery
-//! *is* buffered, so `max_body` still governs it - a `max_body` below one
-//! window refuses bodies well inside the streaming cap, and the two are set
-//! in step.
+//! A body can instead be **streamed** ([`protocol_streaming`]), where [`HttpConfig::max_body`] no longer bounds the
+//! bodies it streams: one of those is never held, so the bound is the one the builder supplies -- measured as each
+//! chunk is declared for chunked, and against the declared length for `Content-Length`. A known-length body at or under
+//! one window still arrives whole (one pool-buffered delivery is already its cheapest form); above that it streams
+//! exactly as chunked does. That whole delivery *is* buffered, so `max_body` still governs it - a `max_body` below one
+//! window refuses bodies well inside the streaming cap, and the two are set in step.
 //!
-//! Chunked is not optional for an S3 front: verified by wire capture
-//! (boto3 1.37.9, 2026-08-07), the default modern SDK PUTs over TLS with
-//! `Transfer-Encoding: chunked` + `Content-Encoding: aws-chunked` and an
-//! unsigned-payload trailer - sometimes with a `Content-Length` alongside
-//! carrying the *decoded* length. This codec de-frames only its own layer:
-//! the aws-chunked entity (chunk metadata and checksum trailer *inside* the
-//! body) passes through byte-for-byte for the S3 band to decode. Genuine
-//! HTTP trailer fields are parsed and surfaced ([`HttpRequest::trailers`])
-//! but not interpreted. Streaming *sends* remain a follow-up on the same
-//! seam; `Framing::SpliceBody` is deliberately not used here, and its doc
-//! comment says why (over kTLS a splice moves one TLS record per op and the
-//! cap cannot be amortised, and a body carrying its own framing cannot be
-//! de-framed on the way past).
+//! Chunked is not optional for an S3 front: verified by wire capture (boto3 1.37.9, 2026-08-07), the default modern SDK
+//! PUTs over TLS with `Transfer-Encoding: chunked` + `Content-Encoding: aws-chunked` and an unsigned-payload trailer -
+//! sometimes with a `Content-Length` alongside carrying the *decoded* length. This codec de-frames only its own layer:
+//! the aws-chunked entity (chunk metadata and checksum trailer *inside* the body) passes through byte-for-byte for the
+//! S3 band to decode. Genuine HTTP trailer fields are parsed and surfaced ([`HttpRequest::trailers`]) but not
+//! interpreted. Streaming *sends* remain a follow-up on the same seam; `Framing::SpliceBody` is deliberately not used
+//! here, and its doc comment says why (over kTLS a splice moves one TLS record per op and the cap cannot be amortised,
+//! and a body carrying its own framing cannot be de-framed on the way past).
 //!
-//! The raw head block is preserved and handed to the handler verbatim
-//! ([`HttpRequest::raw_head`]) for diagnostics; SigV4 canonicalizes from the
-//! parsed header views - borrows into that same buffer, values as sent - not
-//! by re-parsing the raw block, so the codec never gets between the S3 layer
-//! and the wire.
+//! The raw head block is preserved and handed to the handler verbatim ([`HttpRequest::raw_head`]) for diagnostics;
+//! SigV4 canonicalizes from the parsed header views - borrows into that same buffer, values as sent - not by re-parsing
+//! the raw block, so the codec never gets between the S3 layer and the wire.
 
 mod chunked;
 mod date;
@@ -123,22 +86,19 @@ pub use date::HttpDate;
 pub use framer::{HttpConfig, HttpConn};
 pub use head::{HeaderView, Version};
 pub use protocol::{
-    HttpDeferPermit, HttpDeferred, HttpRequest, HttpStreamDeferred,
-    HttpVerdict, Stage, protocol, protocol_deferrable, protocol_streaming,
+    HttpDeferPermit, HttpDeferred, HttpRequest, HttpStreamDeferred, HttpVerdict, Stage, protocol, protocol_deferrable,
+    protocol_streaming,
 };
 #[cfg(feature = "uring-fs")]
 pub use protocol::{protocol_fs, protocol_streaming_fs};
 pub use response::{HttpResponse, IntoBytes, ScreenedHeader, header_pair_ok};
 
-/// Pure codec entry points exposed to the fuzz crate (`fuzz/`) under `__fuzz`
-/// only - the `http` analogue of the net stack's `frame_step` re-export.
-/// Never part of the stable API.
+/// Pure codec entry points exposed to the fuzz crate (`fuzz/`) under `__fuzz` only - the `http` analogue of the net
+/// stack's `frame_step` re-export. Never part of the stable API.
 ///
-/// The targets under `fuzz/fuzz_targets/`: `http_frame` driving
-/// [`fuzz::drive_frame`], `http_head` driving [`fuzz::head_facts`] and
-/// [`fuzz::index_agrees`], and `http_chunked` driving
-/// [`fuzz::chunk_scan`] then [`fuzz::chunk_decode`], each asserting the
-/// codec's delivery-safety and agreement invariants -- seeded under
+/// The targets under `fuzz/fuzz_targets/`: `http_frame` driving [`fuzz::drive_frame`], `http_head` driving
+/// [`fuzz::head_facts`] and [`fuzz::index_agrees`], and `http_chunked` driving [`fuzz::chunk_scan`] then
+/// [`fuzz::chunk_decode`], each asserting the codec's delivery-safety and agreement invariants -- seeded under
 /// `fuzz/corpus/` with the golden botocore shapes.
 #[cfg(feature = "__fuzz")]
 pub mod fuzz {
@@ -146,15 +106,11 @@ pub mod fuzz {
 
     use super::chunked::{self, ChunkScan};
     use super::framer::{HttpConfig, HttpConn, frame};
-    use super::head::{
-        HeadIndex, HeaderView, MAX_HEADERS, frame_facts, frame_facts_indexed,
-        parse_head,
-    };
+    use super::head::{HeadIndex, HeaderView, MAX_HEADERS, frame_facts, frame_facts_indexed, parse_head};
     use crate::net::Framing;
 
-    /// Drive the framing state machine over `data`, feeding progressively
-    /// longer prefixes so the resumable phases (chunk scan, head re-parse) run
-    /// exactly as a drip-fed socket drives them. Returns the terminal verdict.
+    /// Drive the framing state machine over `data`, feeding progressively longer prefixes so the resumable phases
+    /// (chunk scan, head re-parse) run exactly as a drip-fed socket drives them. Returns the terminal verdict.
     pub fn drive_frame(data: &[u8]) -> Framing {
         let cfg = HttpConfig::default();
         let mut conn = HttpConn::new(());
@@ -168,51 +124,36 @@ pub mod fuzz {
         verdict
     }
 
-    /// Run the head tokenizer and semantic rules over `data`, returning the
-    /// head length, the expect-continue flag, whether the body verdict was
-    /// `Ok` (the body enum itself stays crate-private), and the **screened
+    /// Run the head tokenizer and semantic rules over `data`, returning the head length, the expect-continue flag,
+    /// whether the body verdict was `Ok` (the body enum itself stays crate-private), and the **screened
     /// request-target**; `Err` is the die-with status.
     ///
-    /// The target is here so a fuzz target can assert on it. Without it the
-    /// request-target screen - the largest surface the codec grew - was
-    /// exercised by every input and observable by none, which is a target
-    /// that cannot fail.
-    pub fn head_facts(
-        data: &[u8],
-    ) -> Result<Option<(usize, bool, bool, &str)>, u16> {
-        Ok(frame_facts(data)?
-            .map(|f| (f.len, f.expects_continue, f.body.is_ok(), f.target)))
+    /// The target is here so a fuzz target can assert on it. Without it the request-target screen - the largest surface
+    /// the codec grew - was exercised by every input and observable by none, which is a target that cannot fail.
+    pub fn head_facts(data: &[u8]) -> Result<Option<(usize, bool, bool, &str)>, u16> {
+        Ok(frame_facts(data)?.map(|f| (f.len, f.expects_continue, f.body.is_ok(), f.target)))
     }
 
-    /// Whether the index the framer records for `data` describes the
-    /// complete head at its front and rebuilds the same view a tokenize of
-    /// that head gives, which is what dispatch relies on. `None` when `data`
-    /// holds no complete head.
+    /// Whether the index the framer records for `data` describes the complete head at its front and rebuilds the same
+    /// view a tokenize of that head gives, which is what dispatch relies on. `None` when `data` holds no complete head.
     pub fn index_agrees(data: &[u8]) -> Option<bool> {
         let mut index = HeadIndex::default();
         let len = frame_facts_indexed(data, &mut index).ok()??.len;
         let head = &data[..len];
         let mut viewed = [HeaderView::EMPTY; MAX_HEADERS];
         let mut parsed = [HeaderView::EMPTY; MAX_HEADERS];
-        Some(
-            index.view(head, &mut viewed)
-                == parse_head(head, &mut parsed).ok().flatten(),
-        )
+        Some(index.view(head, &mut viewed) == parse_head(head, &mut parsed).ok().flatten())
     }
 
-    /// Resumable chunk scan over a body region: `Ok(Some(extent))` once the
-    /// message completes, `Ok(None)` for need-more, `Err(status)` for
-    /// malformed or oversized input.
+    /// Resumable chunk scan over a body region: `Ok(Some(extent))` once the message completes, `Ok(None)` for
+    /// need-more, `Err(status)` for malformed or oversized input.
     pub fn chunk_scan(body: &[u8]) -> Result<Option<usize>, u16> {
         chunked::scan(body, &mut ChunkScan::default())
     }
 
-    /// One-shot decode of a fully framed chunked body into its entity bytes
-    /// and trailer fields.
+    /// One-shot decode of a fully framed chunked body into its entity bytes and trailer fields.
     #[allow(clippy::result_unit_err)]
-    pub fn chunk_decode(
-        body: &[u8],
-    ) -> Result<(Cow<'_, [u8]>, Vec<HeaderView<'_>>), ()> {
+    pub fn chunk_decode(body: &[u8]) -> Result<(Cow<'_, [u8]>, Vec<HeaderView<'_>>), ()> {
         chunked::decode(body)
     }
 }

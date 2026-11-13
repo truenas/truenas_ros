@@ -1,28 +1,20 @@
-//! Process signals for a daemon: block them once, then receive them as
-//! values on one thread.
+//! Process signals for a daemon: block them once, then receive them as values on one thread.
 //!
-//! No handler is ever installed. The process blocks the signals it acts on
-//! ([`block`]) on its main thread **before any other thread exists** - every
-//! thread created afterwards inherits the mask - and then exactly one thread
-//! receives them, either by waiting ([`Blocked::wait`],
-//! [`Blocked::wait_timeout`]) or through a [`SignalFd`] it can poll next to
-//! other descriptors. Nothing here runs in signal context, so there is no
-//! async-signal-safety to reason about, no handler chaining, and no
-//! process-global handler state; the reactors never see a signal at all.
-//! That is the daemon shape the net server documents and relies on: its
-//! loop is woken only by completions, and a shutdown is an eventfd poke.
+//! No handler is ever installed. The process blocks the signals it acts on ([`block`]) on its main thread **before any
+//! other thread exists** - every thread created afterwards inherits the mask - and then exactly one thread receives
+//! them, either by waiting ([`Blocked::wait`], [`Blocked::wait_timeout`]) or through a [`SignalFd`] it can poll next to
+//! other descriptors. Nothing here runs in signal context, so there is no async-signal-safety to reason about, no
+//! handler chaining, and no process-global handler state; the reactors never see a signal at all. That is the daemon
+//! shape the net server documents and relies on: its loop is woken only by completions, and a shutdown is an eventfd
+//! poke.
 //!
-//! The one mutation of process-global state, the mask, happens only when
-//! asked and on the thread that asks. A signal that arrives at a thread
-//! which has it unblocked takes its default action - for `SIGTERM` that is
-//! the process ending - which is why the order matters: block first, then
-//! spawn. The mask is copied into every task created from the thread that
-//! holds it, a forked process as much as a thread (`CLONE_CLEAR_SIGHAND`
-//! resets handlers, not the mask), so a child forked after [`block`] with
-//! no thread of its own waiting on the set never takes those signals'
-//! default action either. For the credential broker that is the point: it
-//! ignores a cgroup-wide `SIGTERM` and keeps minting identities while the
-//! daemon drains, dying when the daemon drops it.
+//! The one mutation of process-global state, the mask, happens only when asked and on the thread that asks. A signal
+//! that arrives at a thread which has it unblocked takes its default action - for `SIGTERM` that is the process
+//! ending - which is why the order matters: block first, then spawn. The mask is copied into every task created from
+//! the thread that holds it, a forked process as much as a thread (`CLONE_CLEAR_SIGHAND` resets handlers, not the
+//! mask), so a child forked after [`block`] with no thread of its own waiting on the set never takes those signals'
+//! default action either. For the credential broker that is the point: it ignores a cgroup-wide `SIGTERM` and keeps
+//! minting identities while the daemon drains, dying when the daemon drops it.
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -52,10 +44,9 @@ use std::time::Duration;
 
 /// The signals a daemon acts on.
 ///
-/// Deliberately the daemon vocabulary and nothing more, and closed: the
-/// realtime range and the fault signals have no place in a set a thread
-/// waits on, and `SIGCHLD` is displaced by the pidfd every child here is
-/// forked with. A [`Blocked`] yields only signals its own set named.
+/// Deliberately the daemon vocabulary and nothing more, and closed: the realtime range and the fault signals have no
+/// place in a set a thread waits on, and `SIGCHLD` is displaced by the pidfd every child here is forked with. A
+/// [`Blocked`] yields only signals its own set named.
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Signal {
@@ -104,9 +95,8 @@ impl TryFrom<i32> for Signal {
 
 /// A set of signals (`sigset_t`), built only from [`Signal`]s.
 ///
-/// Equality is membership: every set starts from the all-zero pattern and
-/// `sigaddset`/`sigdelset` only flip single bits, so two sets with the same
-/// members are the same bytes.
+/// Equality is membership: every set starts from the all-zero pattern and `sigaddset`/`sigdelset` only flip single
+/// bits, so two sets with the same members are the same bytes.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SigSet(libc::sigset_t);
@@ -121,9 +111,8 @@ impl SigSet {
     /// The empty set.
     pub fn empty() -> SigSet {
         let mut set = MaybeUninit::<libc::sigset_t>::zeroed();
-        // SAFETY: `zeroed` already initialized every byte (all-zero is the
-        // empty set); `sigemptyset` rewrites the words the kernel reads and
-        // cannot fail for a valid pointer.
+        // SAFETY: `zeroed` already initialized every byte (all-zero is the empty set); `sigemptyset` rewrites the words
+        // the kernel reads and cannot fail for a valid pointer.
         unsafe {
             libc::sigemptyset(set.as_mut_ptr());
             SigSet(set.assume_init())
@@ -177,13 +166,10 @@ impl std::fmt::Debug for SigSet {
     }
 }
 
-/// Who sent a signal, as the siginfo reports it. For `kill(2)` and
-/// `tgkill(2)` (`SI_USER`, `SI_TKILL`) the kernel stamps the sender's pid
-/// and real uid itself. For `SI_QUEUE` it relays what the sender wrote:
-/// `sigqueue(3)` fills its own pid and real uid, but `rt_sigqueueinfo(2)`
-/// accepts any values there, so under `SI_QUEUE` this is the sender's
-/// claim. Informational in every case, never an authorization input. A
-/// signal the kernel raised itself has no sender.
+/// Who sent a signal, as the siginfo reports it. For `kill(2)` and `tgkill(2)` (`SI_USER`, `SI_TKILL`) the kernel
+/// stamps the sender's pid and real uid itself. For `SI_QUEUE` it relays what the sender wrote: `sigqueue(3)` fills its
+/// own pid and real uid, but `rt_sigqueueinfo(2)` accepts any values there, so under `SI_QUEUE` this is the sender's
+/// claim. Informational in every case, never an authorization input. A signal the kernel raised itself has no sender.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sender {
     /// The sending process.
@@ -197,27 +183,23 @@ pub struct Sender {
 pub struct Delivered {
     /// Which signal.
     pub signal: Signal,
-    /// Who sent it, where the siginfo carries a sender; see [`Sender`] for
-    /// which origins the kernel vouches for.
+    /// Who sent it, where the siginfo carries a sender; see [`Sender`] for which origins the kernel vouches for.
     pub sender: Option<Sender>,
 }
 
 fn sender_of(code: i32, pid: libc::pid_t, uid: libc::uid_t) -> Option<Sender> {
-    // Only these origins fill the sender fields; for the rest the same
-    // bytes mean something else and must not be read as a pid.
-    matches!(code, libc::SI_USER | libc::SI_QUEUE | libc::SI_TKILL)
-        .then_some(Sender { pid, uid })
+    // Only these origins fill the sender fields; for the rest the same bytes mean something else and must not be read
+    // as a pid.
+    matches!(code, libc::SI_USER | libc::SI_QUEUE | libc::SI_TKILL).then_some(Sender { pid, uid })
 }
 
 impl Delivered {
     fn from_siginfo(info: &libc::siginfo_t) -> Result<Delivered> {
         let signal = Signal::try_from(info.si_signo)?;
-        // SAFETY: the call filled every byte of `info`, so the two union
-        // fields hold initialized integers whatever `si_code` is, which is
-        // all the getters need. The values name a sender only for the codes
-        // `sender_of` keeps: `SI_USER` (the `_kill` layout) and
-        // `SI_QUEUE`/`SI_TKILL` (the `_rt` layout) both begin with
-        // `_pid, _uid`, the offsets the getters read.
+        // SAFETY: the call filled every byte of `info`, so the two union fields hold initialized integers whatever
+        // `si_code` is, which is all the getters need. The values name a sender only for the codes `sender_of` keeps:
+        // `SI_USER` (the `_kill` layout) and `SI_QUEUE`/`SI_TKILL` (the `_rt` layout) both begin with `_pid, _uid`, the
+        // offsets the getters read.
         let (pid, uid) = unsafe { (info.si_pid(), info.si_uid()) };
         Ok(Delivered {
             signal,
@@ -229,27 +211,20 @@ impl Delivered {
         let signal = Signal::try_from(info.ssi_signo as i32)?;
         Ok(Delivered {
             signal,
-            sender: sender_of(
-                info.ssi_code,
-                info.ssi_pid as libc::pid_t,
-                info.ssi_uid as libc::uid_t,
-            ),
+            sender: sender_of(info.ssi_code, info.ssi_pid as libc::pid_t, info.ssi_uid as libc::uid_t),
         })
     }
 }
 
 /// Block `set` on the calling thread.
 ///
-/// Call this on the main thread before any other thread exists: a thread
-/// inherits its creator's mask, so that one call covers the whole process,
-/// and a thread created earlier would keep the set unblocked and take a
-/// signal's default action on the whole process. The returned [`Blocked`]
-/// is the proof the set is blocked here and the handle to receive from it.
+/// Call this on the main thread before any other thread exists: a thread inherits its creator's mask, so that one call
+/// covers the whole process, and a thread created earlier would keep the set unblocked and take a signal's default
+/// action on the whole process. The returned [`Blocked`] is the proof the set is blocked here and the handle to receive
+/// from it.
 pub fn block(set: SigSet) -> Result<Blocked> {
     // SAFETY: a valid set; the old-mask pointer may be null.
-    let rc = unsafe {
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set.0, ptr::null_mut())
-    };
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set.0, ptr::null_mut()) };
     // `pthread_sigmask` returns the error number directly.
     if rc != 0 {
         return Err(Errno::from_raw(rc));
@@ -259,54 +234,40 @@ pub fn block(set: SigSet) -> Result<Blocked> {
 
 /// [`block`], and then confirm the whole process is covered.
 ///
-/// `block` can only report on the thread it ran on. That is the *contract* -
-/// block before any other thread exists, and every later thread inherits the
-/// mask - but nothing enforces it, so a process that spawns first and blocks
-/// second gets `Ok` and still dies on `SIGTERM`, taking the default action on
-/// a thread that was already running. This is the same call with the
-/// contract checked: every other thread in the process must already have the
-/// set blocked.
+/// `block` can only report on the thread it ran on. That is the *contract* - block before any other thread exists, and
+/// every later thread inherits the mask - but nothing enforces it, so a process that spawns first and blocks second
+/// gets `Ok` and still dies on `SIGTERM`, taking the default action on a thread that was already running. This is the
+/// same call with the contract checked: every other thread in the process must already have the set blocked.
 ///
-/// **The check is why this is a second function rather than a stricter
-/// `block`.** A test harness is multi-threaded by the time any test runs -
-/// `cargo test` runs a binary's tests as threads - so refusing there would
-/// fail suites that are doing nothing wrong, this crate's own included. A
-/// daemon calls this one; a test calls [`block`].
+/// **The check is why this is a second function rather than a stricter `block`.** A test harness is multi-threaded by
+/// the time any test runs - `cargo test` runs a binary's tests as threads - so refusing there would fail suites that
+/// are doing nothing wrong, this crate's own included. A daemon calls this one; a test calls [`block`].
 ///
-/// Reads `/proc/self/task/*/status`, so it needs `/proc` mounted, and
-/// refuses when it is not: an `Ok` from this function is supposed to mean
-/// the process is covered, and it cannot mean that unverified. A thread that
-/// exits mid-scan is skipped - it can no longer take a default action - and
-/// one created mid-scan inherited the mask this call has already set, so it
-/// is covered by construction.
+/// Reads `/proc/self/task/*/status`, so it needs `/proc` mounted, and refuses when it is not: an `Ok` from this
+/// function is supposed to mean the process is covered, and it cannot mean that unverified. A thread that exits
+/// mid-scan is skipped - it can no longer take a default action - and one created mid-scan inherited the mask this call
+/// has already set, so it is covered by construction.
 ///
-/// Errors [`Errno::EBUSY`] when a thread is found without the set, and
-/// [`Errno::ENOSYS`] when the check itself could not run - `/proc` absent, or
-/// a `status` this code cannot parse. Both are reported **after** blocking on
-/// this thread: the mask is set either way, and only the report differs, so a
-/// caller that decides to carry on is no worse off than one that called
-/// [`block`].
+/// Errors [`Errno::EBUSY`] when a thread is found without the set, and [`Errno::ENOSYS`] when the check itself could
+/// not run - `/proc` absent, or a `status` this code cannot parse. Both are reported **after** blocking on this thread:
+/// the mask is set either way, and only the report differs, so a caller that decides to carry on is no worse off than
+/// one that called [`block`].
 pub fn block_strict(set: SigSet) -> Result<Blocked> {
     let blocked = block(set)?;
     let me = gettid();
-    let dir =
-        std::fs::read_dir("/proc/self/task").map_err(|_| Errno::ENOSYS)?;
+    let dir = std::fs::read_dir("/proc/self/task").map_err(|_| Errno::ENOSYS)?;
     for entry in dir {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
-        let Some(tid) = name.to_str().and_then(|t| t.parse::<i32>().ok())
-        else {
+        let Some(tid) = name.to_str().and_then(|t| t.parse::<i32>().ok()) else {
             continue;
         };
         if tid == me {
             continue;
         }
         // Gone between the listing and the read: it can take no action.
-        let Ok(status) = std::fs::read_to_string(
-            std::path::Path::new("/proc/self/task")
-                .join(&name)
-                .join("status"),
-        ) else {
+        let Ok(status) = std::fs::read_to_string(std::path::Path::new("/proc/self/task").join(&name).join("status"))
+        else {
             continue;
         };
         let Some(mask) = sig_blk(&status) else {
@@ -319,47 +280,39 @@ pub fn block_strict(set: SigSet) -> Result<Blocked> {
     Ok(blocked)
 }
 
-/// This thread's kernel tid, which is what names its `/proc/self/task` entry.
-/// `std::thread::ThreadId` is not it.
+/// This thread's kernel tid, which is what names its `/proc/self/task` entry. `std::thread::ThreadId` is not it.
 fn gettid() -> i32 {
     // SAFETY: `gettid` takes no arguments, reads no memory and cannot fail.
     unsafe { libc::syscall(libc::SYS_gettid) as i32 }
 }
 
-/// Whether a thread whose blocked-signal mask is `mask` has every signal in
-/// `set` blocked. Bit `n-1` of the mask is signal `n`.
+/// Whether a thread whose blocked-signal mask is `mask` has every signal in `set` blocked. Bit `n-1` of the mask is
+/// signal `n`.
 ///
-/// Asks the set itself rather than walking [`SigSet::ALL`]: that list is the
-/// `Signal` enum's, and a signal outside it would be waved through by a
-/// covering test built from it. Nothing can put one there today - `add` and
-/// `of` both take a `Signal` - but the check that decides whether a process
-/// is covered should not be the one that has to be revisited when the enum
-/// grows.
+/// Asks the set itself rather than walking [`SigSet::ALL`]: that list is the `Signal` enum's, and a signal outside it
+/// would be waved through by a covering test built from it. Nothing can put one there today - `add` and `of` both take
+/// a `Signal` - but the check that decides whether a process is covered should not be the one that has to be revisited
+/// when the enum grows.
 fn mask_covers(set: &SigSet, mask: u64) -> bool {
     (1..=64).all(|n| {
-        // SAFETY: a valid set; `sigismember` answers 0/1 for a signal in
-        // range and -1 for one that is not, all of which read as "absent".
+        // SAFETY: a valid set; `sigismember` answers 0/1 for a signal in range and -1 for one that is not, all of which
+        // read as "absent".
         let member = unsafe { libc::sigismember(&set.0, n) == 1 };
         !member || mask & (1u64 << (n - 1)) != 0
     })
 }
 
-/// The `SigBlk:` mask out of a `/proc/<pid>/task/<tid>/status`, or `None` if
-/// the field is absent or unparseable - which is a `/proc` this code does not
-/// understand, not a thread that is covered.
+/// The `SigBlk:` mask out of a `/proc/<pid>/task/<tid>/status`, or `None` if the field is absent or unparseable - which
+/// is a `/proc` this code does not understand, not a thread that is covered.
 fn sig_blk(status: &str) -> Option<u64> {
-    let field = status
-        .lines()
-        .find_map(|l| l.strip_prefix("SigBlk:"))?
-        .trim();
+    let field = status.lines().find_map(|l| l.strip_prefix("SigBlk:"))?.trim();
     u64::from_str_radix(field, 16).ok()
 }
 
-/// A set of signals blocked on this thread (and on every thread created
-/// after [`block`] ran), and the ways to receive one of them.
+/// A set of signals blocked on this thread (and on every thread created after [`block`] ran), and the ways to receive
+/// one of them.
 ///
-/// Receiving is for one thread: two threads waiting on overlapping sets race
-/// for each delivery.
+/// Receiving is for one thread: two threads waiting on overlapping sets race for each delivery.
 #[derive(Clone, Copy, Debug)]
 pub struct Blocked {
     set: SigSet,
@@ -373,53 +326,43 @@ impl Blocked {
 
     /// Wait for one signal in the set.
     ///
-    /// `sigwaitinfo(2)`: the signal is dequeued, never delivered, so no
-    /// handler runs anywhere. Retries `EINTR`.
+    /// `sigwaitinfo(2)`: the signal is dequeued, never delivered, so no handler runs anywhere. Retries `EINTR`.
     pub fn wait(&self) -> Result<Delivered> {
         let mut info = MaybeUninit::<libc::siginfo_t>::uninit();
-        // SAFETY: a valid set and a writable siginfo the call fills on
-        // success.
-        retry_on_eintr(|| unsafe {
-            libc::sigwaitinfo(&self.set.0, info.as_mut_ptr())
-        })?;
+        // SAFETY: a valid set and a writable siginfo the call fills on success.
+        retry_on_eintr(|| unsafe { libc::sigwaitinfo(&self.set.0, info.as_mut_ptr()) })?;
         // SAFETY: a non-negative return means the call filled `info`.
         Delivered::from_siginfo(unsafe { info.assume_init_ref() })
     }
 
-    /// [`Blocked::wait`] with a deadline: `None` when `timeout` passes with
-    /// nothing pending. A timeout is the natural place for reload hysteresis
-    /// or a periodic liveness check, without a second thread.
+    /// [`Blocked::wait`] with a deadline: `None` when `timeout` passes with nothing pending. A timeout is the natural
+    /// place for reload hysteresis or a periodic liveness check, without a second thread.
     ///
     /// `sigtimedwait(2)`; an `EINTR` restarts the full timeout.
     pub fn wait_timeout(&self, timeout: Duration) -> Result<Option<Delivered>> {
         let ts = timespec_of(timeout);
         let mut info = MaybeUninit::<libc::siginfo_t>::uninit();
-        // SAFETY: a valid set, a writable siginfo, and a timespec that lives
-        // for the call.
-        let r = retry_on_eintr(|| unsafe {
-            libc::sigtimedwait(&self.set.0, info.as_mut_ptr(), &ts)
-        });
+        // SAFETY: a valid set, a writable siginfo, and a timespec that lives for the call.
+        let r = retry_on_eintr(|| unsafe { libc::sigtimedwait(&self.set.0, info.as_mut_ptr(), &ts) });
         match r {
             Ok(_) => {
                 // SAFETY: a non-negative return means the call filled `info`.
-                Delivered::from_siginfo(unsafe { info.assume_init_ref() })
-                    .map(Some)
+                Delivered::from_siginfo(unsafe { info.assume_init_ref() }).map(Some)
             }
             Err(Errno::EAGAIN) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// A descriptor that becomes readable when a signal in the set is
-    /// pending, for a thread that waits on several things at once.
+    /// A descriptor that becomes readable when a signal in the set is pending, for a thread that waits on several
+    /// things at once.
     pub fn signal_fd(&self) -> Result<SignalFd> {
         SignalFd::new(&self.set)
     }
 }
 
-/// A `signalfd(2)` over a blocked set: readable when one of its signals is
-/// pending, so a thread can `poll` it beside a pidfd or an eventfd instead
-/// of blocking in [`Blocked::wait`]. Non-blocking and close-on-exec.
+/// A `signalfd(2)` over a blocked set: readable when one of its signals is pending, so a thread can `poll` it beside a
+/// pidfd or an eventfd instead of blocking in [`Blocked::wait`]. Non-blocking and close-on-exec.
 #[derive(Debug)]
 pub struct SignalFd {
     fd: OwnedFd,
@@ -428,9 +371,7 @@ pub struct SignalFd {
 impl SignalFd {
     fn new(set: &SigSet) -> Result<SignalFd> {
         // SAFETY: a valid set; -1 asks for a new descriptor.
-        let fd = Errno::result(unsafe {
-            libc::signalfd(-1, &set.0, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK)
-        })?;
+        let fd = Errno::result(unsafe { libc::signalfd(-1, &set.0, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) })?;
         // SAFETY: a fresh descriptor this process owns.
         Ok(SignalFd {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
@@ -444,14 +385,11 @@ impl SignalFd {
         let mut info = MaybeUninit::<libc::signalfd_siginfo>::uninit();
         let want = std::mem::size_of::<libc::signalfd_siginfo>();
         // SAFETY: a live fd and a writable buffer of exactly one record.
-        let r = retry_on_eintr(|| unsafe {
-            libc::read(self.fd.as_raw_fd(), info.as_mut_ptr().cast(), want)
-        });
+        let r = retry_on_eintr(|| unsafe { libc::read(self.fd.as_raw_fd(), info.as_mut_ptr().cast(), want) });
         match r {
             Ok(n) if n as usize == want => {
                 // SAFETY: the kernel wrote one whole record.
-                Delivered::from_signalfd(unsafe { info.assume_init_ref() })
-                    .map(Some)
+                Delivered::from_signalfd(unsafe { info.assume_init_ref() }).map(Some)
             }
             // A signalfd read is whole records or nothing.
             Ok(_) => Err(Errno::EIO),
@@ -460,25 +398,21 @@ impl SignalFd {
         }
     }
 
-    /// Wait up to `timeout` (forever for `None`) for a signal, then take
-    /// it. `None` when the timeout passes first. Retries `EINTR`, which
-    /// restarts the full timeout.
+    /// Wait up to `timeout` (forever for `None`) for a signal, then take it. `None` when the timeout passes first.
+    /// Retries `EINTR`, which restarts the full timeout.
     pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<Delivered>> {
         let mut pfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        // `ppoll(2)` rather than `poll(2)`: a timespec reaches as far as
-        // `sigtimedwait`'s does, where poll's int milliseconds stop at
-        // about 24 days and would report a timeout that never passed.
+        // `ppoll(2)` rather than `poll(2)`: a timespec reaches as far as `sigtimedwait`'s does, where poll's int
+        // milliseconds stop at about 24 days and would report a timeout that never passed.
         let ts = timeout.map(timespec_of);
         let tsp = ts.as_ref().map_or(ptr::null(), |t| t as *const _);
-        // SAFETY: one valid pollfd and a timespec (or null) that live for
-        // the call; a null sigmask leaves the mask alone.
-        let n = retry_on_eintr(|| unsafe {
-            libc::ppoll(&mut pfd, 1, tsp, ptr::null())
-        })?;
+        // SAFETY: one valid pollfd and a timespec (or null) that live for the call; a null sigmask leaves the mask
+        // alone.
+        let n = retry_on_eintr(|| unsafe { libc::ppoll(&mut pfd, 1, tsp, ptr::null()) })?;
         if n == 0 {
             return Ok(None);
         }
@@ -500,8 +434,8 @@ impl AsRawFd for SignalFd {
 
 fn timespec_of(d: Duration) -> libc::timespec {
     libc::timespec {
-        // Clamp rather than wrap: a negative tv_sec is EINVAL, and
-        // time_t::MAX seconds is "never" for any practical purpose.
+        // Clamp rather than wrap: a negative tv_sec is EINVAL, and time_t::MAX seconds is "never" for any practical
+        // purpose.
         tv_sec: d.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
         // Below 1e9, so it fits whatever width tv_nsec has.
         tv_nsec: d.subsec_nanos() as libc::c_long,
@@ -512,26 +446,21 @@ fn timespec_of(d: Duration) -> libc::timespec {
 mod tests {
     use super::*;
 
-    /// Raise `s` at the calling thread only (`tgkill`), so a test never
-    /// sends a process-directed signal that another test's thread, with the
-    /// set unblocked, would take at its default action.
+    /// Raise `s` at the calling thread only (`tgkill`), so a test never sends a process-directed signal that another
+    /// test's thread, with the set unblocked, would take at its default action.
     fn raise_here(s: Signal) {
         // SAFETY: the calling thread's own id and a valid signal number.
-        let rc =
-            unsafe { libc::pthread_kill(libc::pthread_self(), s.as_raw()) };
+        let rc = unsafe { libc::pthread_kill(libc::pthread_self(), s.as_raw()) };
         assert_eq!(rc, 0, "pthread_kill");
     }
 
-    /// The sender fields are read out of a union, so which `si_code`
-    /// values are allowed to name a sender is a memory-safety-adjacent
-    /// question and not a formatting one: for anything else the same bytes
-    /// are `si_status`/`si_utime` (a `SIGCHLD`) or `si_addr` (a kernel
-    /// fault), and reporting them as a pid/uid fabricates an origin out of
-    /// unrelated data. `Delivered::sender` is what a caller authorizes on.
+    /// The sender fields are read out of a union, so which `si_code` values are allowed to name a sender is a
+    /// memory-safety-adjacent question and not a formatting one: for anything else the same bytes are
+    /// `si_status`/`si_utime` (a `SIGCHLD`) or `si_addr` (a kernel fault), and reporting them as a pid/uid fabricates
+    /// an origin out of unrelated data. `Delivered::sender` is what a caller authorizes on.
     ///
-    /// Only the three accepted codes are reachable through the public API
-    /// (a raised signal is `SI_TKILL`), so the refusals are pinned on the
-    /// predicate directly.
+    /// Only the three accepted codes are reachable through the public API (a raised signal is `SI_TKILL`), so the
+    /// refusals are pinned on the predicate directly.
     #[test]
     fn only_the_codes_that_carry_a_sender_report_one() {
         for code in [libc::SI_USER, libc::SI_QUEUE, libc::SI_TKILL] {
@@ -541,9 +470,8 @@ mod tests {
                 "si_code {code} fills the sender fields"
             );
         }
-        // A kernel-raised fault carries `si_addr` in those bytes; a timer
-        // carries `si_timerid`/`si_overrun`; a child carries `si_status`
-        // and `si_utime`. None of them is a pid.
+        // A kernel-raised fault carries `si_addr` in those bytes; a timer carries `si_timerid`/`si_overrun`; a child
+        // carries `si_status` and `si_utime`. None of them is a pid.
         for code in [
             libc::SI_KERNEL,
             libc::SI_TIMER,
@@ -553,11 +481,7 @@ mod tests {
             libc::CLD_EXITED,
             libc::CLD_KILLED,
         ] {
-            assert_eq!(
-                sender_of(code, 42, 7),
-                None,
-                "si_code {code} does not name a sender"
-            );
+            assert_eq!(sender_of(code, 42, 7), None, "si_code {code} does not name a sender");
         }
     }
 
@@ -596,30 +520,21 @@ mod tests {
         assert_ne!(set, SigSet::empty());
     }
 
-    /// The calling thread's mask. A null new set leaves the mask alone and
-    /// `how` unread, so this is a pure query.
+    /// The calling thread's mask. A null new set leaves the mask alone and `how` unread, so this is a pure query.
     fn mask_here() -> SigSet {
         let mut out = MaybeUninit::<libc::sigset_t>::zeroed();
         // SAFETY: no new set; `out` is writable and filled on a zero return.
-        let rc = unsafe {
-            libc::pthread_sigmask(
-                libc::SIG_BLOCK,
-                ptr::null(),
-                out.as_mut_ptr(),
-            )
-        };
+        let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, ptr::null(), out.as_mut_ptr()) };
         assert_eq!(rc, 0, "pthread_sigmask");
         // SAFETY: a zero return means the call filled `out`.
         SigSet(unsafe { out.assume_init() })
     }
 
-    /// The `SigBlk:` parse, against the shape `/proc` really writes and
-    /// against shapes it does not.
+    /// The `SigBlk:` parse, against the shape `/proc` really writes and against shapes it does not.
     ///
-    /// A `/proc` this code cannot read is not a process that is covered, so
-    /// an unparseable field has to answer `None` and be refused by the
-    /// caller - the field is 16 hex digits with a leading tab, and the
-    /// mask's bit `n-1` is signal `n`.
+    /// A `/proc` this code cannot read is not a process that is covered, so an unparseable field has to answer `None`
+    /// and be refused by the caller - the field is 16 hex digits with a leading tab, and the mask's bit `n-1` is signal
+    /// `n`.
     #[test]
     fn sig_blk_reads_the_field_the_kernel_writes() {
         let status = "Name:\tfoo\nTgid:\t1\nSigBlk:\t0000000000004002\n\
@@ -634,39 +549,30 @@ mod tests {
         assert!(sig_blk("SigBlk:\tnot-a-mask\n").is_none());
     }
 
-    /// `block_strict` refuses a process whose other threads do not have the
-    /// set blocked, which is the whole of what `block` cannot report.
+    /// `block_strict` refuses a process whose other threads do not have the set blocked, which is the whole of what
+    /// `block` cannot report.
     ///
-    /// **The refusal is what a test binary can observe; the acceptance is
-    /// not.** `cargo test` runs a binary's tests as threads, and its main
-    /// thread never blocks anything, so this process is permanently
-    /// uncovered - which is precisely why this is a second function rather
-    /// than a stricter `block`. Getting a covered process would mean
-    /// forking, and the scan allocates (`read_dir`, `read_to_string`),
-    /// which is the malloc-arena deadlock a fork from a multi-threaded
-    /// harness invites and this repo forbids elsewhere. The acceptance side
-    /// is covered by `mask_covers` instead, which is the decision the loop
-    /// is built out of.
+    /// **The refusal is what a test binary can observe; the acceptance is not.** `cargo test` runs a binary's tests as
+    /// threads, and its main thread never blocks anything, so this process is permanently uncovered - which is
+    /// precisely why this is a second function rather than a stricter `block`. Getting a covered process would mean
+    /// forking, and the scan allocates (`read_dir`, `read_to_string`), which is the malloc-arena deadlock a fork from a
+    /// multi-threaded harness invites and this repo forbids elsewhere. The acceptance side is covered by `mask_covers`
+    /// instead, which is the decision the loop is built out of.
     #[test]
     fn block_strict_refuses_an_uncovered_process() {
         assert!(
-            matches!(
-                block_strict(SigSet::of([Signal::Usr1])),
-                Err(Errno::EBUSY)
-            ),
+            matches!(block_strict(SigSet::of([Signal::Usr1])), Err(Errno::EBUSY)),
             "a process with threads that predate the block was not reported"
         );
-        // And the plain form answers `Ok` on the same process. That is the
-        // defect the strict form exists for, and the reason `block` cannot
-        // simply be made strict.
+        // And the plain form answers `Ok` on the same process. That is the defect the strict form exists for, and the
+        // reason `block` cannot simply be made strict.
         block(SigSet::of([Signal::Usr1])).expect("block is unchanged");
     }
 
     /// The decision `block_strict`'s loop is built out of, both ways.
     ///
-    /// Bit `n-1` of the mask is signal `n`, and *every* signal in the set
-    /// has to be present: a thread with half of them blocked still takes
-    /// the default action on the other half.
+    /// Bit `n-1` of the mask is signal `n`, and *every* signal in the set has to be present: a thread with half of them
+    /// blocked still takes the default action on the other half.
     #[test]
     fn mask_covers_needs_every_signal_in_the_set() {
         let bit = |s: Signal| 1u64 << (s.as_raw() - 1);
@@ -685,9 +591,8 @@ mod tests {
         assert!(mask_covers(&SigSet::empty(), 0));
     }
 
-    /// A signal raised at this thread after blocking is dequeued by `wait`
-    /// as a value, with the kernel's record of who sent it, and no handler
-    /// ran (there is none to run: the process is still here).
+    /// A signal raised at this thread after blocking is dequeued by `wait` as a value, with the kernel's record of who
+    /// sent it, and no handler ran (there is none to run: the process is still here).
     #[test]
     fn wait_receives_a_signal_raised_at_this_thread() {
         let blocked = block(SigSet::of([Signal::Usr1])).expect("block");
@@ -701,12 +606,7 @@ mod tests {
     #[test]
     fn wait_timeout_is_none_until_something_is_pending() {
         let blocked = block(SigSet::of([Signal::Usr2])).expect("block");
-        assert_eq!(
-            blocked
-                .wait_timeout(Duration::from_millis(10))
-                .expect("wait"),
-            None
-        );
+        assert_eq!(blocked.wait_timeout(Duration::from_millis(10)).expect("wait"), None);
         raise_here(Signal::Usr2);
         let d = blocked
             .wait_timeout(Duration::from_secs(5))
@@ -715,8 +615,7 @@ mod tests {
         assert_eq!(d.signal, Signal::Usr2);
     }
 
-    /// The fd form: nothing to read, then readable after a raise, then
-    /// nothing again once taken.
+    /// The fd form: nothing to read, then readable after a raise, then nothing again once taken.
     #[test]
     fn signalfd_reads_a_pending_signal_once() {
         let blocked = block(SigSet::of([Signal::Hup])).expect("block");
@@ -737,15 +636,14 @@ mod tests {
         assert_eq!(fd.read().expect("read"), None, "taken exactly once");
     }
 
-    /// The mask is per thread and inherited at spawn: a thread created
-    /// after `block` can receive the set without blocking it again.
+    /// The mask is per thread and inherited at spawn: a thread created after `block` can receive the set without
+    /// blocking it again.
     #[test]
     fn a_thread_spawned_after_block_inherits_the_mask() {
         let blocked = block(SigSet::of([Signal::Int])).expect("block");
         let t = std::thread::spawn(move || {
-            // Checked before raising: were the mask not inherited, the
-            // raise would end the whole test process rather than fail
-            // this test.
+            // Checked before raising: were the mask not inherited, the raise would end the whole test process rather
+            // than fail this test.
             assert!(
                 mask_here().contains(Signal::Int),
                 "the spawned thread inherits the blocked set"

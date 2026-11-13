@@ -1,6 +1,5 @@
-//! Role-agnostic protocol vocabulary shared across the net roles: addresses,
-//! framing verdicts, close reasons, message bodies, and the reusable
-//! length-prefix framer. No ring code lives here.
+//! Role-agnostic protocol vocabulary shared across the net roles: addresses, framing verdicts, close reasons, message
+//! bodies, and the reusable length-prefix framer. No ring code lives here.
 
 use crate::errno::Errno;
 #[cfg(all(doc, feature = "net-server"))]
@@ -10,9 +9,8 @@ use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
-/// Stream server type and bind address in one type-safe enum: the variant *is*
-/// the server type (the Rust-idiomatic take on `socketserver`'s server class +
-/// `server_address`), so an illegal type/address pairing cannot be expressed.
+/// Stream server type and bind address in one type-safe enum: the variant *is* the server type (the Rust-idiomatic take
+/// on `socketserver`'s server class + `server_address`), so an illegal type/address pairing cannot be expressed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerAddr {
     /// IPv4 TCP (`AF_INET`, `SOCK_STREAM`).
@@ -30,15 +28,13 @@ pub enum ClientAddr {
     Inet(SocketAddr),
     /// A Unix-domain peer (stream clients are unnamed).
     Unix {
-        /// The peer's credentials (`SO_PEERCRED`), fetched between accept and
-        /// the accept handler when `ServerConfig::unix_peercred` is enabled --
-        /// the basis for local authentication. `None` when disabled.
+        /// The peer's credentials (`SO_PEERCRED`), fetched between accept and the accept handler when
+        /// `ServerConfig::unix_peercred` is enabled -- the basis for local authentication. `None` when disabled.
         cred: Option<PeerCred>,
     },
 }
 
-/// Unix-domain peer credentials (`SO_PEERCRED`): the process on the other end
-/// of the socket as of `connect(2)`.
+/// Unix-domain peer credentials (`SO_PEERCRED`): the process on the other end of the socket as of `connect(2)`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerCred {
     /// Peer process id.
@@ -52,150 +48,116 @@ pub struct PeerCred {
 /// A header framer's verdict, given the message bytes accumulated so far.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Framing {
-    /// Read exactly `n` more bytes (one `MSG_WAITALL` recv), then re-check.
-    /// Use when the remaining length is known - efficient, and never
-    /// over-reads.
+    /// Read exactly `n` more bytes (one `MSG_WAITALL` recv), then re-check. Use when the remaining length is known -
+    /// efficient, and never over-reads.
     ///
-    /// Answering this with **nothing buffered** tells the server the
-    /// connection is parked for the *next* message: it carries
-    /// [`ServerConfig::idle_timeout`] and arms no receipt budget. A framer
-    /// mid-message with an empty buffer - a body whose length it parsed out
-    /// of a head it has already consumed - must answer
+    /// Answering this with **nothing buffered** tells the server the connection is parked for the *next* message: it
+    /// carries [`ServerConfig::idle_timeout`] and arms no receipt budget. A framer mid-message with an empty buffer - a
+    /// body whose length it parsed out of a head it has already consumed - must answer
     /// [`NeedInMessage`](Framing::NeedInMessage) instead.
     ///
     /// [`ServerConfig::idle_timeout`]: crate::net::server::ServerConfig::idle_timeout
     Need(usize),
     /// [`Need`](Framing::Need) for a message the peer has already begun.
     ///
-    /// Identical in what it reads. The difference is which clock the read
-    /// carries, exactly as [`MoreInMessage`](Framing::MoreInMessage) is to
-    /// [`More`](Framing::More): this says "a message is under way", so the
-    /// read takes [`ServerConfig::request_timeout`] rather than
-    /// [`ServerConfig::idle_timeout`] and arms
+    /// Identical in what it reads. The difference is which clock the read carries, exactly as
+    /// [`MoreInMessage`](Framing::MoreInMessage) is to [`More`](Framing::More): this says "a message is under way", so
+    /// the read takes [`ServerConfig::request_timeout`] rather than [`ServerConfig::idle_timeout`] and arms
     /// [`ServerConfig::max_receipt_time`].
     ///
-    /// **SECURITY: a framer that answers `Need` here loses both bounds.** A
-    /// peer that sends a partial message and stops is then held by the idle
-    /// clock alone - by nothing at all where that is unset - with its pool
-    /// slot taken at accept, before any authentication. The exact shape is
-    /// easy to reach: a framer that reads a length prefix as its own message,
-    /// consumes it, and answers `Need(payload_len)` from an empty buffer.
+    /// **SECURITY: a framer that answers `Need` here loses both bounds.** A peer that sends a partial message and stops
+    /// is then held by the idle clock alone - by nothing at all where that is unset - with its pool slot taken at
+    /// accept, before any authentication. The exact shape is easy to reach: a framer that reads a length prefix as its
+    /// own message, consumes it, and answers `Need(payload_len)` from an empty buffer.
     ///
     /// [`ServerConfig::idle_timeout`]: crate::net::server::ServerConfig::idle_timeout
     /// [`ServerConfig::request_timeout`]: crate::net::server::ServerConfig::request_timeout
     /// [`ServerConfig::max_receipt_time`]: crate::net::server::ServerConfig::max_receipt_time
     NeedInMessage(usize),
-    /// Read whatever the peer has sent (a chunk, no `MSG_WAITALL`), then
-    /// re-check. Use when scanning for a delimiter of unknown position.
+    /// Read whatever the peer has sent (a chunk, no `MSG_WAITALL`), then re-check. Use when scanning for a delimiter of
+    /// unknown position.
     ///
-    /// Answering this with **nothing buffered** tells the server the
-    /// connection is parked for the *next* message: it carries
-    /// [`ServerConfig::idle_timeout`] and arms no receipt budget. A framer
-    /// mid-message with an empty buffer - a streamed body between windows,
-    /// a chunked body whose head was consumed by the 100-continue dance --
-    /// must answer [`MoreInMessage`](Framing::MoreInMessage) instead.
+    /// Answering this with **nothing buffered** tells the server the connection is parked for the *next* message: it
+    /// carries [`ServerConfig::idle_timeout`] and arms no receipt budget. A framer mid-message with an empty buffer - a
+    /// streamed body between windows, a chunked body whose head was consumed by the 100-continue dance -- must answer
+    /// [`MoreInMessage`](Framing::MoreInMessage) instead.
     ///
     /// [`ServerConfig::idle_timeout`]: crate::net::server::ServerConfig::idle_timeout
     More,
     /// [`More`](Framing::More) for a message the peer has already begun.
     ///
-    /// Identical in what it reads. The difference is which clock the read
-    /// carries: the server cannot tell a mid-message scan from an idle park
-    /// once the framer has consumed everything buffered, and only the framer
-    /// knows. This says "a message is under way", so the read takes
-    /// [`ServerConfig::request_timeout`] rather than
-    /// [`ServerConfig::idle_timeout`] and arms
-    /// [`ServerConfig::max_receipt_time`].
+    /// Identical in what it reads. The difference is which clock the read carries: the server cannot tell a mid-message
+    /// scan from an idle park once the framer has consumed everything buffered, and only the framer knows. This says "a
+    /// message is under way", so the read takes [`ServerConfig::request_timeout`] rather than
+    /// [`ServerConfig::idle_timeout`] and arms [`ServerConfig::max_receipt_time`].
     ///
-    /// **SECURITY: a framer that answers `More` here loses both bounds.** A
-    /// peer that sends a partial message and stops is then held by the idle
-    /// clock alone - by nothing at all where that is unset - with its pool
-    /// slot taken at accept, before any authentication.
+    /// **SECURITY: a framer that answers `More` here loses both bounds.** A peer that sends a partial message and stops
+    /// is then held by the idle clock alone - by nothing at all where that is unset - with its pool slot taken at
+    /// accept, before any authentication.
     ///
     /// [`ServerConfig::idle_timeout`]: crate::net::server::ServerConfig::idle_timeout
     /// [`ServerConfig::request_timeout`]: crate::net::server::ServerConfig::request_timeout
     /// [`ServerConfig::max_receipt_time`]: crate::net::server::ServerConfig::max_receipt_time
     MoreInMessage,
-    /// The message is completely framed: its header is the first
-    /// `header_len` accumulated bytes and its body is `body_len` bytes. The
-    /// server reads any body bytes not already buffered, then delivers the
-    /// message to the body handler.
+    /// The message is completely framed: its header is the first `header_len` accumulated bytes and its body is
+    /// `body_len` bytes. The server reads any body bytes not already buffered, then delivers the message to the body
+    /// handler.
     Complete {
         /// Length of the header portion.
         header_len: usize,
         /// Length of the body portion.
         body_len: usize,
     },
-    /// The message is completely framed, but its **body** should be spliced
-    /// straight from the socket to `fd` (a consumer-owned pipe, e.g. feeding a
-    /// ZFS `lzc_receive`) instead of read into the connection buffer - zero-copy
-    /// (`IORING_OP_SPLICE`). The first `header_len` accumulated bytes are the
-    /// header; the next `body_len` bytes are spliced to `fd`. The server never
-    /// owns or closes `fd`; the framer must read its header with exact
+    /// The message is completely framed, but its **body** should be spliced straight from the socket to `fd` (a
+    /// consumer-owned pipe, e.g. feeding a ZFS `lzc_receive`) instead of read into the connection buffer - zero-copy
+    /// (`IORING_OP_SPLICE`). The first `header_len` accumulated bytes are the header; the next `body_len` bytes are
+    /// spliced to `fd`. The server never owns or closes `fd`; the framer must read its header with exact
     /// [`Framing::Need`] so no body byte is over-read into the buffer.
     ///
-    /// Works over plain TCP/unix **and kernel TLS**: the kernel routes the
-    /// splice through the socket's `splice_read`, which for kTLS is
-    /// `tls_sw_splice_read` - it decrypts and moves plaintext, so the body
-    /// splices in the clear, and body bytes the header read left buffered in
-    /// the kernel's TLS receive list are picked up too. A mid-stream TLS
-    /// control record (a TLS 1.3 KeyUpdate, or an alert) cannot be spliced and
-    /// closes the connection with [`CloseReason::TlsControl`]. NIC-offloaded
-    /// kTLS RX (`tls_device`) uses this **same** `tls_sw_splice_read` path (the
-    /// NIC decrypts, the software layer still frames records with a decrypt
-    /// fallback), so splice is expected to work there too - though it is
-    /// untested without offload-capable hardware. The legacy `TLS_HW_RECORD`
-    /// full-offload mode (TOE-style) delivers a plain stream and is out of
-    /// scope.
+    /// Works over plain TCP/unix **and kernel TLS**: the kernel routes the splice through the socket's `splice_read`,
+    /// which for kTLS is `tls_sw_splice_read` - it decrypts and moves plaintext, so the body splices in the clear, and
+    /// body bytes the header read left buffered in the kernel's TLS receive list are picked up too. A mid-stream TLS
+    /// control record (a TLS 1.3 KeyUpdate, or an alert) cannot be spliced and closes the connection with
+    /// [`CloseReason::TlsControl`]. NIC-offloaded kTLS RX (`tls_device`) uses this **same** `tls_sw_splice_read` path
+    /// (the NIC decrypts, the software layer still frames records with a decrypt fallback), so splice is expected to
+    /// work there too - though it is untested without offload-capable hardware. The legacy `TLS_HW_RECORD` full-offload
+    /// mode (TOE-style) delivers a plain stream and is out of scope.
     ///
-    /// **Over kTLS a splice moves one TLS record and no more, and that cap
-    /// cannot be amortised.** `tls_sw_splice_read` (`net/tls/tls_sw.c`) has
-    /// no loop: it takes one record, splices
-    /// `min(rxm->full_len, len)` of it, and returns - so a body moves in
-    /// `TLS_MAX_PAYLOAD_SIZE` (`1 << 14`, `include/net/tls.h`) steps, each
-    /// blocking an io-wq worker. Queue depth does not help, because
-    /// `tls_rx_reader_acquire` admits one reader per socket at a time and a
-    /// blocked splice holds that gate while it waits for its record; the
-    /// per-connection ceiling is one record per round trip, strictly
-    /// serialised. Plain TCP has neither limit - `tcp_splice_read`
-    /// (`net/ipv4/tcp.c`) loops `while (tss.len)` - so this is a kTLS
-    /// property, not a splice one.
+    /// **Over kTLS a splice moves one TLS record and no more, and that cap cannot be amortised.** `tls_sw_splice_read`
+    /// (`net/tls/tls_sw.c`) has no loop: it takes one record, splices `min(rxm->full_len, len)` of it, and returns - so
+    /// a body moves in `TLS_MAX_PAYLOAD_SIZE` (`1 << 14`, `include/net/tls.h`) steps, each blocking an io-wq worker.
+    /// Queue depth does not help, because `tls_rx_reader_acquire` admits one reader per socket at a time and a blocked
+    /// splice holds that gate while it waits for its record; the per-connection ceiling is one record per round trip,
+    /// strictly serialised. Plain TCP has neither limit - `tcp_splice_read` (`net/ipv4/tcp.c`) loops `while
+    /// (tss.len)` - so this is a kTLS property, not a splice one.
     ///
-    /// **A body that carries its own framing belongs on
-    /// [`Framing::Complete`], not here.** Splice moves opaque bytes, so a
-    /// chunked transfer coding - or an inner encoding whose frame headers
-    /// land at arbitrary offsets inside the outer chunks - cannot be
-    /// de-framed on the way past. The extent named here has to be
-    /// payload the consumer wants verbatim.
+    /// **A body that carries its own framing belongs on [`Framing::Complete`], not here.** Splice moves opaque bytes,
+    /// so a chunked transfer coding - or an inner encoding whose frame headers land at arbitrary offsets inside the
+    /// outer chunks - cannot be de-framed on the way past. The extent named here has to be payload the consumer wants
+    /// verbatim.
     ///
-    /// `fd` must be **blocking** (its `O_NONBLOCK` clear); a non-blocking
-    /// destination is rejected with [`CloseReason::SpliceBadFd`] - see that
-    /// variant for why. Backpressure is the pipe itself: a full pipe blocks
-    /// the splice on an io-wq worker (never the ring), TCP flow control
-    /// pushes back on the sender, and the ring keeps serving other
-    /// connections. Over kTLS, `ServerConfig::request_timeout` (when set)
-    /// also clocks each spliced record - including time blocked on a full
-    /// pipe, which the kernel cannot distinguish from a stalled peer - so a
-    /// consumer draining slower than a record per period is evicted as a
-    /// slow-loris would be.
+    /// `fd` must be **blocking** (its `O_NONBLOCK` clear); a non-blocking destination is rejected with
+    /// [`CloseReason::SpliceBadFd`] - see that variant for why. Backpressure is the pipe itself: a full pipe blocks the
+    /// splice on an io-wq worker (never the ring), TCP flow control pushes back on the sender, and the ring keeps
+    /// serving other connections. Over kTLS, `ServerConfig::request_timeout` (when set) also clocks each spliced
+    /// record - including time blocked on a full pipe, which the kernel cannot distinguish from a stalled peer - so a
+    /// consumer draining slower than a record per period is evicted as a slow-loris would be.
     SpliceBody {
         /// Length of the header portion (buffered).
         header_len: usize,
         /// Length of the body portion (spliced to `fd`).
         body_len: usize,
-        /// Consumer-owned destination fd (borrowed; e.g. a **blocking** pipe
-        /// write end).
+        /// Consumer-owned destination fd (borrowed; e.g. a **blocking** pipe write end).
         fd: RawFd,
     },
     /// The input is malformed; close the connection.
     Invalid,
 }
 
-/// Why a connection is being closed, as reported to the close hook
-/// ([`Server::set_close_hook`]).
+/// Why a connection is being closed, as reported to the close hook ([`Server::set_close_hook`]).
 ///
-/// Rejected (`accept` returned `None`) and load-shed (pool-full) connections
-/// never had per-connection state, so the hook does not fire for them.
+/// Rejected (`accept` returned `None`) and load-shed (pool-full) connections never had per-connection state, so the
+/// hook does not fire for them.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloseReason {
@@ -203,154 +165,119 @@ pub enum CloseReason {
     PeerClosed,
     /// The peer vanished mid-message (EOF or short read inside a frame).
     TruncatedMessage,
-    /// The header framer returned [`Framing::Invalid`] (or an impossible frame,
-    /// e.g. a zero-byte need or a zero-length message).
+    /// The header framer returned [`Framing::Invalid`] (or an impossible frame, e.g. a zero-byte need or a zero-length
+    /// message).
     Malformed,
     /// A message exceeded `ServerConfig::max_request_bytes`.
     TooLarge,
-    /// The body handler ended the connection: it returned [`Response::Close`]
-    /// or [`Response::ReplyClose`], or a [`Response::Defer`] whose permit was
-    /// minted for a different request (see [`DeferPermit`]).
+    /// The body handler ended the connection: it returned [`Response::Close`] or [`Response::ReplyClose`], or a
+    /// [`Response::Defer`] whose permit was minted for a different request (see [`DeferPermit`]).
     HandlerClosed,
-    /// A worker resolved the request with [`Deferred::close`] or
-    /// [`Deferred::reply_close`], or its [`Deferred`] was dropped unresolved
-    /// (lost worker).
+    /// A worker resolved the request with [`Deferred::close`] or [`Deferred::reply_close`], or its [`Deferred`] was
+    /// dropped unresolved (lost worker).
     WorkerClosed,
-    /// An application thread ended the connection via [`PushHandle::close`] --
-    /// outside any request cycle (session revocation, an administrative
-    /// kick). PDUs already queued, including pushes issued before the close,
-    /// were flushed first.
+    /// An application thread ended the connection via [`PushHandle::close`] -- outside any request cycle (session
+    /// revocation, an administrative kick). PDUs already queued, including pushes issued before the close, were flushed
+    /// first.
     PushClosed,
     /// The `idle_timeout` fired while parked for the next request.
     IdleTimeout,
-    /// The `request_timeout` fired: a request had begun arriving (a body, or
-    /// an exact header remainder) but was not fully received in time - the
-    /// slow-loris guard (see `ServerConfig::request_timeout`).
+    /// The `request_timeout` fired: a request had begun arriving (a body, or an exact header remainder) but was not
+    /// fully received in time - the slow-loris guard (see `ServerConfig::request_timeout`).
     RequestTimeout,
-    /// The `max_receipt_time` fired: a message began arriving and was still
-    /// arriving when its total-receipt budget ran out. Unlike
-    /// [`CloseReason::RequestTimeout`] this is not an inactivity verdict --
-    /// the peer may have been sending the whole time, just below the floor
-    /// the deployment set (see `ServerConfig::max_receipt_time`).
+    /// The `max_receipt_time` fired: a message began arriving and was still arriving when its total-receipt budget ran
+    /// out. Unlike [`CloseReason::RequestTimeout`] this is not an inactivity verdict -- the peer may have been sending
+    /// the whole time, just below the floor the deployment set (see `ServerConfig::max_receipt_time`).
     ReceiptTimeout,
     /// The `send_timeout` fired while a reply was stalled (peer not reading).
     SendTimeout,
-    /// Closed by shutdown (graceful drain, or the connection quiesced during
-    /// one). A protocol that answers its last request with its own farewell
-    /// once draining (HTTP's `Connection: close`) reports that close as the
-    /// handler's, [`CloseReason::HandlerClosed`], since it returned the
-    /// flush-close.
+    /// Closed by shutdown (graceful drain, or the connection quiesced during one). A protocol that answers its last
+    /// request with its own farewell once draining (HTTP's `Connection: close`) reports that close as the handler's,
+    /// [`CloseReason::HandlerClosed`], since it returned the flush-close.
     ShuttingDown,
-    /// A push overflowed `ServerConfig::max_send_backlog` - the peer is not
-    /// draining its socket (slow-consumer eviction).
+    /// A push overflowed `ServerConfig::max_send_backlog` - the peer is not draining its socket (slow-consumer
+    /// eviction).
     SendBacklog,
     /// A receive failed with this errno.
     RecvError(Errno),
     /// A send failed with this errno.
     SendError(Errno),
-    /// A file-sourced reply body (`Response::ReplyFile`) could not run or
-    /// failed mid-stream: the server has no fs pool, a second file body
-    /// arrived while one was active, the fs op table was full or staging
-    /// failed (`EBUSY` - shedding this one connection, never the server),
-    /// or a body read failed with this errno.
+    /// A file-sourced reply body (`Response::ReplyFile`) could not run or failed mid-stream: the server has no fs pool,
+    /// a second file body arrived while one was active, the fs op table was full or staging failed (`EBUSY` - shedding
+    /// this one connection, never the server), or a body read failed with this errno.
     FileBody(Errno),
-    /// A file-sourced reply body hit EOF before its declared length: the
-    /// file shrank after the header committed to a Content-Length, which
-    /// the framing cannot renegotiate. The connection closes mid-body so
-    /// the peer sees a truncated transfer rather than a short body
-    /// presented as complete.
+    /// A file-sourced reply body hit EOF before its declared length: the file shrank after the header committed to a
+    /// Content-Length, which the framing cannot renegotiate. The connection closes mid-body so the peer sees a
+    /// truncated transfer rather than a short body presented as complete.
     FileBodyTruncated,
-    /// A kTLS connection delivered a non-`application_data` record (a
-    /// post-handshake handshake message, TLS 1.3 KeyUpdate, or alert). The
-    /// server closes rather than handle it (renegotiation/rekey are out of
-    /// scope); a `close_notify` from the peer surfaces here too.
+    /// A kTLS connection delivered a non-`application_data` record (a post-handshake handshake message, TLS 1.3
+    /// KeyUpdate, or alert). The server closes rather than handle it (renegotiation/rekey are out of scope); a
+    /// `close_notify` from the peer surfaces here too.
     TlsControl,
-    /// The fd a framer handed to [`Framing::SpliceBody`] was unusable: closed,
-    /// or opened **non-blocking**. This is a consumer bug, not peer behavior.
-    /// The destination must be a blocking pipe write end: `splice` promotes
-    /// the output fd's `O_NONBLOCK` to `SPLICE_F_NONBLOCK`, making a full
-    /// pipe fail `-EAGAIN` before the socket is read - indistinguishable
-    /// from "no socket data", which would spin the readiness poll at full
-    /// CPU. A blocking pipe blocks the splice on an io-wq worker instead:
+    /// The fd a framer handed to [`Framing::SpliceBody`] was unusable: closed, or opened **non-blocking**. This is a
+    /// consumer bug, not peer behavior. The destination must be a blocking pipe write end: `splice` promotes the output
+    /// fd's `O_NONBLOCK` to `SPLICE_F_NONBLOCK`, making a full pipe fail `-EAGAIN` before the socket is read -
+    /// indistinguishable from "no socket data", which would spin the readiness poll at full CPU. A blocking pipe blocks
+    /// the splice on an io-wq worker instead:
     /// that is the transfer's designed backpressure.
     ///
-    /// Over kTLS the block is not only "the pipe is full" - see the
-    /// `net::server` module docs: the destination pipe's mutex is held
-    /// across a wait for the next TLS record, so one silent peer stalls
-    /// every other body spliced to the same fd. Give each connection its
-    /// own pipe there.
+    /// Over kTLS the block is not only "the pipe is full" - see the `net::server` module docs: the destination pipe's
+    /// mutex is held across a wait for the next TLS record, so one silent peer stalls every other body spliced to the
+    /// same fd. Give each connection its own pipe there.
     SpliceBadFd,
-    /// A framer named a [`Framing::SpliceBody`] destination that another
-    /// connection is already splicing to. **Sharing one pipe across
-    /// connections corrupts bodies, not just latency.**
+    /// A framer named a [`Framing::SpliceBody`] destination that another connection is already splicing to. **Sharing
+    /// one pipe across connections corrupts bodies, not just latency.**
     ///
-    /// A splice moves at most what the transport hands over in one call -
-    /// over kTLS, one TLS record - and the reactor resubmits the remainder
-    /// as a fresh op. Between those two, another connection's splice can
-    /// take the pipe's mutex and write its own bytes, so two bodies sharing
-    /// a destination **interleave**. The head-of-line stall a shared pipe
-    /// also causes (see [`CloseReason::SpliceBadFd`]) is the same
-    /// configuration, noticed from the other end.
+    /// A splice moves at most what the transport hands over in one call - over kTLS, one TLS record - and the reactor
+    /// resubmits the remainder as a fresh op. Between those two, another connection's splice can take the pipe's mutex
+    /// and write its own bytes, so two bodies sharing a destination **interleave**. The head-of-line stall a shared
+    /// pipe also causes (see [`CloseReason::SpliceBadFd`]) is the same configuration, noticed from the other end.
     ///
-    /// Give each connection its own pipe. This is a consumer bug, not peer
-    /// behaviour - a captured-fd closure is the shape that invites it.
+    /// Give each connection its own pipe. This is a consumer bug, not peer behaviour - a captured-fd closure is the
+    /// shape that invites it.
     SpliceFdInUse,
-    /// A kTLS [`Framing::SpliceBody`] on a role with no request clock -
-    /// `ServerConfig::request_timeout`, or its client spelling
-    /// `ClientConfig::response_timeout`.
+    /// A kTLS [`Framing::SpliceBody`] on a role with no request clock - `ServerConfig::request_timeout`, or its client
+    /// spelling `ClientConfig::response_timeout`.
     ///
-    /// That clock is the *only* bound a kTLS body splice has. It blocks on
-    /// an io-wq worker awaiting the next TLS record, which no linked
-    /// timeout can reach (the kernel arms one only after the head op's
-    /// `issue()` returns, and a blocking splice's does not return until it
-    /// completes), so the standalone watchdog keyed on `request_timeout` is
-    /// what cancels a stalled one. Unset, a peer that handshakes, declares
-    /// a large body and goes silent holds its slot, an io-wq worker and its
-    /// destination pipe's mutex for as long as it likes.
+    /// That clock is the *only* bound a kTLS body splice has. It blocks on an io-wq worker awaiting the next TLS
+    /// record, which no linked timeout can reach (the kernel arms one only after the head op's `issue()` returns, and a
+    /// blocking splice's does not return until it completes), so the standalone watchdog keyed on `request_timeout` is
+    /// what cancels a stalled one. Unset, a peer that handshakes, declares a large body and goes silent holds its slot,
+    /// an io-wq worker and its destination pipe's mutex for as long as it likes.
     ///
-    /// Refused rather than served unbounded: the remedy is one
-    /// configuration line, and a silent unbounded stall is not something an
-    /// operator can find. Plain-TCP splices are unaffected - their
-    /// readiness-poll path is already clocked.
+    /// Refused rather than served unbounded: the remedy is one configuration line, and a silent unbounded stall is not
+    /// something an operator can find. Plain-TCP splices are unaffected - their readiness-poll path is already clocked.
     SpliceUnbounded,
 }
 
 /// The current message's body, as handed to the `body` handler.
 ///
-/// Dereferences to `[u8]` for in-place reads. [`Body::take`] yields the bytes
-/// as an owned `Vec<u8>` - a zero-copy move when the body was **placed** in
-/// its own allocation (bodies at or over
-/// `ServerConfig::body_placement_threshold`), an in-place truncate when the
-/// body owns a **window** of a larger wire buffer (no allocation, at most one
-/// overlapping move - how the http codec delivers a de-chunked entity), and a
-/// copy-out otherwise - so a handler that offloads work writes one pattern
-/// that is never wrong: `let payload = body.take();`. After `take` the body
-/// reads as empty. A handler that writes the body out or keeps it whole
-/// takes [`Body::take_owned`] instead, which hands over the storage with
-/// the body's range in it and never copies. A server's placed body that is
-/// dropped untaken goes back to the ring's body pool for the next one.
+/// Dereferences to `[u8]` for in-place reads. [`Body::take`] yields the bytes as an owned `Vec<u8>` - a zero-copy move
+/// when the body was **placed** in its own allocation (bodies at or over `ServerConfig::body_placement_threshold`), an
+/// in-place truncate when the body owns a **window** of a larger wire buffer (no allocation, at most one overlapping
+/// move - how the http codec delivers a de-chunked entity), and a copy-out otherwise - so a handler that offloads work
+/// writes one pattern that is never wrong: `let payload = body.take();`. After `take` the body reads as empty. A
+/// handler that writes the body out or keeps it whole takes [`Body::take_owned`] instead, which hands over the storage
+/// with the body's range in it and never copies. A server's placed body that is dropped untaken goes back to the ring's
+/// body pool for the next one.
 pub struct Body<'a> {
     inner: BodyInner<'a>,
-    /// The ring's body pool, for a body that owns storage the reactor read
-    /// it into, so storage the handler leaves untaken goes back for the
-    /// next body rather than being freed.
+    /// The ring's body pool, for a body that owns storage the reactor read it into, so storage the handler leaves
+    /// untaken goes back for the next body rather than being freed.
     #[cfg(feature = "net-server")]
     home: Option<crate::net::core::bodypool::Home>,
 }
 
 enum BodyInner<'a> {
-    /// Borrowed from a larger wire message a codec carved the payload out
-    /// of, as the http codec delivers an entity.
+    /// Borrowed from a larger wire message a codec carved the payload out of, as the http codec delivers an entity.
     #[cfg_attr(not(feature = "http"), allow(dead_code))]
     Inline(&'a [u8]),
-    /// Borrowed from the connection's accumulate buffer, mutably, so a
-    /// handler may transform the message where it lies, as one that opens
-    /// a sealed body does.
+    /// Borrowed from the connection's accumulate buffer, mutably, so a handler may transform the message where it lies,
+    /// as one that opens a sealed body does.
     InlineMut(&'a mut [u8]),
-    /// Owns an allocation in which the body is the `start..start + len`
-    /// window - the whole allocation for a placed body; a sub-window when a
-    /// codec carved the payload out of a larger wire message (the bytes
-    /// around the window are dead framing). `None` once taken.
+    /// Owns an allocation in which the body is the `start..start + len` window - the whole allocation for a placed
+    /// body; a sub-window when a codec carved the payload out of a larger wire message (the bytes around the window are
+    /// dead framing). `None` once taken.
     Owned {
         buf: Option<Vec<u8>>,
         start: usize,
@@ -376,11 +303,9 @@ impl<'a> Body<'a> {
         }
     }
 
-    /// The bytes mutably, for a handler that transforms the message where
-    /// it lies rather than taking it, which the reactor's own delivery
-    /// allows, inline or placed, and the bytes read as transformed
-    /// afterwards. `None` for a body a codec borrowed out of a larger
-    /// message, which [`Body::take`] copies out.
+    /// The bytes mutably, for a handler that transforms the message where it lies rather than taking it, which the
+    /// reactor's own delivery allows, inline or placed, and the bytes read as transformed afterwards. `None` for a body
+    /// a codec borrowed out of a larger message, which [`Body::take`] copies out.
     pub fn bytes_mut(&mut self) -> Option<&mut [u8]> {
         match &mut self.inner {
             BodyInner::Inline(_) => None,
@@ -399,14 +324,9 @@ impl<'a> Body<'a> {
         Body::owned_range(bytes, 0, len)
     }
 
-    /// A body owning `bytes` whose payload is the `start..start + len`
-    /// window. [`Body::take`] truncates to the window in place - ownership
-    /// moves, the allocation doesn't.
-    pub(crate) fn owned_range(
-        bytes: Vec<u8>,
-        start: usize,
-        len: usize,
-    ) -> Body<'a> {
+    /// A body owning `bytes` whose payload is the `start..start + len` window. [`Body::take`] truncates to the window
+    /// in place - ownership moves, the allocation doesn't.
+    pub(crate) fn owned_range(bytes: Vec<u8>, start: usize, len: usize) -> Body<'a> {
         debug_assert!(
             start.checked_add(len).is_some_and(|end| end <= bytes.len()),
             "window out of bounds"
@@ -422,25 +342,18 @@ impl<'a> Body<'a> {
         }
     }
 
-    /// Send the storage of a body that owns some back to `pool` if the
-    /// handler drops the body without taking it, and take the `bytes` it
-    /// has on the pool's count off as the body is taken or dropped. A body
-    /// that borrows its bytes owns nothing to send and has nothing counted.
+    /// Send the storage of a body that owns some back to `pool` if the handler drops the body without taking it, and
+    /// take the `bytes` it has on the pool's count off as the body is taken or dropped. A body that borrows its bytes
+    /// owns nothing to send and has nothing counted.
     #[cfg(feature = "net-server")]
-    pub(crate) fn set_home(
-        &mut self,
-        pool: &crate::net::core::bodypool::PoolHandle,
-        bytes: usize,
-    ) {
+    pub(crate) fn set_home(&mut self, pool: &crate::net::core::bodypool::PoolHandle, bytes: usize) {
         if matches!(self.inner, BodyInner::Owned { buf: Some(_), .. }) {
-            self.home =
-                Some(crate::net::core::bodypool::Home::new(pool, bytes));
+            self.home = Some(crate::net::core::bodypool::Home::new(pool, bytes));
         }
     }
 
-    /// Take ownership of the body bytes: a zero-copy move when placed, an
-    /// in-place truncate (no allocation) when the body owns a window of a
-    /// larger buffer, a copy otherwise. The body reads as empty afterwards.
+    /// Take ownership of the body bytes: a zero-copy move when placed, an in-place truncate (no allocation) when the
+    /// body owns a window of a larger buffer, a copy otherwise. The body reads as empty afterwards.
     pub fn take(&mut self) -> Vec<u8> {
         match &mut self.inner {
             BodyInner::Inline(bytes) => {
@@ -459,8 +372,8 @@ impl<'a> Body<'a> {
                     #[cfg(feature = "net-server")]
                     drop(self.home.take());
                     if *start > 0 {
-                        // Overlapping move within the same allocation; the
-                        // window becomes the prefix, the tail is dropped.
+                        // Overlapping move within the same allocation; the window becomes the prefix, the tail is
+                        // dropped.
                         v.copy_within(*start..*start + *len, 0);
                     }
                     v.truncate(*len);
@@ -472,15 +385,13 @@ impl<'a> Body<'a> {
         }
     }
 
-    /// The whole allocation of a body that owns one, a placed body, with
-    /// the range the body takes in it, and the body reads as empty
-    /// afterwards. Nothing moves, so the bytes around the range are still
-    /// there, which the http codec de-chunks in place.
+    /// The whole allocation of a body that owns one, a placed body, with the range the body takes in it, and the body
+    /// reads as empty afterwards. Nothing moves, so the bytes around the range are still there, which the http codec
+    /// de-chunks in place.
     ///
-    /// `None` for a body that borrows the receive buffer or a larger
-    /// message, which is left as it was. [`Body::take`] would copy one of
-    /// those, so a handler that must not copy writes it out where it lies,
-    /// as `FsConn::pwritev2_from` does.
+    /// `None` for a body that borrows the receive buffer or a larger message, which is left as it was. [`Body::take`]
+    /// would copy one of those, so a handler that must not copy writes it out where it lies, as `FsConn::pwritev2_from`
+    /// does.
     pub fn take_owned(&mut self) -> Option<(Vec<u8>, std::ops::Range<usize>)> {
         match &mut self.inner {
             BodyInner::Inline(_) | BodyInner::InlineMut(_) => None,
@@ -531,44 +442,35 @@ impl std::fmt::Debug for Body<'_> {
     }
 }
 
-/// One outgoing reply segment's bytes: an owned buffer, or a borrow that
-/// lives for the whole process. The send queue holds a segment until the
-/// peer drains it - across partial writes and suspended sends - so a
-/// borrowed segment must outlive every retry; `'static` is the bound that
-/// makes pinning it free, and it is exactly what a canned reply body or
-/// protocol constant already has. Anything shorter-lived must be owned.
+/// One outgoing reply segment's bytes: an owned buffer, or a borrow that lives for the whole process. The send queue
+/// holds a segment until the peer drains it - across partial writes and suspended sends - so a borrowed segment must
+/// outlive every retry; `'static` is the bound that makes pinning it free, and it is exactly what a canned reply body
+/// or protocol constant already has. Anything shorter-lived must be owned.
 ///
-/// Constructed via `From`/`Into`: `Vec<u8>`, `String`, `&'static [u8]`,
-/// `&'static str`, and `Cow<'static, [u8]>` all convert without copying.
-/// [`SendBuf::recycled`] makes an owned segment whose storage the ring's
-/// body pool takes back once sent. Dereferences to `[u8]`.
+/// Constructed via `From`/`Into`: `Vec<u8>`, `String`, `&'static [u8]`, `&'static str`, and `Cow<'static, [u8]>` all
+/// convert without copying. [`SendBuf::recycled`] makes an owned segment whose storage the ring's body pool takes back
+/// once sent. Dereferences to `[u8]`.
 ///
-/// Opaque rather than a `Cow` alias so a shared-buffer representation (one
-/// cached body serving many connections at once) can arrive without
-/// changing the segment type.
+/// Opaque rather than a `Cow` alias so a shared-buffer representation (one cached body serving many connections at
+/// once) can arrive without changing the segment type.
 #[derive(Debug)]
 pub struct SendBuf(Seg);
 
 #[derive(Debug)]
 enum Seg {
     Cow(Cow<'static, [u8]>),
-    /// Owned bytes whose storage goes to the ring's body pool once they are
-    /// sent ([`SendBuf::recycled`]).
+    /// Owned bytes whose storage goes to the ring's body pool once they are sent ([`SendBuf::recycled`]).
     ///
-    /// Only storage a consumer marks goes home, never every owned segment.
-    /// The pool keeps a give that fits under its target, and the target
-    /// covers the room bodies claimed out of it leave behind, so small
-    /// replies no one claimed would fill that room, and a body coming home
-    /// would be freed in their place.
+    /// Only storage a consumer marks goes home, never every owned segment. The pool keeps a give that fits under its
+    /// target, and the target covers the room bodies claimed out of it leave behind, so small replies no one claimed
+    /// would fill that room, and a body coming home would be freed in their place.
     Recycled(Vec<u8>),
     /// A file-body chunk the kernel filled in a ring buffer.
     ///
-    /// Raw because the buffer belongs to the reactor's pool, not to this
-    /// segment: it is valid until the segment flushes and the id is handed
-    /// back, and the pool outlives every connection by field order
-    /// (`Reactor` declares `table` before its pools, so connections drop
-    /// first). Nothing else can name the id in the meantime - the kernel
-    /// hands a buffer to exactly one completion.
+    /// Raw because the buffer belongs to the reactor's pool, not to this segment: it is valid until the segment flushes
+    /// and the id is handed back, and the pool outlives every connection by field order (`Reactor` declares `table`
+    /// before its pools, so connections drop first). Nothing else can name the id in the meantime - the kernel hands a
+    /// buffer to exactly one completion.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     Pooled {
         ptr: *mut u8,
@@ -578,23 +480,20 @@ enum Seg {
 }
 
 impl SendBuf {
-    /// Owned bytes whose storage goes to the serving ring's body pool once
-    /// every byte is sent, for the next claim on that ring to reuse.
-    /// Meant for a buffer drawn from `BodyRecycler::claim`, so a reply
-    /// built in it costs no allocation once the pool is warm. The pool's
-    /// byte law keeps it while demand needs it and frees it otherwise. A
-    /// deferred reply is marked by sending it with
-    /// `Deferred::reply_recycled`.
+    /// Owned bytes whose storage goes to the serving ring's body pool once every byte is sent, for the next claim on
+    /// that ring to reuse.
+    /// Meant for a buffer drawn from `BodyRecycler::claim`, so a reply built in it costs no allocation once the pool is
+    /// warm. The pool's byte law keeps it while demand needs it and frees it otherwise. A deferred reply is marked by
+    /// sending it with `Deferred::reply_recycled`.
     ///
-    /// Its storage goes home as well when its connection closes before it
-    /// is sent. It is freed as any owned segment is when it is empty or
-    /// when the ring has no body pool.
+    /// Its storage goes home as well when its connection closes before it is sent. It is freed as any owned segment is
+    /// when it is empty or when the ring has no body pool.
     pub fn recycled(bytes: Vec<u8>) -> SendBuf {
         SendBuf(Seg::Recycled(bytes))
     }
 
-    /// The storage of a [`recycled`](Self::recycled) segment, for its queue
-    /// entry to send home as it drops, or `None` for any other kind.
+    /// The storage of a [`recycled`](Self::recycled) segment, for its queue entry to send home as it drops, or `None`
+    /// for any other kind.
     #[cfg(feature = "net-server")]
     pub(crate) fn recycled_mut(&mut self) -> Option<&mut Vec<u8>> {
         match &mut self.0 {
@@ -606,9 +505,8 @@ impl SendBuf {
     /// A segment over `len` bytes of pool buffer `bid`.
     ///
     /// # Safety
-    /// `ptr` must address at least `len` initialized bytes of the buffer
-    /// the pool holds under `bid`, and that buffer must stay lent until
-    /// this segment is dropped or its id released.
+    /// `ptr` must address at least `len` initialized bytes of the buffer the pool holds under `bid`, and that buffer
+    /// must stay lent until this segment is dropped or its id released.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) unsafe fn pooled(ptr: *mut u8, len: usize, bid: u16) -> SendBuf {
         SendBuf(Seg::Pooled { ptr, len, bid })
@@ -630,12 +528,9 @@ impl std::ops::Deref for SendBuf {
         match &self.0 {
             Seg::Cow(c) => c,
             Seg::Recycled(bytes) => bytes,
-            // SAFETY: the constructor's contract - `len` initialized bytes
-            // that stay valid while this segment lives.
+            // SAFETY: the constructor's contract - `len` initialized bytes that stay valid while this segment lives.
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
-            Seg::Pooled { ptr, len, .. } => unsafe {
-                std::slice::from_raw_parts(*ptr, *len)
-            },
+            Seg::Pooled { ptr, len, .. } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
         }
     }
 }
@@ -726,9 +621,8 @@ fn read_prefix(header: &[u8], width: PrefixWidth, endian: Endian) -> u64 {
     v
 }
 
-/// A reusable header framer for a fixed-width length prefix: the first `width`
-/// bytes are an unsigned integer giving the message length; `includes_self`
-/// means that length counts the prefix itself. Works with any state `U`.
+/// A reusable header framer for a fixed-width length prefix: the first `width` bytes are an unsigned integer giving the
+/// message length; `includes_self` means that length counts the prefix itself. Works with any state `U`.
 pub fn length_prefix_header<U>(
     width: PrefixWidth,
     endian: Endian,
@@ -764,8 +658,7 @@ mod tests {
 
     #[test]
     fn length_prefix_header_verdicts() {
-        let mut h =
-            length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false);
+        let mut h = length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false);
         assert_eq!(h(&[], &mut ()), Framing::Need(4));
         assert_eq!(h(&[0, 0], &mut ()), Framing::Need(2));
         assert_eq!(
@@ -779,8 +672,7 @@ mod tests {
 
     #[test]
     fn length_prefix_includes_self() {
-        let mut h =
-            length_prefix_header::<()>(PrefixWidth::U16, Endian::Big, true);
+        let mut h = length_prefix_header::<()>(PrefixWidth::U16, Endian::Big, true);
         // total length 10 includes the 2-byte prefix -> body is 8.
         assert_eq!(
             h(&[0, 10], &mut ()),
@@ -795,8 +687,8 @@ mod tests {
 
     #[test]
     fn owned_range_take_truncates_in_place() {
-        // The wire form around a windowed body is dead framing; take()
-        // compacts to the window without leaving the allocation.
+        // The wire form around a windowed body is dead framing; take() compacts to the window without leaving the
+        // allocation.
         let wire = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
         let p0 = wire.as_ptr() as usize;
         let mut b = Body::owned_range(wire, 3, 5);
@@ -823,14 +715,12 @@ mod tests {
         let wire = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
         let p0 = wire.as_ptr() as usize;
         let mut b = Body::placed(wire);
-        let (w, range) =
-            b.take_owned().expect("owned body hands its buffer over");
+        let (w, range) = b.take_owned().expect("owned body hands its buffer over");
         assert_eq!(w.as_ptr() as usize, p0);
         assert_eq!((w.len(), range), (15, 0..15));
         assert!(b.is_empty());
         assert!(b.take_owned().is_none(), "handed over once");
-        // A window of a larger allocation comes with its place in it, and
-        // the bytes around it stay where they were.
+        // A window of a larger allocation comes with its place in it, and the bytes around it stay where they were.
         let mut b = Body::owned_range(b"..abc.".to_vec(), 2, 3);
         let (w, range) = b.take_owned().expect("a window is owned too");
         assert_eq!((&w[..], range), (&b"..abc."[..], 2..5));
@@ -840,8 +730,7 @@ mod tests {
         assert!(b.take_owned().is_none());
         assert_eq!(&b[..], b"abc");
         assert!(b.bytes_mut().is_none());
-        // A handler may change the bytes where they lie when the reactor
-        // delivered them, inline or placed.
+        // A handler may change the bytes where they lie when the reactor delivered them, inline or placed.
         let mut abc = *b"abc";
         let mut b = Body::inline_mut(&mut abc);
         assert!(b.take_owned().is_none());

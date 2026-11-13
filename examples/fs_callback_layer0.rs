@@ -1,17 +1,13 @@
 //! Layer 0 callback substrate - a self-contained, compiling design probe.
 //!
-//! A completion-callback model for the FS reactor on the io_uring net-server
-//! base, distilled to the part that actually stresses the borrow checker:
-//! `submit(op, ReqKey, Callback)`, a drain loop firing each callback with
-//! `(&Completion, &mut ReqState, &mut Staging)`, and a `Staging` buffer with
-//! `linked_run` (IOSQE_IO_LINK) for the atomic-PUT tail.
+//! A completion-callback model for the FS reactor on the io_uring net-server base, distilled to the part that actually
+//! stresses the borrow checker: `submit(op, ReqKey, Callback)`, a drain loop firing each callback with `(&Completion,
+//! &mut ReqState, &mut Staging)`, and a `Staging` buffer with `linked_run` (IOSQE_IO_LINK) for the atomic-PUT tail.
 //!
-//! NOT wired to the real reactor. The "ring" here is a synchronous mock that
-//! runs each op with one real syscall against a temp dir, so the
-//! ownership/borrow structure is exactly what the real reactor would have,
-//! while the demo genuinely creates files (and shows link fail-fast leaving no
-//! half-written object behind). No futures anywhere - a request's terminal
-//! action is a plain boxed closure; the callback layer needs no async runtime.
+//! NOT wired to the real reactor. The "ring" here is a synchronous mock that runs each op with one real syscall against
+//! a temp dir, so the ownership/borrow structure is exactly what the real reactor would have, while the demo genuinely
+//! creates files (and shows link fail-fast leaving no half-written object behind). No futures anywhere - a request's
+//! terminal action is a plain boxed closure; the callback layer needs no async runtime.
 //!
 //! Run: `cargo run --example fs_callback_layer0`
 
@@ -22,9 +18,8 @@ use std::os::unix::io::RawFd;
 
 // ---- identity: OpToken rides *in* the SQE/CQE `user_data` field -------------
 
-/// Our op identity: packs (generation, slot). This is the value we put in the
-/// ABI `user_data` field; naming it `OpToken` keeps the logical identity
-/// distinct from that field.
+/// Our op identity: packs (generation, slot). This is the value we put in the ABI `user_data` field; naming it
+/// `OpToken` keeps the logical identity distinct from that field.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 struct OpToken(u64);
 impl OpToken {
@@ -125,9 +120,8 @@ impl Staging {
         });
     }
 
-    /// A kernel-linked run (IOSQE_IO_LINK across all but the last): ordered and
-    /// fail-fast - the tail is cancelled if any op fails. This is the atomic
-    /// write -> fsync -> rename -> dirfsync tail.
+    /// A kernel-linked run (IOSQE_IO_LINK across all but the last): ordered and fail-fast - the tail is cancelled if
+    /// any op fails. This is the atomic write -> fsync -> rename -> dirfsync tail.
     fn linked_run(&mut self, items: Vec<(OpSpec, Callback)>, key: ReqKey) {
         let n = items.len();
         for (i, (op, cb)) in items.into_iter().enumerate() {
@@ -202,9 +196,8 @@ impl Core {
         OpToken::pack(e.generation, slot)
     }
 
-    /// Retrieve + recycle the slot for a completion. A stale/foreign token
-    /// (wrong generation, or already reaped) returns None and is inert - the
-    /// property the routing/close-last fuzzer checks.
+    /// Retrieve + recycle the slot for a completion. A stale/foreign token (wrong generation, or already reaped)
+    /// returns None and is inert - the property the routing/close-last fuzzer checks.
     fn take_op(&mut self, tok: OpToken) -> Option<(Callback, ReqKey)> {
         let e = self.slots.get_mut(tok.slot() as usize)?;
         if !e.used || e.generation != tok.generation() {
@@ -234,19 +227,12 @@ impl Reactor {
         key
     }
 
-    /// Execute staged ops into completions. A linked run runs in order and
-    /// severs its tail (-ECANCELED) on the first failure - the mock's stand-in
-    /// for IOSQE_IO_LINK.
+    /// Execute staged ops into completions. A linked run runs in order and severs its tail (-ECANCELED) on the first
+    /// failure - the mock's stand-in for IOSQE_IO_LINK.
     fn flush(&mut self) {
         let runs = std::mem::take(&mut self.staging.runs);
         let mut severed = false;
-        for Staged {
-            op,
-            key,
-            cb,
-            link_next,
-        } in runs
-        {
+        for Staged { op, key, cb, link_next } in runs {
             let token = self.core.alloc(key, cb);
             let (res, out) = if severed {
                 (-libc::ECANCELED, OpOutput::None)
@@ -263,9 +249,8 @@ impl Reactor {
         }
     }
 
-    /// Fire each completion's callback with ONLY its own request state + the
-    /// stage buffer. `reqs` and `staging` are disjoint fields, so the reactor
-    /// hands out &mut to each at once - the borrow split that makes this legal.
+    /// Fire each completion's callback with ONLY its own request state + the stage buffer. `reqs` and `staging` are
+    /// disjoint fields, so the reactor hands out &mut to each at once - the borrow split that makes this legal.
     fn drain(&mut self) {
         while let Some(comp) = self.core.cq.pop_front() {
             let Some((cb, key)) = self.core.take_op(comp.token) else {
@@ -273,11 +258,9 @@ impl Reactor {
             };
             let state = &mut self.reqs[key];
             let staging = &mut self.staging;
-            // A panicking callback must not abort the drain (pyos reports it
-            // unraisable); catch_unwind is the equivalent.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                move || cb(&comp, state, staging),
-            ));
+            // A panicking callback must not abort the drain (pyos reports it unraisable); catch_unwind is the
+            // equivalent.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || cb(&comp, state, staging)));
         }
     }
 
@@ -295,27 +278,13 @@ impl Reactor {
 // ---- the op executor: one real syscall per op ------------------------------
 
 fn execute(op: &OpSpec) -> (i32, OpOutput) {
-    // SAFETY: every fd/path handed to these calls is live for the call's
-    // duration (owned by the ReqState / OpSpec the caller still holds).
+    // SAFETY: every fd/path handed to these calls is live for the call's duration (owned by the ReqState / OpSpec the
+    // caller still holds).
     unsafe {
         match op {
-            OpSpec::OpenAt {
-                dir,
-                path,
-                flags,
-                mode,
-            } => {
-                let fd = libc::openat(
-                    *dir,
-                    path.as_ptr(),
-                    *flags,
-                    *mode as libc::c_uint,
-                );
-                if fd < 0 {
-                    errno_out()
-                } else {
-                    (fd, OpOutput::Fd(fd))
-                }
+            OpSpec::OpenAt { dir, path, flags, mode } => {
+                let fd = libc::openat(*dir, path.as_ptr(), *flags, *mode as libc::c_uint);
+                if fd < 0 { errno_out() } else { (fd, OpOutput::Fd(fd)) }
             }
             OpSpec::StatIsDir { dir, path } => {
                 let mut stx: libc::stat = std::mem::zeroed();
@@ -327,11 +296,7 @@ fn execute(op: &OpSpec) -> (i32, OpOutput) {
                 }
             }
             OpSpec::Write { fd, data } => {
-                let n = libc::write(
-                    *fd,
-                    data.as_ptr() as *const libc::c_void,
-                    data.len(),
-                );
+                let n = libc::write(*fd, data.as_ptr() as *const libc::c_void, data.len());
                 if n < 0 {
                     errno_out()
                 } else {
@@ -344,45 +309,25 @@ fn execute(op: &OpSpec) -> (i32, OpOutput) {
                 old,
                 newdir,
                 new,
-            } => io_result(libc::renameat(
-                *olddir,
-                old.as_ptr(),
-                *newdir,
-                new.as_ptr(),
-            )),
+            } => io_result(libc::renameat(*olddir, old.as_ptr(), *newdir, new.as_ptr())),
             OpSpec::Close { fd } => io_result(libc::close(*fd)),
-            OpSpec::Unlink { dir, path } => {
-                io_result(libc::unlinkat(*dir, path.as_ptr(), 0))
-            }
+            OpSpec::Unlink { dir, path } => io_result(libc::unlinkat(*dir, path.as_ptr(), 0)),
         }
     }
 }
 fn io_result(r: i32) -> (i32, OpOutput) {
-    if r < 0 {
-        errno_out()
-    } else {
-        (0, OpOutput::None)
-    }
+    if r < 0 { errno_out() } else { (0, OpOutput::None) }
 }
 fn errno_out() -> (i32, OpOutput) {
-    let e = std::io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(libc::EIO);
+    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
     (-e, OpOutput::None)
 }
 
 // ---- handlers, written as callback chains (no futures) ---------------------
 
-/// Atomic durable PUT: open tmp (a round-trip for the fd), then the ordered
-/// write -> fsync -> rename -> dirfsync tail as one linked run.
-fn put(
-    rt: &mut Reactor,
-    dir: RawFd,
-    tmp: &str,
-    fin: &str,
-    body: Vec<u8>,
-    done: Done,
-) {
+/// Atomic durable PUT: open tmp (a round-trip for the fd), then the ordered write -> fsync -> rename -> dirfsync tail
+/// as one linked run.
+fn put(rt: &mut Reactor, dir: RawFd, tmp: &str, fin: &str, body: Vec<u8>, done: Done) {
     let key = rt.begin(ReqState {
         key: 0,
         dir,
@@ -439,8 +384,8 @@ fn on_tmp_open(c: &Completion, st: &mut ReqState, stage: &mut Staging) {
 }
 
 fn on_step(c: &Completion, st: &mut ReqState, stage: &mut Staging) {
-    // The first failure finalizes + cleans up; the linked tail's -ECANCELED
-    // completions land here too but are ignored (st.failed already set).
+    // The first failure finalizes + cleans up; the linked tail's -ECANCELED completions land here too but are ignored
+    // (st.failed already set).
     if c.res < 0 && !st.failed {
         st.failed = true;
         st.finish(Err(c.res));
@@ -453,11 +398,7 @@ fn on_step(c: &Completion, st: &mut ReqState, stage: &mut Staging) {
             Box::new(ignore),
         );
         if st.tmp_fd >= 0 {
-            stage.one(
-                OpSpec::Close { fd: st.tmp_fd },
-                st.key,
-                Box::new(ignore),
-            );
+            stage.one(OpSpec::Close { fd: st.tmp_fd }, st.key, Box::new(ignore));
         }
     }
 }
@@ -472,11 +413,7 @@ fn on_committed(c: &Completion, st: &mut ReqState, stage: &mut Staging) {
         st.failed = r.is_err();
         st.finish(r);
         if st.tmp_fd >= 0 {
-            stage.one(
-                OpSpec::Close { fd: st.tmp_fd },
-                st.key,
-                Box::new(ignore),
-            );
+            stage.one(OpSpec::Close { fd: st.tmp_fd }, st.key, Box::new(ignore));
         }
     }
 }
@@ -493,21 +430,13 @@ fn stat_then_open(rt: &mut Reactor, dir: RawFd, name: &str, done: Done) {
         failed: false,
         done: Some(done),
     });
-    rt.staging.one(
-        OpSpec::StatIsDir {
-            dir,
-            path: cstr(name),
-        },
-        key,
-        Box::new(on_stat),
-    );
+    rt.staging
+        .one(OpSpec::StatIsDir { dir, path: cstr(name) }, key, Box::new(on_stat));
 }
 
 fn on_stat(c: &Completion, st: &mut ReqState, stage: &mut Staging) {
     match c.out {
-        OpOutput::IsDir(true) => {
-            st.finish(Ok("is a directory (not opened)".to_string()))
-        }
+        OpOutput::IsDir(true) => st.finish(Ok("is a directory (not opened)".to_string())),
         OpOutput::IsDir(false) => stage.one(
             OpSpec::OpenAt {
                 dir: st.dir,
@@ -560,9 +489,7 @@ fn main() {
     report_file(&base, "obj1");
     report_absent(&base, "obj1.tmp");
 
-    println!(
-        "== Demo 2: atomic PUT (rename fails -> fail-fast, no half-write) =="
-    );
+    println!("== Demo 2: atomic PUT (rename fails -> fail-fast, no half-write) ==");
     put(
         &mut rt,
         dir,
@@ -605,14 +532,8 @@ fn main() {
 fn open_dir(p: &std::path::Path) -> RawFd {
     let c = CString::new(p.as_os_str().as_bytes()).unwrap();
     // SAFETY: `c` is a valid NUL-terminated path live for the call.
-    let fd =
-        unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-    assert!(
-        fd >= 0,
-        "open dir {:?}: {}",
-        p,
-        std::io::Error::last_os_error()
-    );
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    assert!(fd >= 0, "open dir {:?}: {}", p, std::io::Error::last_os_error());
     fd
 }
 
@@ -628,9 +549,5 @@ fn report_file(base: &std::path::Path, name: &str) {
     }
 }
 fn report_absent(base: &std::path::Path, name: &str) {
-    println!(
-        "  {:?} present? {}  (expected: false)",
-        name,
-        base.join(name).exists()
-    );
+    println!("  {:?} present? {}  (expected: false)", name, base.join(name).exists());
 }

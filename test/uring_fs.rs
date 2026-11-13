@@ -1,15 +1,12 @@
-//! Integration tests for the `uring_fs` io_uring reactor - live data and
-//! metadata ops against a tempdir, every one stamped with a self personality
-//! and resolved against an [`Anchor`] (there is no unstamped or
-//! absolute-path variant to test).
+//! Integration tests for the `uring_fs` io_uring reactor - live data and metadata ops against a tempdir, every one
+//! stamped with a self personality and resolved against an [`Anchor`] (there is no unstamped or absolute-path variant
+//! to test).
 //!
-//! Like `test/net_server.rs`, these **skip** (return early) when io_uring is
-//! unavailable - a bare sandbox blocks the syscalls (ENOSYS/EPERM/EACCES) --
-//! and `TRUENAS_ROS_REQUIRE_IO_URING=1` turns that skip into a hard failure.
+//! Like `test/net_server.rs`, these **skip** (return early) when io_uring is unavailable - a bare sandbox blocks the
+//! syscalls (ENOSYS/EPERM/EACCES) -- and `TRUENAS_ROS_REQUIRE_IO_URING=1` turns that skip into a hard failure.
 //!
-//! `UringFs` is `!Send` (single-thread ring), so the harness runs the loop on
-//! the test thread and drives the client from a scoped thread; a panic-safe
-//! guard stops the loop however the client exits.
+//! `UringFs` is `!Send` (single-thread ring), so the harness runs the loop on the test thread and drives the client
+//! from a scoped thread; a panic-safe guard stops the loop however the client exits.
 #![cfg(all(target_os = "linux", feature = "uring-fs"))]
 
 use std::ffi::CString;
@@ -18,15 +15,11 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
-use truenas_ros::sync_fs::{
-    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxAttr,
-    StatxMask, ZfsAttr,
-};
+use truenas_ros::sync_fs::{AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxAttr, StatxMask, ZfsAttr};
 use truenas_ros::uring_fs::{
-    Advice, Anchor, AsUser, Caps, CredBroker, CredHandle, EnrichSpec, File,
-    FsConfig, FsHandle, IdentityCache, Leaf, Order, Personality,
-    PrivilegedXattrs, QueryOptions, ReopenAccess, RwFlags, ShutdownHandle,
-    TreeCursor, TreeOptions, UringFs, query_directory, query_tree,
+    Advice, Anchor, AsUser, Caps, CredBroker, CredHandle, EnrichSpec, File, FsConfig, FsHandle, IdentityCache, Leaf,
+    Order, Personality, PrivilegedXattrs, QueryOptions, ReopenAccess, RwFlags, ShutdownHandle, TreeCursor, TreeOptions,
+    UringFs, query_directory, query_tree,
 };
 use truenas_ros::{Errno, Error};
 
@@ -40,14 +33,12 @@ mod zfs_dir;
 use privilege::{is_root, root_or_skip};
 use zfs_dir::zfs_dir_or_skip;
 
-/// Hold a ring-side `fsetxattr` refusal to the `TRUENAS_ROS_REQUIRE_XATTRS`
-/// gate, returning whether the set stuck.
+/// Hold a ring-side `fsetxattr` refusal to the `TRUENAS_ROS_REQUIRE_XATTRS` gate, returning whether the set stuck.
 ///
-/// The probes here set through the fs handle rather than `libc`, so the
-/// shared module's path helper cannot serve them - but what a refusal means
-/// is identical: every xattr assertion behind it is about to be skipped, and
-/// a runner whose scratch filesystem dropped xattr support has to fail where
-/// CI arms the gate rather than pass green having tested nothing.
+/// The probes here set through the fs handle rather than `libc`, so the shared module's path helper cannot serve them -
+/// but what a refusal means is identical: every xattr assertion behind it is about to be skipped, and a runner whose
+/// scratch filesystem dropped xattr support has to fail where CI arms the gate rather than pass green having tested
+/// nothing.
 fn fd_xattr_ok<T>(what: &str, res: &Result<T, Error>) -> bool {
     if let Err(e) = res {
         xattr_probe::refusal_is_allowed(what, e);
@@ -55,32 +46,18 @@ fn fd_xattr_ok<T>(what: &str, res: &Result<T, Error>) -> bool {
     res.is_ok()
 }
 
-/// Single-buffer read into a buffer the caller filled first, over the
-/// vectored, flagged form.
+/// Single-buffer read into a buffer the caller filled first, over the vectored, flagged form.
 ///
-/// The many tests that read a single buffer wrap `preadv2` here rather than
-/// repeating `vec![..]` and `RwFlags::empty()` and then indexing the result.
-/// A read into the room past a buffer's length is `FsHandle::pread_spare`,
-/// which takes one buffer already.
-fn pread1(
-    h: &FsHandle,
-    who: Personality,
-    f: &File,
-    buf: Vec<u8>,
-    off: u64,
-) -> (Result<usize, Error>, Vec<u8>) {
+/// The many tests that read a single buffer wrap `preadv2` here rather than repeating `vec![..]` and `RwFlags::empty()`
+/// and then indexing the result. A read into the room past a buffer's length is `FsHandle::pread_spare`, which takes
+/// one buffer already.
+fn pread1(h: &FsHandle, who: Personality, f: &File, buf: Vec<u8>, off: u64) -> (Result<usize, Error>, Vec<u8>) {
     let (res, mut bufs) = h.preadv2(who, f, vec![buf], off, RwFlags::empty());
     (res, bufs.pop().unwrap_or_default())
 }
 
 /// Single-buffer write; the write-side twin of [`pread1`].
-fn pwrite1(
-    h: &FsHandle,
-    who: Personality,
-    f: &File,
-    buf: Vec<u8>,
-    off: u64,
-) -> (Result<usize, Error>, Vec<u8>) {
+fn pwrite1(h: &FsHandle, who: Personality, f: &File, buf: Vec<u8>, off: u64) -> (Result<usize, Error>, Vec<u8>) {
     let (res, mut bufs) = h.pwritev2(who, f, vec![buf], off, RwFlags::empty());
     (res, bufs.pop().unwrap_or_default())
 }
@@ -94,18 +71,14 @@ fn xattr_name(name: &str) -> CString {
     CString::new(name).unwrap()
 }
 
-/// Errors that mean "io_uring is unavailable here" - an environmental skip.
-/// Deliberately excludes `EINVAL` (a rejected setup argument is a real bug).
+/// Errors that mean "io_uring is unavailable here" - an environmental skip. Deliberately excludes `EINVAL` (a rejected
+/// setup argument is a real bug).
 fn should_skip(e: &Error) -> bool {
     let unavailable = matches!(
         e,
-        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded
-        // box exhausts it and ring creation fails - environmental, and
-        // the REQUIRE variable turns the skip red where it must not
-        // happen.
-        Error::Errno(
-            Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM
-        )
+        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded box exhausts it and ring creation fails -
+        // environmental, and the REQUIRE variable turns the skip red where it must not happen.
+        Error::Errno(Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM)
     );
     if unavailable {
         assert!(
@@ -124,12 +97,10 @@ impl Drop for StopGuard {
     }
 }
 
-/// Pin a known umask for the whole binary. Several tests assert on the mode
-/// of something they create - `mkdirat`'s mode argument, or a setup file an
-/// impersonated user has to be able to read - and the kernel masks every one
-/// of those with the umask the suite happens to inherit. Left alone, a
-/// developer or CI runner at 0077 fails those tests for a reason that has
-/// nothing to do with the code under test.
+/// Pin a known umask for the whole binary. Several tests assert on the mode of something they create - `mkdirat`'s mode
+/// argument, or a setup file an impersonated user has to be able to read - and the kernel masks every one of those with
+/// the umask the suite happens to inherit. Left alone, a developer or CI runner at 0077 fails those tests for a reason
+/// that has nothing to do with the code under test.
 fn pin_umask() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -140,12 +111,10 @@ fn pin_umask() {
 
 /// Reactor sizing for tests, deliberately **not** [`FsConfig::default`].
 ///
-/// The default is sized for a server daemon, which costs roughly 400 KiB of
-/// `RLIMIT_MEMLOCK` per ring (see `FsConfig`'s docs). `cargo test` runs a
-/// binary's tests as threads in **one** process, so inheriting that default
-/// would have every concurrent test drawing on one locked-memory budget - and
-/// the failure lands on whichever test happens to create the ring that
-/// crosses the limit, not on the one that caused it.
+/// The default is sized for a server daemon, which costs roughly 400 KiB of `RLIMIT_MEMLOCK` per ring (see `FsConfig`'s
+/// docs). `cargo test` runs a binary's tests as threads in **one** process, so inheriting that default would have every
+/// concurrent test drawing on one locked-memory budget - and the failure lands on whichever test happens to create the
+/// ring that crosses the limit, not on the one that caused it.
 fn test_cfg() -> FsConfig {
     let mut cfg = FsConfig::default();
     cfg.entries = 128;
@@ -153,8 +122,8 @@ fn test_cfg() -> FsConfig {
     cfg
 }
 
-/// Build an `UringFs` over a fresh tempdir, register a self personality, run
-/// the loop on this thread, and drive `client` from a scoped thread.
+/// Build an `UringFs` over a fresh tempdir, register a self personality, run the loop on this thread, and drive
+/// `client` from a scoped thread.
 fn with_fs<F>(cfg: FsConfig, client: F)
 where
     F: FnOnce(FsHandle, Personality, PathBuf, ShutdownHandle) + Send,
@@ -205,8 +174,8 @@ fn mkfifo(dir: &Path, name: &str) -> String {
 
 // ---------------------------------------------------------------------------
 
-/// A close-on-exec pipe, returned `(read end, write end)`. Both are plain
-/// descriptors the caller closes; `splice_from_pipe` never adopts either.
+/// A close-on-exec pipe, returned `(read end, write end)`. Both are plain descriptors the caller closes;
+/// `splice_from_pipe` never adopts either.
 fn pipe_pair() -> (libc::c_int, libc::c_int) {
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe2` writes exactly two descriptors into `fds`.
@@ -215,26 +184,21 @@ fn pipe_pair() -> (libc::c_int, libc::c_int) {
     (fds[0], fds[1])
 }
 
-/// `splice_from_pipe` moves pipe bytes into a file with no userspace buffer,
-/// honouring the destination offset - and reports a short move as a count
-/// rather than an error, which is what the resubmit contract rests on.
+/// `splice_from_pipe` moves pipe bytes into a file with no userspace buffer, honouring the destination offset - and
+/// reports a short move as a count rather than an error, which is what the resubmit contract rests on.
 ///
-/// Bites three ways: drop the destination offset and the seeded bytes are
-/// overwritten at 0; leave `splice_off_in` at 0 instead of -1 and the kernel
-/// refuses a pipe source with `ESPIPE`; put the pipe in `sqe.fd` instead of
-/// `splice_fd_in` and it moves nothing.
+/// Bites three ways: drop the destination offset and the seeded bytes are overwritten at 0; leave `splice_off_in` at 0
+/// instead of -1 and the kernel refuses a pipe source with `ESPIPE`; put the pipe in `sqe.fd` instead of `splice_fd_in`
+/// and it moves nothing.
 #[test]
 fn splice_from_a_pipe_lands_at_the_offset_and_reports_short_moves() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
-        let f = h
-            .open(me, &anchor, "spliced.bin", creat_rw())
-            .expect("open");
+        let f = h.open(me, &anchor, "spliced.bin", creat_rw()).expect("open");
 
-        // Seed 16 bytes so a splice at offset 4 has to land *inside* existing
-        // content: an ignored offset shows up as clobbered leading bytes.
-        let (n, _) =
-            h.pwritev2(me, &f, vec![vec![b'.'; 16]], 0, RwFlags::empty());
+        // Seed 16 bytes so a splice at offset 4 has to land *inside* existing content: an ignored offset shows up as
+        // clobbered leading bytes.
+        let (n, _) = h.pwritev2(me, &f, vec![vec![b'.'; 16]], 0, RwFlags::empty());
         assert_eq!(n.expect("seed"), 16);
 
         let (rd, wr) = pipe_pair();
@@ -242,8 +206,8 @@ fn splice_from_a_pipe_lands_at_the_offset_and_reports_short_moves() {
         // SAFETY: writing our own buffer to our own pipe's write end.
         let w = unsafe { libc::write(wr, body.as_ptr().cast(), body.len()) };
         assert_eq!(w, body.len() as isize, "seed the pipe");
-        // Close the write end so the pipe is at EOF once drained, making both
-        // the short move and the follow-up zero deterministic.
+        // Close the write end so the pipe is at EOF once drained, making both the short move and the follow-up zero
+        // deterministic.
         // SAFETY: our own descriptor, not used again.
         unsafe { libc::close(wr) };
 
@@ -256,9 +220,7 @@ fn splice_from_a_pipe_lands_at_the_offset_and_reports_short_moves() {
         );
 
         // Drained: the next move is a clean zero, not an error.
-        let eof = h
-            .splice_from_pipe(me, &f, rd, 11, 4096)
-            .expect("splice eof");
+        let eof = h.splice_from_pipe(me, &f, rd, 11, 4096).expect("splice eof");
         assert_eq!(eof, 0, "drained pipe with the write end closed");
         // SAFETY: our own descriptor, not used again.
         unsafe { libc::close(rd) };
@@ -281,21 +243,15 @@ fn round_trip_write_fsync_read() {
 
         // Write a new file through the reactor: two gathered buffers.
         let f = h.open(me, &anchor, "out.bin", creat_rw()).expect("open");
-        let (n, bufs) = h.pwritev2(
-            me,
-            &f,
-            vec![b"hello ".to_vec(), b"world".to_vec()],
-            0,
-            RwFlags::empty(),
-        );
+        let (n, bufs) = h.pwritev2(me, &f, vec![b"hello ".to_vec(), b"world".to_vec()], 0, RwFlags::empty());
         assert_eq!(n.expect("writev"), 11);
         assert_eq!(bufs.len(), 2, "buffers round-trip");
         h.fsync(me, &f).expect("fsync");
         h.fdatasync(me, &f).expect("fdatasync");
         h.close(f).expect("close");
 
-        // Oracle: the bytes are on disk, owned by us (O_CREAT under a self
-        // personality creates as the calling identity).
+        // Oracle: the bytes are on disk, owned by us (O_CREAT under a self personality creates as the calling
+        // identity).
         let disk = std::fs::read(dir.join("out.bin")).expect("std read");
         assert_eq!(disk, b"hello world");
         let meta = std::fs::metadata(dir.join("out.bin")).unwrap();
@@ -324,10 +280,9 @@ fn round_trip_write_fsync_read() {
     });
 }
 
-/// A read into spare room lands straight after what the buffer holds, in
-/// the same storage, and comes back short at the end of the file. A count
-/// past the room, the offset io_uring reads as the file's position, and a
-/// read the kernel refuses each hand the buffer back as it came.
+/// A read into spare room lands straight after what the buffer holds, in the same storage, and comes back short at the
+/// end of the file. A count past the room, the offset io_uring reads as the file's position, and a read the kernel
+/// refuses each hand the buffer back as it came.
 #[test]
 fn a_read_into_spare_room_keeps_what_the_buffer_holds() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -347,8 +302,7 @@ fn a_read_into_spare_room_keeps_what_the_buffer_holds() {
         assert_eq!(n.expect("a short read at the end"), 5);
         assert_eq!(buf, b"headhello worldworld");
 
-        // Two bytes are left at 9, fewer than the room, so only the screen
-        // stops this.
+        // Two bytes are left at 9, fewer than the room, so only the screen stops this.
         let room = buf.capacity() - buf.len();
         let (n, buf) = h.pread_spare(me, &f, buf, room + 1, 9, flags);
         assert!(matches!(n, Err(Error::Errno(Errno::EINVAL))), "{n:?}");
@@ -369,8 +323,8 @@ fn a_read_into_spare_room_keeps_what_the_buffer_holds() {
     });
 }
 
-/// With both slots of a two-slot table held by parked reads, a read into
-/// spare room is refused with `EBUSY` and hands its buffer back as it came.
+/// With both slots of a two-slot table held by parked reads, a read into spare room is refused with `EBUSY` and hands
+/// its buffer back as it came.
 #[test]
 fn a_read_into_spare_room_on_a_full_table_hands_its_buffer_back() {
     let mut cfg = test_cfg();
@@ -380,8 +334,7 @@ fn a_read_into_spare_room_on_a_full_table_hands_its_buffer_back() {
         std::fs::write(dir.join("f"), b"bytes").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "f", rdonly()).expect("open f");
-        // O_RDWR on a FIFO opens at once with a writer attached, so a read
-        // with no data parks and holds its slot.
+        // O_RDWR on a FIFO opens at once with a writer attached, so a read with no data parks and holds its slot.
         let how = OpenHow::new().flags(OFlag::O_RDWR);
         let fifo = h.open(me, &anchor, "fifo", how).expect("open fifo");
         let park = || {
@@ -399,8 +352,7 @@ fn a_read_into_spare_room_on_a_full_table_hands_its_buffer_back() {
         let path = dir.join("fifo");
         let writer = thread::spawn(move || {
             use std::io::Write;
-            let mut w =
-                std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let mut w = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             w.write_all(b"one two ").unwrap();
         });
         for pending in [first, second] {
@@ -411,11 +363,9 @@ fn a_read_into_spare_room_on_a_full_table_hands_its_buffer_back() {
     });
 }
 
-/// `fstatfs` answers for the mount, from a file and from an anchor alike, and
-/// the two agree because they name the same filesystem. The anchor form is
-/// the one that matters: an `Anchor` is `O_PATH`, which `fsync` refuses, so
-/// this pins that `fstatfs` accepts it and a caller need not open anything to
-/// ask a whole tree's capacity.
+/// `fstatfs` answers for the mount, from a file and from an anchor alike, and the two agree because they name the same
+/// filesystem. The anchor form is the one that matters: an `Anchor` is `O_PATH`, which `fsync` refuses, so this pins
+/// that `fstatfs` accepts it and a caller need not open anything to ask a whole tree's capacity.
 #[test]
 fn fstatfs_answers_from_a_file_and_from_an_anchor() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -446,14 +396,12 @@ fn fstatfs_answers_from_a_file_and_from_an_anchor() {
     });
 }
 
-/// The immutability claim, exercised rather than asserted: set `IMMUTABLE`
-/// through the reactor and the file becomes undeletable *and* its xattrs
-/// unwritable - enforcement the VFS applies, so no protocol routes around it.
+/// The immutability claim, exercised rather than asserted: set `IMMUTABLE` through the reactor and the file becomes
+/// undeletable *and* its xattrs unwritable - enforcement the VFS applies, so no protocol routes around it.
 ///
-/// Needs a real ZFS dataset - a tmpfs tempdir answers the ioctl `ENOTTY` - so
-/// it resolves one and skips loudly under `TRUENAS_ROS_REQUIRE_ZFS`, which
-/// the QEMU job arms. Unprivileged, the `EPERM` on setting the flag is itself
-/// the property under test and is asserted rather than skipped.
+/// Needs a real ZFS dataset - a tmpfs tempdir answers the ioctl `ENOTTY` - so it resolves one and skips loudly under
+/// `TRUENAS_ROS_REQUIRE_ZFS`, which the QEMU job arms. Unprivileged, the `EPERM` on setting the flag is itself the
+/// property under test and is asserted rather than skipped.
 #[test]
 fn an_immutable_file_cannot_be_unlinked_or_relabelled() {
     let Some(ds) = zfs_dir_or_skip() else {
@@ -474,18 +422,16 @@ fn an_immutable_file_cannot_be_unlinked_or_relabelled() {
             "a fresh file is not locked"
         );
 
-        // Metadata has to land before the lock: an immutable inode refuses
-        // xattr writes (`may_write_xattr`, fs/xattr.c).
+        // Metadata has to land before the lock: an immutable inode refuses xattr writes (`may_write_xattr`,
+        // fs/xattr.c).
         let name = xattr_name("user.retain-until");
-        let (res, _) =
-            h.fsetxattr(me, &f, name.clone(), b"2099-01-01".to_vec(), 0);
+        let (res, _) = h.fsetxattr(me, &f, name.clone(), b"2099-01-01".to_vec(), 0);
         res.expect("xattr before locking");
 
         match h.fset_zfs_attrs(&f, before | ZfsAttr::IMMUTABLE) {
             Ok(()) => {}
-            // CAP_LINUX_IMMUTABLE is required, and its absence is the very
-            // property under test - so an unprivileged refusal is a pass for
-            // the half this can reach, not a skip of the whole test.
+            // CAP_LINUX_IMMUTABLE is required, and its absence is the very property under test - so an unprivileged
+            // refusal is a pass for the half this can reach, not a skip of the whole test.
             Err(Error::Errno(Errno::EPERM)) => {
                 assert!(!is_root(), "root was refused CAP_LINUX_IMMUTABLE");
                 h.close(f).expect("close");
@@ -509,8 +455,7 @@ fn an_immutable_file_cannot_be_unlinked_or_relabelled() {
             matches!(unlinked, Err(Error::Errno(Errno::EPERM))),
             "an immutable file must not unlink: {unlinked:?}"
         );
-        let (res, _) =
-            h.fsetxattr(me, &f, name.clone(), b"2000-01-01".to_vec(), 0);
+        let (res, _) = h.fsetxattr(me, &f, name.clone(), b"2000-01-01".to_vec(), 0);
         assert!(
             matches!(res, Err(Error::Errno(Errno::EPERM))),
             "an immutable file's xattrs must be sealed: {res:?}"
@@ -534,14 +479,11 @@ fn ranged_fsync_syncs_a_byte_range_and_whole_file() {
         let (n, _) = pwrite1(&h, me, &f, data.clone(), 0);
         assert_eq!(n.expect("pwrite"), 8192);
 
-        // Sync just the first 4 KiB (fsync range form: off=0, len=4096), then a
-        // tail range with datasync semantics, then the whole file via 0/0.
-        h.fsync_range(me, &f, false, 0, 4096)
-            .expect("fsync_range head");
-        h.fsync_range(me, &f, true, 4096, 4096)
-            .expect("fdatasync_range tail");
-        h.fsync_range(me, &f, false, 0, 0)
-            .expect("fsync_range whole");
+        // Sync just the first 4 KiB (fsync range form: off=0, len=4096), then a tail range with datasync semantics,
+        // then the whole file via 0/0.
+        h.fsync_range(me, &f, false, 0, 4096).expect("fsync_range head");
+        h.fsync_range(me, &f, true, 4096, 4096).expect("fdatasync_range tail");
+        h.fsync_range(me, &f, false, 0, 0).expect("fsync_range whole");
         // The plain wrappers keep their whole-file behavior.
         h.fsync(me, &f).expect("fsync");
         h.fdatasync(me, &f).expect("fdatasync");
@@ -560,8 +502,8 @@ fn multi_component_and_beneath() {
         std::fs::write(dir.join("sub/inner.txt"), b"beneath").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
-        // Multi-component relative paths are the open's job (only op that
-        // walks); RESOLVE_BENEATH confines them in-kernel.
+        // Multi-component relative paths are the open's job (only op that walks); RESOLVE_BENEATH confines them
+        // in-kernel.
         let how = rdonly().resolve(ResolveFlag::RESOLVE_BENEATH);
         let f = h.open(me, &anchor, "sub/inner.txt", how).expect("open");
         let (n, buf) = pread1(&h, me, &f, vec![0u8; 16], 0);
@@ -575,16 +517,15 @@ fn multi_component_and_beneath() {
             other => panic!("expected EXDEV, got {other:?}"),
         }
 
-        // The DEFAULT (no explicit resolve) confines too: `open` applies the
-        // whole `CONFINED_RESOLVE` set - BENEATH | NO_SYMLINKS | NO_XDEV --
-        // when `how` states no policy, so a bare `rdonly()` rejects a `..`
-        // escape without the caller opting in.
+        // The DEFAULT (no explicit resolve) confines too: `open` applies the whole `CONFINED_RESOLVE` set - BENEATH |
+        // NO_SYMLINKS | NO_XDEV -- when `how` states no policy, so a bare `rdonly()` rejects a `..` escape without the
+        // caller opting in.
         match h.open(me, &anchor, "../escape", rdonly()) {
             Err(Error::Errno(Errno::EXDEV)) => {}
             other => panic!("default open must confine `..`, got {other:?}"),
         }
-        // ...and does not follow a symlink (NO_SYMLINKS -> ELOOP), so a
-        // peer-planted link can't redirect the open out of the share.
+        // ...and does not follow a symlink (NO_SYMLINKS -> ELOOP), so a peer-planted link can't redirect the open out
+        // of the share.
         std::os::unix::fs::symlink("/etc/hostname", dir.join("out")).unwrap();
         match h.open(me, &anchor, "out", rdonly()) {
             Err(Error::Errno(Errno::ELOOP)) => {}
@@ -592,12 +533,9 @@ fn multi_component_and_beneath() {
                 panic!("default open must not follow a symlink, {other:?}")
             }
         }
-        // A legit in-anchor nested path still opens under the default policy:
-        // BENEATH permits descending real subdirs; NO_SYMLINKS blocks only
-        // symlink components.
-        let f = h
-            .open(me, &anchor, "sub/inner.txt", rdonly())
-            .expect("nested");
+        // A legit in-anchor nested path still opens under the default policy: BENEATH permits descending real subdirs;
+        // NO_SYMLINKS blocks only symlink components.
+        let f = h.open(me, &anchor, "sub/inner.txt", rdonly()).expect("nested");
         h.close(f).unwrap();
     });
 }
@@ -617,9 +555,8 @@ fn fstatx_reports_open_file_metadata() {
     });
 }
 
-/// A descriptor opened outside the reactor serves its fd-based ops once
-/// wrapped. The ring's statx sees the inode a blocking stat sees, and a
-/// ring read gives back the bytes.
+/// A descriptor opened outside the reactor serves its fd-based ops once wrapped. The ring's statx sees the inode a
+/// blocking stat sees, and a ring read gives back the bytes.
 #[test]
 fn a_descriptor_opened_outside_the_ring_serves_its_ops_once_wrapped() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -628,9 +565,7 @@ fn a_descriptor_opened_outside_the_ring_serves_its_ops_once_wrapped() {
         let ino = std::fs::metadata(&path).unwrap().ino();
         let fd = std::fs::File::open(&path).unwrap().into();
         let f = File::from_fd(fd);
-        let st = h
-            .fstatx(me, &f, AtFlags::empty(), StatxMask::INO)
-            .expect("fstatx");
+        let st = h.fstatx(me, &f, AtFlags::empty(), StatxMask::INO).expect("fstatx");
         assert_eq!(st.ino(), ino);
         let (n, buf) = pread1(&h, me, &f, vec![0u8; 12], 0);
         assert_eq!(n.expect("read"), 12);
@@ -639,12 +574,10 @@ fn a_descriptor_opened_outside_the_ring_serves_its_ops_once_wrapped() {
     });
 }
 
-/// A `resolve` that only *hardens* must not also un-confine. `open` applies
-/// the full `CONFINED_RESOLVE` and lets a caller replace it, but only by
-/// naming a policy (`RESOLVE_BENEATH`, `RESOLVE_IN_ROOT`); a request for
-/// `RESOLVE_NO_MAGICLINKS` asks for *more* restriction and keeps the default
-/// underneath it. Keying that union on `resolve == 0` instead turns the
-/// hardening request into an escape hatch, which is what this pins.
+/// A `resolve` that only *hardens* must not also un-confine. `open` applies the full `CONFINED_RESOLVE` and lets a
+/// caller replace it, but only by naming a policy (`RESOLVE_BENEATH`, `RESOLVE_IN_ROOT`); a request for
+/// `RESOLVE_NO_MAGICLINKS` asks for *more* restriction and keeps the default underneath it. Keying that union on
+/// `resolve == 0` instead turns the hardening request into an escape hatch, which is what this pins.
 #[test]
 fn a_hardening_flag_does_not_opt_out_of_confinement() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -667,13 +600,10 @@ fn a_hardening_flag_does_not_opt_out_of_confinement() {
             }
         }
 
-        // A *stated* policy still stands alone: `RESOLVE_BENEATH` without
-        // `RESOLVE_NO_SYMLINKS` is how a caller asks to follow in-tree
-        // symlinks, and it must keep meaning that.
+        // A *stated* policy still stands alone: `RESOLVE_BENEATH` without `RESOLVE_NO_SYMLINKS` is how a caller asks to
+        // follow in-tree symlinks, and it must keep meaning that.
         let stated = rdonly().resolve(ResolveFlag::RESOLVE_BENEATH);
-        let f = h
-            .open(me, &anchor, "link", stated)
-            .expect("in-tree symlink");
+        let f = h.open(me, &anchor, "link", stated).expect("in-tree symlink");
         h.close(f).unwrap();
     });
 }
@@ -683,26 +613,20 @@ fn validation_and_errno_mapping() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
-        // An empty path is a library-validation error; an absolute path is
-        // refused by the *kernel* under the default RESOLVE_BENEATH confinement
-        // (it cannot resolve outside the anchor).
-        assert!(matches!(
-            h.open(me, &anchor, "", rdonly()),
-            Err(Error::Validation(_))
-        ));
+        // An empty path is a library-validation error; an absolute path is refused by the *kernel* under the default
+        // RESOLVE_BENEATH confinement (it cannot resolve outside the anchor).
+        assert!(matches!(h.open(me, &anchor, "", rdonly()), Err(Error::Validation(_))));
         assert!(matches!(
             h.open(me, &anchor, "/etc/hostname", rdonly()),
             Err(Error::Errno(Errno::EXDEV))
         ));
-        // O_CLOEXEC is accepted now (opens return real fds) and reaches the
-        // kernel, which opens the file.
+        // O_CLOEXEC is accepted now (opens return real fds) and reaches the kernel, which opens the file.
         std::fs::write(dir.join("cx"), b"cx").unwrap();
         let cloexec = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC);
         let fc = h.open(me, &anchor, "cx", cloexec).expect("O_CLOEXEC open");
         h.close(fc).unwrap();
 
-        // Kernel errno round-trips: ENOENT for a missing file, EBADF for a
-        // write on a read-only open.
+        // Kernel errno round-trips: ENOENT for a missing file, EBADF for a write on a read-only open.
         assert!(matches!(
             h.open(me, &anchor, "missing.txt", rdonly()),
             Err(Error::Errno(Errno::ENOENT))
@@ -750,21 +674,19 @@ fn stale_personality_from_other_ring_is_einval() {
     drop(afs_a); // ring A (and its registration) outlived the use on B
 }
 
-// Files are plain reference-counted fds now - there is no per-file pool to
-// exhaust (`ENFILE`), and dropping a token does NOT cancel in-flight ops: the
-// reactor keeps the fd alive (via the op entry's parked `Arc<OwnedFd>`) until
-// the op completes, then the fd closes with the last reference (close-last by
-// ownership). This test covers that cancel-safety property: a parked read
-// whose only caller token is dropped mid-flight still completes correctly when
-// data arrives - no use-after-close.
+// Files are plain reference-counted fds now - there is no per-file pool to exhaust (`ENFILE`), and dropping a token
+// does NOT cancel in-flight ops: the reactor keeps the fd alive (via the op entry's parked `Arc<OwnedFd>`) until the op
+// completes, then the fd closes with the last reference (close-last by ownership). This test covers that cancel-safety
+// property: a parked read whose only caller token is dropped mid-flight still completes correctly when data arrives -
+// no use-after-close.
 #[test]
 fn dropped_file_mid_op_completes_without_use_after_close() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         mkfifo(&dir, "fifo");
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
-        // O_RDWR on a FIFO opens immediately and keeps a writer attached, so a
-        // read with no data parks - an op genuinely in flight.
+        // O_RDWR on a FIFO opens immediately and keeps a writer attached, so a read with no data parks - an op
+        // genuinely in flight.
         let how = OpenHow::new().flags(OFlag::O_RDWR);
         let f = h.open(me, &anchor, "fifo", how).expect("open fifo");
         let pending = h
@@ -772,17 +694,16 @@ fn dropped_file_mid_op_completes_without_use_after_close() {
             .expect("start readv");
         thread::sleep(Duration::from_millis(50)); // let it park in the kernel
 
-        // Drop the caller's only token while the read is parked. The reactor
-        // still owns the fd (op-entry `Arc`), so the read stays valid.
+        // Drop the caller's only token while the read is parked. The reactor still owns the fd (op-entry `Arc`), so the
+        // read stays valid.
         drop(f);
 
-        // Feed the fifo from a fresh writer; the parked read must complete with
-        // the real bytes, proving the fd was not closed out from under it.
+        // Feed the fifo from a fresh writer; the parked read must complete with the real bytes, proving the fd was not
+        // closed out from under it.
         let path = dir.join("fifo");
         let writer = thread::spawn(move || {
             use std::io::Write;
-            let mut w =
-                std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let mut w = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             w.write_all(b"okay").unwrap();
         });
 
@@ -795,17 +716,13 @@ fn dropped_file_mid_op_completes_without_use_after_close() {
 
 /// A creating open must not block on a name someone else planted.
 ///
-/// `io_openat_force_async` puts every `O_CREAT`/`O_TRUNC` open on an io-wq
-/// worker, where the kernel does *not* add the `O_NONBLOCK` its inline path
-/// adds, so an `O_CREAT` that lands on a pre-existing FIFO sleeps in
-/// `wait_for_partner` until a writer appears. That pins a bounded io-wq
-/// worker and the calling thread - `into_outcome` waits with no deadline --
-/// so a handful of names in a shared multiprotocol tree stall every blocking
-/// fs op on the ring.
+/// `io_openat_force_async` puts every `O_CREAT`/`O_TRUNC` open on an io-wq worker, where the kernel does *not* add the
+/// `O_NONBLOCK` its inline path adds, so an `O_CREAT` that lands on a pre-existing FIFO sleeps in `wait_for_partner`
+/// until a writer appears. That pins a bounded io-wq worker and the calling thread - `into_outcome` waits with no
+/// deadline -- so a handful of names in a shared multiprotocol tree stall every blocking fs op on the ring.
 ///
-/// Both flags are driven: `O_CREAT|O_RDONLY` blocks for a writer,
-/// `O_TRUNC|O_WRONLY` for a reader. Non-blocking, the first opens and the
-/// second answers `ENXIO`; what is asserted is that each *returns*.
+/// Both flags are driven: `O_CREAT|O_RDONLY` blocks for a writer, `O_TRUNC|O_WRONLY` for a reader. Non-blocking, the
+/// first opens and the second answers `ENXIO`; what is asserted is that each *returns*.
 #[test]
 fn a_creating_open_of_a_planted_fifo_does_not_block() {
     use std::sync::mpsc;
@@ -819,12 +736,10 @@ fn a_creating_open_of_a_planted_fifo_does_not_block() {
             let (tx, rx) = mpsc::channel();
             let h2 = h.clone();
             let a2 = anchor.clone();
-            // Off-thread, because the failure mode is an indefinite block: a
-            // regression must fail this test rather than hang it.
+            // Off-thread, because the failure mode is an indefinite block: a regression must fail this test rather than
+            // hang it.
             thread::spawn(move || {
-                let how = OpenHow::new()
-                    .flags(flags)
-                    .mode(Mode::from_bits_truncate(0o600));
+                let how = OpenHow::new().flags(flags).mode(Mode::from_bits_truncate(0o600));
                 let _ = tx.send(h2.open(me, &a2, "planted", how).is_ok());
             });
             rx.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| {
@@ -850,9 +765,8 @@ fn teardown_with_inflight_op() {
             .expect("start readv");
         thread::sleep(Duration::from_millis(50));
 
-        // Shut down with the read parked: run()'s drain cancels it, the
-        // waiter unblocks with an error, and run() returns cleanly (the
-        // harness asserts that).
+        // Shut down with the read parked: run()'s drain cancels it, the waiter unblocks with an error, and run()
+        // returns cleanly (the harness asserts that).
         stop.shutdown();
         let (res, _bufs) = pending.wait();
         assert!(res.is_err(), "parked read must fail at teardown");
@@ -876,13 +790,7 @@ fn concurrent_ops_across_threads() {
                     let name = name.as_str();
                     let payload = vec![i as u8 + 1; 4096 * (i + 1)];
                     let f = h.open(me, &anchor, name, creat_rw()).unwrap();
-                    let (n, _bufs) = h.pwritev2(
-                        me,
-                        &f,
-                        vec![payload.clone()],
-                        0,
-                        RwFlags::empty(),
-                    );
+                    let (n, _bufs) = h.pwritev2(me, &f, vec![payload.clone()], 0, RwFlags::empty());
                     assert_eq!(n.unwrap(), payload.len());
                     h.fsync(me, &f).unwrap();
                     h.close(f).unwrap();
@@ -925,8 +833,8 @@ fn write_pread_offsets() {
 
 #[test]
 fn open_metadata_close_workflow() {
-    // The shape the API is built to encourage: open once, do every metadata
-    // op against the resulting fd, close. No path is named after the open.
+    // The shape the API is built to encourage: open once, do every metadata op against the resulting fd, close. No path
+    // is named after the open.
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "doc.bin", creat_rw()).unwrap();
@@ -934,11 +842,9 @@ fn open_metadata_close_workflow() {
         let (n, _b) = pwrite1(&h, me, &f, vec![b'x'; 4096], 0);
         assert_eq!(n.unwrap(), 4096);
 
-        // Extended attributes, by fd. (This is the DOS-attributes shape the
-        // whole reactor exists for.)
+        // Extended attributes, by fd. (This is the DOS-attributes shape the whole reactor exists for.)
         let name = xattr_name("user.dosattrib");
-        let (res, _v) =
-            h.fsetxattr(me, &f, name.clone(), b"\x01\x02\x03".to_vec(), 0);
+        let (res, _v) = h.fsetxattr(me, &f, name.clone(), b"\x01\x02\x03".to_vec(), 0);
         res.expect("fsetxattr");
         let (n, val) = h.fgetxattr(me, &f, name.clone(), vec![0u8; 64]);
         assert_eq!(n.expect("fgetxattr"), 3);
@@ -953,24 +859,15 @@ fn open_metadata_close_workflow() {
         assert!(matches!(res, Err(Error::Errno(Errno::ERANGE))));
 
         // XATTR_CREATE on an existing attribute must fail EEXIST.
-        let (res, _v) = h.fsetxattr(
-            me,
-            &f,
-            name.clone(),
-            b"zz".to_vec(),
-            libc::XATTR_CREATE,
-        );
+        let (res, _v) = h.fsetxattr(me, &f, name.clone(), b"zz".to_vec(), libc::XATTR_CREATE);
         assert!(matches!(res, Err(Error::Errno(Errno::EEXIST))));
 
-        // Oversized is E2BIG on this path too - the sync twin's contract
-        // (`sync_fs::xattr::fsetxattr`, `test/coverage.rs
-        // oversize_short_circuits_to_e2big`).
+        // Oversized is E2BIG on this path too - the sync twin's contract (`sync_fs::xattr::fsetxattr`,
+        // `test/coverage.rs oversize_short_circuits_to_e2big`).
         //
-        // This is a contract test, not a control: measured on this
-        // filesystem the kernel answers E2BIG here anyway, so removing
-        // the crate's bound does not change the result. What the bound
-        // catches is the `as u32` truncation, which needs a value of
-        // 1 << 32 to reach and is not testable at that size.
+        // This is a contract test, not a control: measured on this filesystem the kernel answers E2BIG here anyway, so
+        // removing the crate's bound does not change the result. What the bound catches is the `as u32` truncation,
+        // which needs a value of 1 << 32 to reach and is not testable at that size.
         use truenas_ros::sync_fs::xattr::XATTR_SIZE_MAX;
         let big = vec![0u8; XATTR_SIZE_MAX + 1];
         let (res, back) = h.fsetxattr(me, &f, name.clone(), big, 0);
@@ -984,13 +881,10 @@ fn open_metadata_close_workflow() {
         assert_eq!(n.expect("fgetxattr"), 3);
         assert_eq!(&val[..3], b"\x01\x02\x03");
 
-        // ...and a *generous* read buffer is not an oversized value. The
-        // bound above belongs to the write path: `FsConn::fgetxattr`'s
-        // contract is that a buffer SHORTER than the value fails ERANGE,
-        // and the sync twin (`sync_fs::xattr::fgetxattr`) takes no buffer
-        // at all and never refuses on its size.
-        let (n, val) =
-            h.fgetxattr(me, &f, name.clone(), vec![0u8; 2 * XATTR_SIZE_MAX]);
+        // ...and a *generous* read buffer is not an oversized value. The bound above belongs to the write path:
+        // `FsConn::fgetxattr`'s contract is that a buffer SHORTER than the value fails ERANGE, and the sync twin
+        // (`sync_fs::xattr::fgetxattr`) takes no buffer at all and never refuses on its size.
+        let (n, val) = h.fgetxattr(me, &f, name.clone(), vec![0u8; 2 * XATTR_SIZE_MAX]);
         assert_eq!(n.expect("a generous read buffer still reads the value"), 3);
         assert_eq!(&val[..3], b"\x01\x02\x03");
 
@@ -1003,17 +897,9 @@ fn open_metadata_close_workflow() {
 
         // Oracle: the xattr is really on disk, seen by a plain syscall.
         let mut out = [0u8; 8];
-        let p =
-            CString::new(dir.join("doc.bin").as_os_str().as_bytes()).unwrap();
+        let p = CString::new(dir.join("doc.bin").as_os_str().as_bytes()).unwrap();
         // SAFETY: valid path/name/buffer.
-        let n = unsafe {
-            libc::getxattr(
-                p.as_ptr(),
-                name.as_ptr(),
-                out.as_mut_ptr().cast(),
-                out.len(),
-            )
-        };
+        let n = unsafe { libc::getxattr(p.as_ptr(), name.as_ptr(), out.as_mut_ptr().cast(), out.len()) };
         assert_eq!(n, 3, "attribute visible to getxattr(2)");
         assert_eq!(&out[..3], b"\x01\x02\x03");
     });
@@ -1035,10 +921,9 @@ fn ftruncate_by_fd_or_unsupported() {
 
 #[test]
 fn fd_metadata_respects_close_last() {
-    // Metadata ops hold a file reference like data ops do, so a close racing
-    // one in flight must still be the file's last op: the reactor parks an
-    // `Arc<OwnedFd>` clone for the duration, and the descriptor closes when
-    // that clone drops, not when the caller lets go.
+    // Metadata ops hold a file reference like data ops do, so a close racing one in flight must still be the file's
+    // last op: the reactor parks an `Arc<OwnedFd>` clone for the duration, and the descriptor closes when that clone
+    // drops, not when the caller lets go.
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "a.bin", creat_rw()).unwrap();
@@ -1063,20 +948,13 @@ fn statx_by_leaf_and_anchor() {
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
         let st = h
-            .statx(
-                me,
-                &anchor,
-                leaf("sized"),
-                AtFlags::empty(),
-                StatxMask::BASIC_STATS,
-            )
+            .statx(me, &anchor, leaf("sized"), AtFlags::empty(), StatxMask::BASIC_STATS)
             .expect("statx leaf");
         assert_eq!(st.size(), 1234);
         // SAFETY: geteuid is always safe.
         assert_eq!(st.uid(), unsafe { libc::geteuid() });
 
-        // The anchor itself, via AT_EMPTY_PATH - the closest to fd-based
-        // statx this interface can offer.
+        // The anchor itself, via AT_EMPTY_PATH - the closest to fd-based statx this interface can offer.
         let st = h
             .statx_anchor(me, &anchor, AtFlags::empty(), StatxMask::BASIC_STATS)
             .expect("statx anchor");
@@ -1084,29 +962,16 @@ fn statx_by_leaf_and_anchor() {
 
         // A missing entry is a plain ENOENT.
         assert!(matches!(
-            h.statx(
-                me,
-                &anchor,
-                leaf("nope"),
-                AtFlags::empty(),
-                StatxMask::BASIC_STATS
-            ),
+            h.statx(me, &anchor, leaf("nope"), AtFlags::empty(), StatxMask::BASIC_STATS),
             Err(Error::Errno(Errno::ENOENT))
         ));
 
-        // The async surface does not follow a terminal symlink BY DEFAULT (a
-        // peer-planted symlink can't redirect the stat out of the anchor), but
-        // AT_SYMLINK_FOLLOW opts into stat'ing the target; an explicit
-        // AT_SYMLINK_NOFOLLOW is the default.
+        // The async surface does not follow a terminal symlink BY DEFAULT (a peer-planted symlink can't redirect the
+        // stat out of the anchor), but AT_SYMLINK_FOLLOW opts into stat'ing the target; an explicit AT_SYMLINK_NOFOLLOW
+        // is the default.
         std::os::unix::fs::symlink("sized", dir.join("ln")).unwrap();
         let by_default = h
-            .statx(
-                me,
-                &anchor,
-                leaf("ln"),
-                AtFlags::empty(),
-                StatxMask::BASIC_STATS,
-            )
+            .statx(me, &anchor, leaf("ln"), AtFlags::empty(), StatxMask::BASIC_STATS)
             .unwrap();
         assert!(by_default.is_symlink(), "does not follow by default");
         let explicit = h
@@ -1134,9 +999,8 @@ fn statx_by_leaf_and_anchor() {
 
 #[test]
 fn leaf_validation_is_the_confinement() {
-    // The *at opcodes honour no RESOLVE_* flags, so the single-component
-    // rule is what keeps a directory op inside its anchor. Reject anything
-    // that could walk.
+    // The *at opcodes honour no RESOLVE_* flags, so the single-component rule is what keeps a directory op inside its
+    // anchor. Reject anything that could walk.
     for bad in ["", ".", "..", "a/b", "/abs", "../escape", "sub/"] {
         assert!(
             matches!(Leaf::new(bad), Err(Error::Validation(_))),
@@ -1144,10 +1008,7 @@ fn leaf_validation_is_the_confinement() {
         );
     }
     assert!(Leaf::new("file.txt").is_ok());
-    assert!(
-        Leaf::new("..hidden").is_ok(),
-        "only exactly `..` is special"
-    );
+    assert!(Leaf::new("..hidden").is_ok(), "only exactly `..` is special");
     assert!(Leaf::new(&b"nul\0byte"[..]).is_err());
 }
 
@@ -1179,8 +1040,8 @@ fn directory_entry_ops() {
         h.unlinkat(me, &anchor, leaf("f")).expect("unlinkat");
         assert!(!dir.join("f").exists());
 
-        // symlink: the target is content, never resolved at creation, so a
-        // dangling (and multi-component) target is legal.
+        // symlink: the target is content, never resolved at creation, so a dangling (and multi-component) target is
+        // legal.
         h.symlinkat(me, "../elsewhere/target", &anchor, leaf("link"))
             .expect("symlinkat");
         assert_eq!(
@@ -1190,31 +1051,13 @@ fn directory_entry_ops() {
 
         // hard link + rename
         std::fs::write(dir.join("orig"), b"data").unwrap();
-        h.linkat(
-            me,
-            &anchor,
-            leaf("orig"),
-            &anchor,
-            leaf("hard"),
-            AtFlags::empty(),
-        )
-        .expect("linkat");
+        h.linkat(me, &anchor, leaf("orig"), &anchor, leaf("hard"), AtFlags::empty())
+            .expect("linkat");
         assert_eq!(std::fs::read(dir.join("hard")).unwrap(), b"data");
-        assert_eq!(
-            std::fs::metadata(dir.join("orig")).unwrap().nlink(),
-            2,
-            "same inode"
-        );
+        assert_eq!(std::fs::metadata(dir.join("orig")).unwrap().nlink(), 2, "same inode");
 
-        h.renameat(
-            me,
-            &anchor,
-            leaf("hard"),
-            &anchor,
-            leaf("moved"),
-            RenameFlags::empty(),
-        )
-        .expect("renameat");
+        h.renameat(me, &anchor, leaf("hard"), &anchor, leaf("moved"), RenameFlags::empty())
+            .expect("renameat");
         assert!(dir.join("moved").exists() && !dir.join("hard").exists());
 
         // RENAME_NOREPLACE refuses to clobber.
@@ -1233,15 +1076,8 @@ fn directory_entry_ops() {
         // RENAME_EXCHANGE swaps two entries atomically.
         std::fs::write(dir.join("A"), b"a").unwrap();
         std::fs::write(dir.join("B"), b"b").unwrap();
-        h.renameat(
-            me,
-            &anchor,
-            leaf("A"),
-            &anchor,
-            leaf("B"),
-            RenameFlags::RENAME_EXCHANGE,
-        )
-        .expect("exchange");
+        h.renameat(me, &anchor, leaf("A"), &anchor, leaf("B"), RenameFlags::RENAME_EXCHANGE)
+            .expect("exchange");
         assert_eq!(std::fs::read(dir.join("A")).unwrap(), b"b");
         assert_eq!(std::fs::read(dir.join("B")).unwrap(), b"a");
     });
@@ -1256,33 +1092,24 @@ fn rename_across_two_anchors() {
         let a_src = Anchor::open(dir.join("src").as_path()).unwrap();
         let a_dst = Anchor::open(dir.join("dst").as_path()).unwrap();
 
-        // Two distinct dirfds: the second rides in sqe.len per the kernel's
-        // packing, which this proves end-to-end.
-        h.renameat(
-            me,
-            &a_src,
-            leaf("f"),
-            &a_dst,
-            leaf("g"),
-            RenameFlags::empty(),
-        )
-        .expect("cross-anchor rename");
+        // Two distinct dirfds: the second rides in sqe.len per the kernel's packing, which this proves end-to-end.
+        h.renameat(me, &a_src, leaf("f"), &a_dst, leaf("g"), RenameFlags::empty())
+            .expect("cross-anchor rename");
         assert!(!dir.join("src/f").exists());
         assert_eq!(std::fs::read(dir.join("dst/g")).unwrap(), b"payload");
     });
 }
 
-/// An `O_TMPFILE` create is invisible until `linkat` names it, and complete the
-/// instant it becomes visible - the durable-publish property an object store
-/// needs. Also pins that the file really has no name beforehand: the directory
+/// An `O_TMPFILE` create is invisible until `linkat` names it, and complete the instant it becomes visible - the
+/// durable-publish property an object store needs. Also pins that the file really has no name beforehand: the directory
 /// stays empty while the data is being written.
 #[test]
 fn o_tmpfile_is_invisible_until_linkat_publishes_it() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
 
-        // O_TMPFILE names the *directory*; the file it creates has no entry.
-        // Deliberately no O_EXCL - that is the "never linkable" opt-out.
+        // O_TMPFILE names the *directory*; the file it creates has no entry. Deliberately no O_EXCL - that is the
+        // "never linkable" opt-out.
         let how = OpenHow::new()
             .flags(OFlag::O_TMPFILE | OFlag::O_RDWR)
             .mode(Mode::from_bits_truncate(0o600));
@@ -1302,18 +1129,14 @@ fn o_tmpfile_is_invisible_until_linkat_publishes_it() {
         h.linkat_file(me, &f, &anchor, leaf("object"))
             .expect("linkat AT_EMPTY_PATH");
 
-        // Visible, and already whole: no window where a reader sees a partial
-        // file, which is the entire point of publishing this way.
-        assert_eq!(
-            std::fs::read(dir.join("object")).unwrap(),
-            b"published atomically"
-        );
+        // Visible, and already whole: no window where a reader sees a partial file, which is the entire point of
+        // publishing this way.
+        assert_eq!(std::fs::read(dir.join("object")).unwrap(), b"published atomically");
     });
 }
 
-/// `linkat` cannot replace an existing name, so overwriting is link-to-temp
-/// then rename. Pins the `EEXIST` that forces the two-step, and that the
-/// rename really does replace the old content atomically.
+/// `linkat` cannot replace an existing name, so overwriting is link-to-temp then rename. Pins the `EEXIST` that forces
+/// the two-step, and that the rename really does replace the old content atomically.
 #[test]
 fn linkat_file_cannot_replace_but_rename_can() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1355,10 +1178,9 @@ fn linkat_file_cannot_replace_but_rename_can() {
     });
 }
 
-/// `O_EXCL` with `O_TMPFILE` is the "this inode may never be linked" opt-out:
-/// the kernel withholds `I_LINKABLE`, and `vfs_link` then refuses an inode
-/// whose link count is zero. The failure is `ENOENT`, which says nothing about
-/// the real cause - hence the test, and hence the warning in the docs.
+/// `O_EXCL` with `O_TMPFILE` is the "this inode may never be linked" opt-out: the kernel withholds `I_LINKABLE`, and
+/// `vfs_link` then refuses an inode whose link count is zero. The failure is `ENOENT`, which says nothing about the
+/// real cause - hence the test, and hence the warning in the docs.
 #[test]
 fn o_tmpfile_with_o_excl_is_unlinkable() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1366,9 +1188,7 @@ fn o_tmpfile_with_o_excl_is_unlinkable() {
         let how = OpenHow::new()
             .flags(OFlag::O_TMPFILE | OFlag::O_RDWR | OFlag::O_EXCL)
             .mode(Mode::from_bits_truncate(0o600));
-        let f = h
-            .open(me, &anchor, ".", how)
-            .expect("O_TMPFILE|O_EXCL still opens");
+        let f = h.open(me, &anchor, ".", how).expect("O_TMPFILE|O_EXCL still opens");
 
         assert!(
             matches!(
@@ -1383,13 +1203,11 @@ fn o_tmpfile_with_o_excl_is_unlinkable() {
 
 /// Which personality may publish an `O_TMPFILE`?
 ///
-/// `AT_EMPTY_PATH` demands `f_cred == current_cred()` - a **pointer**
-/// comparison (`fs/namei.c:2631`). io_uring's `register_personality` stores
-/// `get_current_cred()`, so two registrations taken from unchanged credentials
-/// reference the same `struct cred`. This pins the consequence: two
-/// `register_self` ids are interchangeable for the link, because they *are*
-/// the same credentials. The requirement therefore bites across genuinely
-/// different identities (the broker's), not across id values.
+/// `AT_EMPTY_PATH` demands `f_cred == current_cred()` - a **pointer** comparison (`fs/namei.c:2631`). io_uring's
+/// `register_personality` stores `get_current_cred()`, so two registrations taken from unchanged credentials reference
+/// the same `struct cred`. This pins the consequence: two `register_self` ids are interchangeable for the link, because
+/// they *are* the same credentials. The requirement therefore bites across genuinely different identities (the
+/// broker's), not across id values.
 #[test]
 fn linkat_file_accepts_any_id_for_the_same_credentials() {
     pin_umask();
@@ -1429,10 +1247,9 @@ fn linkat_file_accepts_any_id_for_the_same_credentials() {
     });
 }
 
-/// The allowlist's *refusals* are the security property, so they get the test.
-/// `security.` would grant file capabilities, `system.` would rewrite ACLs, and
-/// `user.` needs no privilege at all - none may be elevated. A bare `trusted.`
-/// is refused too: it would cover the entire namespace.
+/// The allowlist's *refusals* are the security property, so they get the test. `security.` would grant file
+/// capabilities, `system.` would rewrite ACLs, and `user.` needs no privilege at all - none may be elevated. A bare
+/// `trusted.` is refused too: it would cover the entire namespace.
 #[test]
 fn privileged_xattr_prefixes_refuse_dangerous_namespaces() {
     for bad in [
@@ -1447,10 +1264,7 @@ fn privileged_xattr_prefixes_refuse_dangerous_namespaces() {
         c"nonsense",
     ] {
         assert!(
-            matches!(
-                PrivilegedXattrs::new().allow_prefix(bad),
-                Err(Error::Validation(_))
-            ),
+            matches!(PrivilegedXattrs::new().allow_prefix(bad), Err(Error::Validation(_))),
             "prefix {bad:?} must be refused"
         );
     }
@@ -1460,13 +1274,11 @@ fn privileged_xattr_prefixes_refuse_dangerous_namespaces() {
         .expect("a scoped trusted. prefix is allowed");
 }
 
-/// An allowlisted `trusted.*` write is elevated to the reactor's ambient
-/// credentials; an unlisted name in the same namespace, through the same call,
-/// is not - and unprivileged callers cannot even see the elevated name.
+/// An allowlisted `trusted.*` write is elevated to the reactor's ambient credentials; an unlisted name in the same
+/// namespace, through the same call, is not - and unprivileged callers cannot even see the elevated name.
 ///
-/// Requires privilege to be meaningful (the `trusted.` namespace is
-/// `CAP_SYS_ADMIN`-gated), so it skips when not root - and skips on kernels
-/// below 6.13, where fd-based xattrs are unavailable.
+/// Requires privilege to be meaningful (the `trusted.` namespace is `CAP_SYS_ADMIN`-gated), so it skips when not root -
+/// and skips on kernels below 6.13, where fd-based xattrs are unavailable.
 #[test]
 fn privileged_xattr_allowlist_elevates_only_listed_names() {
     if !root_or_skip("privileged_xattr_allowlist_elevates_only_listed_names") {
@@ -1474,13 +1286,9 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
     }
     pin_umask();
     let dir = truenas_ros::tempdir().expect("tempdir");
-    // `tempdir` creates the directory 0700; the unprivileged identity must
-    // traverse it, and reaching the file is not what this test probes.
-    std::fs::set_permissions(
-        dir.path(),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .expect("open up the scratch dir");
+    // `tempdir` creates the directory 0700; the unprivileged identity must traverse it, and reaching the file is not
+    // what this test probes.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).expect("open up the scratch dir");
     let mut afs = match UringFs::new(test_cfg()) {
         Ok(a) => a,
         Err(e) => {
@@ -1496,8 +1304,8 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
             .expect("valid prefix"),
     );
 
-    // A *brokered*, unprivileged identity: the whole point is that this
-    // personality could never write `trusted.*` itself.
+    // A *brokered*, unprivileged identity: the whole point is that this personality could never write `trusted.*`
+    // itself.
     let broker = match CredBroker::spawn(&[&afs]) {
         Ok(b) => b,
         Err(_) => return, // no privilege to impersonate here
@@ -1515,24 +1323,13 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
             let _guard = StopGuard(stop);
             let anchor = Anchor::open(dir_path.as_path()).expect("anchor");
             std::fs::write(dir_path.join("obj"), b"data").unwrap();
-            // World-writable so the identity's failures are about the xattr
-            // namespace, not about reaching the file.
-            std::fs::set_permissions(
-                dir_path.join("obj"),
-                std::fs::Permissions::from_mode(0o666),
-            )
-            .unwrap();
+            // World-writable so the identity's failures are about the xattr namespace, not about reaching the file.
+            std::fs::set_permissions(dir_path.join("obj"), std::fs::Permissions::from_mode(0o666)).unwrap();
             let f = h
-                .open(
-                    nobody,
-                    &anchor,
-                    "obj",
-                    OpenHow::new().flags(OFlag::O_RDWR),
-                )
+                .open(nobody, &anchor, "obj", OpenHow::new().flags(OFlag::O_RDWR))
                 .expect("open as the unprivileged identity");
 
-            // Allowlisted: elevated, so it succeeds despite `nobody` holding
-            // no CAP_SYS_ADMIN.
+            // Allowlisted: elevated, so it succeeds despite `nobody` holding no CAP_SYS_ADMIN.
             let (res, _) = h.fsetxattr(
                 nobody,
                 &f,
@@ -1542,36 +1339,20 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
             );
             res.expect("an allowlisted name is written with ambient creds");
 
-            // Same namespace, same call, not listed: stays with the request
-            // identity and is refused by the kernel.
-            let (res, _) = h.fsetxattr(
-                nobody,
-                &f,
-                xattr_name("trusted.other"),
-                b"nope".to_vec(),
-                0,
-            );
+            // Same namespace, same call, not listed: stays with the request identity and is refused by the kernel.
+            let (res, _) = h.fsetxattr(nobody, &f, xattr_name("trusted.other"), b"nope".to_vec(), 0);
             assert!(
                 matches!(res, Err(Error::Errno(Errno::EPERM))),
                 "an unlisted trusted.* name must not be elevated, got {res:?}"
             );
 
             // The stored value is real, and readable only with privilege.
-            let (res, buf) = h.fgetxattr_as_root(
-                &f,
-                xattr_name("trusted.truenas_test_meta"),
-                vec![0u8; 64],
-            );
+            let (res, buf) = h.fgetxattr_as_root(&f, xattr_name("trusted.truenas_test_meta"), vec![0u8; 64]);
             let n = res.expect("privileged read");
             assert_eq!(&buf[..n], b"server-owned");
 
             // ...and invisible to the identity that "owns" the file.
-            let (res, _) = h.fgetxattr(
-                nobody,
-                &f,
-                xattr_name("trusted.truenas_test_meta"),
-                vec![0u8; 64],
-            );
+            let (res, _) = h.fgetxattr(nobody, &f, xattr_name("trusted.truenas_test_meta"), vec![0u8; 64]);
             assert!(
                 matches!(res, Err(Error::Errno(Errno::ENODATA))),
                 "trusted.* must be invisible unprivileged, got {res:?}"
@@ -1581,10 +1362,9 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
     });
 }
 
-/// `preadv2`/`pwritev2` round-trip with a durability flag, and - the part that
-/// matters - an *unsupported* flag fails the operation instead of being
-/// silently dropped. A durability flag that no-ops would be the worst possible
-/// failure mode, so the degrade path is the assertion.
+/// `preadv2`/`pwritev2` round-trip with a durability flag, and - the part that matters - an *unsupported* flag fails
+/// the operation instead of being silently dropped. A durability flag that no-ops would be the worst possible failure
+/// mode, so the degrade path is the assertion.
 #[test]
 fn preadv2_pwritev2_flags_apply_or_fail_loudly() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1592,26 +1372,21 @@ fn preadv2_pwritev2_flags_apply_or_fail_loudly() {
         let f = h.open(me, &anchor, "rw2", creat_rw()).expect("open");
 
         // No flags: identical to the plain forms.
-        let (n, _) =
-            h.pwritev2(me, &f, vec![b"alpha".to_vec()], 0, RwFlags::empty());
+        let (n, _) = h.pwritev2(me, &f, vec![b"alpha".to_vec()], 0, RwFlags::empty());
         assert_eq!(n.expect("pwritev2"), 5);
 
         // RWF_DSYNC: the write is itself durable, standing in for fdatasync.
-        let (n, _) =
-            h.pwritev2(me, &f, vec![b"-beta".to_vec()], 5, RwFlags::RWF_DSYNC);
+        let (n, _) = h.pwritev2(me, &f, vec![b"-beta".to_vec()], 5, RwFlags::RWF_DSYNC);
         assert_eq!(n.expect("pwritev2 RWF_DSYNC"), 5);
 
-        let (n, bufs) =
-            h.preadv2(me, &f, vec![vec![0u8; 10]], 0, RwFlags::empty());
+        let (n, bufs) = h.preadv2(me, &f, vec![vec![0u8; 10]], 0, RwFlags::empty());
         assert_eq!(n.expect("preadv2"), 10);
         assert_eq!(&bufs[0][..10], b"alpha-beta");
         assert_eq!(std::fs::read(dir.join("rw2")).unwrap(), b"alpha-beta");
 
-        // A flag the filesystem does not implement must be refused outright.
-        // `RWF_ATOMIC` needs FMODE_CAN_ATOMIC_WRITE, which neither tmpfs nor
-        // ZFS sets; accept EOPNOTSUPP or EINVAL, but never a silent success.
-        let (res, _) =
-            h.pwritev2(me, &f, vec![b"x".to_vec()], 0, RwFlags::RWF_ATOMIC);
+        // A flag the filesystem does not implement must be refused outright. `RWF_ATOMIC` needs FMODE_CAN_ATOMIC_WRITE,
+        // which neither tmpfs nor ZFS sets; accept EOPNOTSUPP or EINVAL, but never a silent success.
+        let (res, _) = h.pwritev2(me, &f, vec![b"x".to_vec()], 0, RwFlags::RWF_ATOMIC);
         assert!(
             matches!(res, Err(Error::Errno(Errno::EOPNOTSUPP | Errno::EINVAL))),
             "an unsupported rw flag must fail the op, got {res:?}"
@@ -1625,8 +1400,8 @@ fn preadv2_pwritev2_flags_apply_or_fail_loudly() {
 
 /// `open_confined` cannot be talked out of its confinement. `open` yields to a
 /// caller that *states* a policy (documented, and fine for a general opener);
-/// the confined form unions the guarantees in, so a `how` that buys in-tree
-/// symlinks through `open` buys nothing through `open_confined`.
+/// the confined form unions the guarantees in, so a `how` that buys in-tree symlinks through `open` buys nothing
+/// through `open_confined`.
 #[test]
 fn open_confined_cannot_be_weakened_by_the_caller() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1635,13 +1410,11 @@ fn open_confined_cannot_be_weakened_by_the_caller() {
         std::fs::write(dir.join("inner/target"), b"in-tree").unwrap();
         let inner = Anchor::open(dir.join("inner").as_path()).unwrap();
 
-        // A stated policy `open` honours: BENEATH without NO_SYMLINKS follows
-        // a link that stays inside the anchor.
+        // A stated policy `open` honours: BENEATH without NO_SYMLINKS follows a link that stays inside the anchor.
         let stated = OpenHow::new()
             .flags(OFlag::O_RDONLY)
             .resolve(ResolveFlag::RESOLVE_BENEATH);
-        std::os::unix::fs::symlink("target", dir.join("inner/in_tree"))
-            .unwrap();
+        std::os::unix::fs::symlink("target", dir.join("inner/in_tree")).unwrap();
         let f = h
             .open(me, &inner, "in_tree", stated)
             .expect("plain open honours a stated policy");
@@ -1669,10 +1442,8 @@ fn open_confined_cannot_be_weakened_by_the_caller() {
             "confined open must refuse a `..` escape, got {res:?}"
         );
 
-        // A symlink pointing out of the tree is refused too, even though the
-        // path itself contains no `..`.
-        std::os::unix::fs::symlink(dir.join("outside"), dir.join("inner/link"))
-            .unwrap();
+        // A symlink pointing out of the tree is refused too, even though the path itself contains no `..`.
+        std::os::unix::fs::symlink(dir.join("outside"), dir.join("inner/link")).unwrap();
         let res = h.open_confined(me, &inner, "link", permissive);
         assert!(
             matches!(res, Err(Error::Errno(Errno::ELOOP | Errno::EXDEV))),
@@ -1683,11 +1454,9 @@ fn open_confined_cannot_be_weakened_by_the_caller() {
         let res = h.open_confined(me, &inner, "/etc/hostname", permissive);
         assert!(res.is_err(), "confined open must refuse an absolute path");
 
-        // `RESOLVE_IN_ROOT` is the one flag that cannot be unioned in: the
-        // kernel refuses `BENEATH|IN_ROOT` outright (`fs/open.c:1264`), so
-        // the union answered `EINVAL` for every path shape - a leaf, a
-        // nested path, `"."` - while the same call through `open` worked.
-        // Refused at the boundary, where the message can name the fix.
+        // `RESOLVE_IN_ROOT` is the one flag that cannot be unioned in: the kernel refuses `BENEATH|IN_ROOT` outright
+        // (`fs/open.c:1264`), so the union answered `EINVAL` for every path shape - a leaf, a nested path, `"."` -
+        // while the same call through `open` worked. Refused at the boundary, where the message can name the fix.
         let in_root = OpenHow::new()
             .flags(OFlag::O_RDONLY)
             .resolve(ResolveFlag::RESOLVE_IN_ROOT);
@@ -1699,8 +1468,8 @@ fn open_confined_cannot_be_weakened_by_the_caller() {
                  refused as a bad argument, not answered EINVAL by the \
                  kernel: got {res:?}"
             );
-            // The plain opener still serves it, which is what makes the
-            // refusal a routing decision rather than a lost capability.
+            // The plain opener still serves it, which is what makes the refusal a routing decision rather than a lost
+            // capability.
             let f = h
                 .open(me, &inner, path, in_root)
                 .unwrap_or_else(|e| panic!("open({path:?}) IN_ROOT: {e}"));
@@ -1709,27 +1478,24 @@ fn open_confined_cannot_be_weakened_by_the_caller() {
     });
 }
 
-/// `mkdir_path` is `mkdir -p`, confined: it creates what is missing, tolerates
-/// what exists, and refuses to build a path that would leave the anchor.
+/// `mkdir_path` is `mkdir -p`, confined: it creates what is missing, tolerates what exists, and refuses to build a path
+/// that would leave the anchor.
 #[test]
 fn mkdir_path_creates_confined_and_is_idempotent() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let mode = Mode::from_bits_truncate(0o755);
 
-        let leaf_anchor = h
-            .mkdir_path(me, &anchor, "a/b/c", mode)
-            .expect("create a nested tree");
+        let leaf_anchor = h.mkdir_path(me, &anchor, "a/b/c", mode).expect("create a nested tree");
         assert!(dir.join("a/b/c").is_dir());
 
-        // The returned anchor really is the deepest directory: a leaf op
-        // through it lands in `a/b/c`.
+        // The returned anchor really is the deepest directory: a leaf op through it lands in `a/b/c`.
         h.mkdirat(me, &leaf_anchor, leaf("d"), mode)
             .expect("mkdir through the returned anchor");
         assert!(dir.join("a/b/c/d").is_dir());
 
-        // Idempotent: re-running changes nothing and still succeeds (this is
-        // also the lost-race outcome when two callers create the same tree).
+        // Idempotent: re-running changes nothing and still succeeds (this is also the lost-race outcome when two
+        // callers create the same tree).
         h.mkdir_path(me, &anchor, "a/b/c", mode)
             .expect("existing tree is not an error");
         // Partially-existing trees extend rather than fail.
@@ -1737,14 +1503,11 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
             .expect("extend an existing prefix");
         assert!(dir.join("a/b/other/deep").is_dir());
 
-        // Every component must be a plain name. `a/../b` is the one worth
-        // stating: `openat2` under CONFINED_RESOLVE resolves it safely, so
-        // it is refused for a different reason - a walk creating `b` cannot
-        // know what `a/..` will turn out to be, and a path that succeeded
-        // where the tree existed and failed where it did not would name two
-        // different things. Redundant separators go with them: they name
-        // the same directory, which makes them a caller assembling a path
-        // wrongly rather than a path meaning something unintended.
+        // Every component must be a plain name. `a/../b` is the one worth stating: `openat2` under CONFINED_RESOLVE
+        // resolves it safely, so it is refused for a different reason - a walk creating `b` cannot know what `a/..`
+        // will turn out to be, and a path that succeeded where the tree existed and failed where it did not would name
+        // two different things. Redundant separators go with them: they name the same directory, which makes them a
+        // caller assembling a path wrongly rather than a path meaning something unintended.
         for bad in [
             "../escape",
             "a/../../escape",
@@ -1764,8 +1527,8 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
             );
         }
         assert!(!dir.parent().unwrap().join("escape").exists());
-        // Refused on shape, so refused whether or not the tree exists:
-        // `a/b/c` is there by now and `a/b/../b/c` still is not accepted.
+        // Refused on shape, so refused whether or not the tree exists: `a/b/c` is there by now and `a/b/../b/c` still
+        // is not accepted.
         assert!(
             h.mkdir_path(me, &anchor, "a/b/../b/c", mode).is_err(),
             "an existing tree does not make `..` acceptable"
@@ -1773,36 +1536,26 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
     });
 }
 
-/// Top-level directories that genuinely sit on another filesystem - the
-/// fixture the `RESOLVE_NO_XDEV` tests need.
+/// Top-level directories that genuinely sit on another filesystem - the fixture the `RESOLVE_NO_XDEV` tests need.
 ///
-/// `symlink_metadata`, not `metadata`: a followed symlink reports its TARGET's
-/// device, so on a usr-merged root `/lib -> usr/lib` qualifies while being an
-/// ordinary symlink on the root filesystem. The opens under test resolve with
-/// `RESOLVE_NO_SYMLINKS`, so such a candidate dies `ELOOP` before the
-/// confinement is ever reached.
+/// `symlink_metadata`, not `metadata`: a followed symlink reports its TARGET's device, so on a usr-merged root `/lib ->
+/// usr/lib` qualifies while being an ordinary symlink on the root filesystem. The opens under test resolve with
+/// `RESOLVE_NO_SYMLINKS`, so such a candidate dies `ELOOP` before the confinement is ever reached.
 ///
-/// **Real mounts first, and the order is deterministic.** `/proc`, `/sys`,
-/// `/dev` and `/run` are top-level mounts on every Linux host, so "is the
-/// list empty" is a question that answers itself: an emptiness gate could
-/// never fire, and the boundary actually crossed would be whichever entry
-/// `read_dir` happened to yield first - in practice procfs, and a different
-/// pick from run to run.
+/// **Real mounts first, and the order is deterministic.** `/proc`, `/sys`, `/dev` and `/run` are top-level mounts on
+/// every Linux host, so "is the list empty" is a question that answers itself: an emptiness gate could never fire, and
+/// the boundary actually crossed would be whichever entry `read_dir` happened to yield first - in practice procfs, and
+/// a different pick from run to run.
 ///
-/// What the QEMU job pays for is a pair of ZFS datasets (`setup-test-zfs.sh`
-/// mounts `/POSIXACL` and `/NFSV4ACL`), and those are the boundary worth
-/// crossing: a pseudo filesystem shares neither ZFS's mount semantics nor its
-/// ACL behaviour, so pinning `RESOLVE_NO_XDEV` against procfs proves nothing
-/// about the platform the product ships. So the pseudo mounts sort last, and
-/// `TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY=1` demands a **real** crossing rather
-/// than merely any crossing - which is what holds the runner to what the job
-/// provisions.
+/// What the QEMU job pays for is a pair of ZFS datasets (`setup-test-zfs.sh` mounts `/POSIXACL` and `/NFSV4ACL`), and
+/// those are the boundary worth crossing: a pseudo filesystem shares neither ZFS's mount semantics nor its ACL
+/// behaviour, so pinning `RESOLVE_NO_XDEV` against procfs proves nothing about the platform the product ships. So the
+/// pseudo mounts sort last, and `TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY=1` demands a **real** crossing rather than merely
+/// any crossing - which is what holds the runner to what the job provisions.
 ///
-/// `symlink_metadata`, not `metadata`: a followed symlink reports its TARGET's
-/// device, so on a usr-merged root `/lib -> usr/lib` qualifies while being an
-/// ordinary symlink on the root filesystem. The opens under test resolve with
-/// `RESOLVE_NO_SYMLINKS`, so such a candidate dies `ELOOP` before the
-/// confinement is ever reached.
+/// `symlink_metadata`, not `metadata`: a followed symlink reports its TARGET's device, so on a usr-merged root `/lib ->
+/// usr/lib` qualifies while being an ordinary symlink on the root filesystem. The opens under test resolve with
+/// `RESOLVE_NO_SYMLINKS`, so such a candidate dies `ELOOP` before the confinement is ever reached.
 fn mount_crossings() -> Vec<String> {
     /// Always present, so their presence proves nothing about provisioning.
     const PSEUDO: [&str; 4] = ["proc", "sys", "dev", "run"];
@@ -1813,21 +1566,15 @@ fn mount_crossings() -> Vec<String> {
         .flatten()
         .filter_map(|e| {
             let md = std::fs::symlink_metadata(e.path()).ok()?;
-            (md.is_dir() && md.dev() != root_dev)
-                .then(|| e.file_name().into_string().ok())?
+            (md.is_dir() && md.dev() != root_dev).then(|| e.file_name().into_string().ok())?
         })
         .collect();
-    // Alphabetical, then a stable partition - so the chosen boundary is the
-    // same on every run of the same host.
+    // Alphabetical, then a stable partition - so the chosen boundary is the same on every run of the same host.
     found.sort();
     found.sort_by_key(|n| PSEUDO.contains(&n.as_str()));
-    let real = found
-        .iter()
-        .filter(|n| !PSEUDO.contains(&n.as_str()))
-        .count();
+    let real = found.iter().filter(|n| !PSEUDO.contains(&n.as_str())).count();
     assert!(
-        real > 0
-            || std::env::var_os("TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY").is_none(),
+        real > 0 || std::env::var_os("TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY").is_none(),
         "TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY is set but the only top-level \
          mounts are pseudo filesystems ({found:?}): the datasets \
          setup-test-zfs.sh provisions are missing, and crossing into procfs \
@@ -1836,16 +1583,13 @@ fn mount_crossings() -> Vec<String> {
     found
 }
 
-/// A crossing this identity can **search**, which is more than
-/// [`mount_crossings`] promises: it filters on device and nothing else, and
-/// the relocation half below opens the chosen mount as its own anchor. A
-/// top-level dataset can be root-only - TrueNAS ships `/audit`, `/conf` and
-/// `/root` at 0700, and they sort first - so an unprivileged run picked one
-/// and died `EACCES` on a fixture question rather than on the confinement
-/// under test.
+/// A crossing this identity can **search**, which is more than [`mount_crossings`] promises: it filters on device and
+/// nothing else, and the relocation half below opens the chosen mount as its own anchor. A top-level dataset can be
+/// root-only - TrueNAS ships `/audit`, `/conf` and `/root` at 0700, and they sort first - so an unprivileged run picked
+/// one and died `EACCES` on a fixture question rather than on the confinement under test.
 ///
-/// `metadata("/<name>/.")` is exactly that question: resolving `.` inside
-/// the directory needs the search bit the test is about to need.
+/// `metadata("/<name>/.")` is exactly that question: resolving `.` inside the directory needs the search bit the test
+/// is about to need.
 fn traversable_crossing() -> Option<String> {
     let all = mount_crossings();
     let pick = all
@@ -1853,9 +1597,7 @@ fn traversable_crossing() -> Option<String> {
         .find(|n| std::fs::metadata(format!("/{n}/.")).is_ok())
         .cloned();
     assert!(
-        pick.is_some()
-            || all.is_empty()
-            || std::env::var_os("TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY").is_none(),
+        pick.is_some() || all.is_empty() || std::env::var_os("TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY").is_none(),
         "TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY is set but none of {all:?} is \
          searchable by uid {}: the confinement test needs a crossing it can \
          open as its own anchor, not merely one that exists",
@@ -1865,9 +1607,8 @@ fn traversable_crossing() -> Option<String> {
     pick
 }
 
-/// `RESOLVE_NO_XDEV` is what makes "this tree is one filesystem" a rule the
-/// kernel enforces rather than a convention: a walk that would step onto
-/// another mount fails instead of quietly serving files from it. Uses a real
+/// `RESOLVE_NO_XDEV` is what makes "this tree is one filesystem" a rule the kernel enforces rather than a convention: a
+/// walk that would step onto another mount fails instead of quietly serving files from it. Uses a real
 /// mount boundary on the running system (on TrueNAS, a child dataset);
 /// self-skips where the root filesystem has no child mounts.
 #[test]
@@ -1880,16 +1621,12 @@ fn confined_open_refuses_to_cross_a_mount_point() {
 
         let how = OpenHow::new().flags(OFlag::O_PATH | OFlag::O_DIRECTORY);
 
-        // The default carries NO_XDEV, so an ordinary open stops too. This is
-        // the half a caller gets without asking: a share anchored on a parent
-        // dataset does not serve a child dataset's files through an object
-        // key that happens to name its mountpoint.
+        // The default carries NO_XDEV, so an ordinary open stops too. This is the half a caller gets without asking: a
+        // share anchored on a parent dataset does not serve a child dataset's files through an object key that happens
+        // to name its mountpoint.
         for (what, res) in [
             ("open", h.open(me, &root, name.as_str(), how)),
-            (
-                "open_confined",
-                h.open_confined(me, &root, name.as_str(), how),
-            ),
+            ("open_confined", h.open_confined(me, &root, name.as_str(), how)),
         ] {
             assert!(
                 matches!(res, Err(Error::Errno(Errno::EXDEV))),
@@ -1897,12 +1634,9 @@ fn confined_open_refuses_to_cross_a_mount_point() {
             );
         }
 
-        // Stating a policy replaces the policy, not the hardening that
-        // rides with it. `RESOLVE_BENEATH` is how a caller asks to follow
-        // in-tree symlinks; it must not also, silently, be how they ask to
-        // leave the filesystem - the kernel keeps the two questions apart
-        // (`__traverse_mounts` consults only `LOOKUP_NO_XDEV`), and so does
-        // this.
+        // Stating a policy replaces the policy, not the hardening that rides with it. `RESOLVE_BENEATH` is how a caller
+        // asks to follow in-tree symlinks; it must not also, silently, be how they ask to leave the filesystem - the
+        // kernel keeps the two questions apart (`__traverse_mounts` consults only `LOOKUP_NO_XDEV`), and so does this.
         for stated in [
             ResolveFlag::RESOLVE_BENEATH,
             ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS,
@@ -1915,19 +1649,16 @@ fn confined_open_refuses_to_cross_a_mount_point() {
             );
         }
 
-        // The capability is not lost, only relocated to where a reader can
-        // see it: anchor on the nested mount and open relative to that.
-        let nested =
-            Anchor::open(format!("/{name}").as_str()).expect("anchor nested");
-        h.open(me, &nested, ".", how).unwrap_or_else(|e| {
-            panic!("open of /{name} as its own anchor: {e}")
-        });
+        // The capability is not lost, only relocated to where a reader can see it: anchor on the nested mount and open
+        // relative to that.
+        let nested = Anchor::open(format!("/{name}").as_str()).expect("anchor nested");
+        h.open(me, &nested, ".", how)
+            .unwrap_or_else(|e| panic!("open of /{name} as its own anchor: {e}"));
     });
 }
 
-/// An abandoned upload leaves nothing to clean up - the property that removes
-/// the need for a temp-file sweeper. Drop the file instead of committing it
-/// and assert the staging directory is still empty.
+/// An abandoned upload leaves nothing to clean up - the property that removes the need for a temp-file sweeper. Drop
+/// the file instead of committing it and assert the staging directory is still empty.
 #[test]
 fn abandoned_tmpfile_leaves_nothing_behind() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1951,14 +1682,11 @@ fn abandoned_tmpfile_leaves_nothing_behind() {
     });
 }
 
-/// The confinement composes with every enrichment, not only the one that
-/// takes the by-name `statx` path.
+/// The confinement composes with every enrichment, not only the one that takes the by-name `statx` path.
 ///
-/// Asking for xattrs, an ACL or a name list opens a descriptor, and the
-/// device then comes from a `statx` of *that* - issued in the read phase,
-/// with no by-name answer at the collection phase at all. A confinement
-/// that reads "no metadata here" as a failure at the earlier phase would
-/// refuse every such listing outright.
+/// Asking for xattrs, an ACL or a name list opens a descriptor, and the device then comes from a `statx` of *that* -
+/// issued in the read phase, with no by-name answer at the collection phase at all. A confinement that reads "no
+/// metadata here" as a failure at the earlier phase would refuse every such listing outright.
 #[test]
 fn confinement_composes_with_the_descriptor_enrichments() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1980,9 +1708,7 @@ fn confinement_composes_with_the_descriptor_enrichments() {
             let mut q = query_directory(&h, me, &anchor, opts).expect("list");
             let mut names = Vec::new();
             while let Some(batch) = q.next() {
-                for e in batch
-                    .unwrap_or_else(|e| panic!("{spec:?} listing refused: {e}"))
-                {
+                for e in batch.unwrap_or_else(|e| panic!("{spec:?} listing refused: {e}")) {
                     names.push(e.name.to_string_lossy().into_owned());
                 }
             }
@@ -1992,9 +1718,8 @@ fn confinement_composes_with_the_descriptor_enrichments() {
     });
 }
 
-/// `readdir` honours no `RESOLVE_*` flags, so the listing side needs its own
-/// mount check - otherwise a nested dataset lists as though it were part of
-/// the tree. Uses a real mount boundary; self-skips without one.
+/// `readdir` honours no `RESOLVE_*` flags, so the listing side needs its own mount check - otherwise a nested dataset
+/// lists as though it were part of the tree. Uses a real mount boundary; self-skips without one.
 #[test]
 fn listing_can_be_confined_to_one_filesystem() {
     with_fs(test_cfg(), |h, me, _dir, _stop| {
@@ -2025,16 +1750,10 @@ fn listing_can_be_confined_to_one_filesystem() {
         let confined = names(true);
         for c in &crossings {
             assert!(all.contains(c), "unconfined listing should include /{c}");
-            assert!(
-                !confined.contains(c),
-                "confined listing must drop the mount point /{c}"
-            );
+            assert!(!confined.contains(c), "confined listing must drop the mount point /{c}");
         }
         // Only the crossings are dropped; same-filesystem entries survive.
-        assert!(
-            all.len() > confined.len(),
-            "confinement should drop something here"
-        );
+        assert!(all.len() > confined.len(), "confinement should drop something here");
         for n in &confined {
             assert!(all.contains(n), "confinement must not invent entries");
         }
@@ -2043,30 +1762,19 @@ fn listing_can_be_confined_to_one_filesystem() {
 
 #[test]
 fn metadata_ops_carry_the_personality() {
-    // Every metadata op stamps sqe.personality; an id this ring never
-    // registered must fail at submission rather than running as the daemon.
+    // Every metadata op stamps sqe.personality; an id this ring never registered must fail at submission rather than
+    // running as the daemon.
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("f"), b"x").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let bogus = Personality::from_raw(4242).unwrap();
 
         assert!(matches!(
-            h.statx(
-                bogus,
-                &anchor,
-                leaf("f"),
-                AtFlags::empty(),
-                StatxMask::BASIC_STATS
-            ),
+            h.statx(bogus, &anchor, leaf("f"), AtFlags::empty(), StatxMask::BASIC_STATS),
             Err(Error::Errno(Errno::EINVAL))
         ));
         assert!(matches!(
-            h.mkdirat(
-                bogus,
-                &anchor,
-                leaf("d"),
-                Mode::from_bits_truncate(0o755)
-            ),
+            h.mkdirat(bogus, &anchor, leaf("d"), Mode::from_bits_truncate(0o755)),
             Err(Error::Errno(Errno::EINVAL))
         ));
         assert!(matches!(
@@ -2085,19 +1793,15 @@ fn metadata_ops_carry_the_personality() {
 
 // --- M3: the credential broker ---------------------------------------------
 
-/// The broker forks, so it must be created before the harness starts
-/// threads. These tests each build their own reactor rather than using
-/// `with_fs`, and run the loop on a scoped thread while the test thread
-/// drives registration (the reverse of the other tests, because `UringFs`
-/// is `!Send` but `CredBroker`/`CredHandle` are `Send`).
+/// The broker forks, so it must be created before the harness starts threads. These tests each build their own reactor
+/// rather than using `with_fs`, and run the loop on a scoped thread while the test thread drives registration (the
+/// reverse of the other tests, because `UringFs` is `!Send` but `CredBroker`/`CredHandle` are `Send`).
 /// Dropping the broker must leave no zombie behind.
 ///
-/// `clone3_fork(0, 0, ..)` gives the child `exit_signal == 0`, which makes it
-/// a "clone child": `eligible_child` (`kernel/exit.c:1163`) tests
-/// `(p->exit_signal != SIGCHLD) ^ !!(wo->wo_flags & __WCLONE)`, so a plain
-/// `waitpid` answers `-1 ECHILD` at once and the task stays `Z` for the host
-/// process's life. Nothing else reaps it either - no `SIGCHLD` is delivered
-/// to hang a handler off - so this leaks one task per broker.
+/// `clone3_fork(0, 0, ..)` gives the child `exit_signal == 0`, which makes it a "clone child": `eligible_child`
+/// (`kernel/exit.c:1163`) tests `(p->exit_signal != SIGCHLD) ^ !!(wo->wo_flags & __WCLONE)`, so a plain `waitpid`
+/// answers `-1 ECHILD` at once and the task stays `Z` for the host process's life. Nothing else reaps it either - no
+/// `SIGCHLD` is delivered to hang a handler off - so this leaks one task per broker.
 #[test]
 fn dropping_the_broker_leaves_no_zombie() {
     let afs = match UringFs::new(test_cfg()) {
@@ -2114,14 +1818,12 @@ fn dropping_the_broker_leaves_no_zombie() {
     assert!(broker.is_alive(), "the broker should be running");
     drop(broker); // SIGKILL via the pidfd, then the reap
 
-    // A successful reap releases the task, so `/proc/<pid>` is gone the
-    // moment `Drop` returns. The poll is for the failing shape: a
-    // `waitpid` that answered ECHILD returns just as fast, and the child
-    // needs a moment to finish dying before it reads `Z`.
+    // A successful reap releases the task, so `/proc/<pid>` is gone the moment `Drop` returns. The poll is for the
+    // failing shape: a `waitpid` that answered ECHILD returns just as fast, and the child needs a moment to finish
+    // dying before it reads `Z`.
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     // Loops while `/proc/<pid>` still exists; a read error is the reap.
-    while let Ok(last) = std::fs::read_to_string(format!("/proc/{pid}/status"))
-    {
+    while let Ok(last) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
         assert!(
             std::time::Instant::now() < deadline,
             "broker pid {pid} outlived its drop ({}): the reap needs \
@@ -2150,8 +1852,7 @@ where
     with_broker_policy(allowed, None, client)
 }
 
-/// [`with_broker_caps`] with a root limit too, through
-/// `CredBroker::spawn_with_root`.
+/// [`with_broker_caps`] with a root limit too, through `CredBroker::spawn_with_root`.
 fn with_broker_root<F>(allowed: Caps, root: Caps, client: F)
 where
     F: FnOnce(&FsHandle, &CredHandle, Personality, &Path) + Send,
@@ -2166,17 +1867,12 @@ where
 {
     pin_umask();
     let dir = truenas_ros::tempdir().expect("tempdir");
-    // These tests drive ops as an impersonated user, who must be able to
-    // traverse this directory and - for the ones that create as that user --
-    // write in it. A fresh tempdir is only owner-writable, so widen it once
-    // here rather than in each test.
-    std::fs::set_permissions(
-        dir.path(),
-        std::fs::Permissions::from_mode(0o777),
-    )
-    .expect("chmod tempdir");
-    // The ring must exist before the broker forks: it inherits the fd,
-    // because an io_uring descriptor cannot be sent over a unix socket.
+    // These tests drive ops as an impersonated user, who must be able to traverse this directory and - for the ones
+    // that create as that user -- write in it. A fresh tempdir is only owner-writable, so widen it once here rather
+    // than in each test.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).expect("chmod tempdir");
+    // The ring must exist before the broker forks: it inherits the fd, because an io_uring descriptor cannot be sent
+    // over a unix socket.
     let mut afs = match UringFs::new(test_cfg()) {
         Ok(a) => a,
         Err(e) => {
@@ -2217,12 +1913,10 @@ where
 
 /// The special-file guard leaves nothing behind on the descriptor.
 ///
-/// `O_NONBLOCK` stops the *open* parking on a planted FIFO, but on the file
-/// it returns it is not inert: `io_file_get_flags` reads it into
-/// `REQ_F_SUPPORT_NOWAIT`, so `__io_read` takes the `IOCB_NOWAIT` branch and
-/// the transfer runs in the submitting task - the reactor thread - instead of
-/// on an io-wq worker. Measured at 22.7 ms inline for a 32 MiB warm ZFS read
-/// against a punt. The kernel strips the flag from files it added it to
+/// `O_NONBLOCK` stops the *open* parking on a planted FIFO, but on the file it returns it is not inert:
+/// `io_file_get_flags` reads it into `REQ_F_SUPPORT_NOWAIT`, so `__io_read` takes the `IOCB_NOWAIT` branch and the
+/// transfer runs in the submitting task - the reactor thread - instead of on an io-wq worker. Measured at 22.7 ms
+/// inline for a 32 MiB warm ZFS read against a punt. The kernel strips the flag from files it added it to
 /// (`io_uring/openclose.c:161-162`); so does this.
 #[test]
 fn an_open_leaves_no_guard_nonblock_on_the_descriptor() {
@@ -2237,8 +1931,7 @@ fn an_open_leaves_no_guard_nonblock_on_the_descriptor() {
             unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) }
         };
 
-        // Guarded (the default): the open cannot block, and the descriptor
-        // does not carry the flag that made it so.
+        // Guarded (the default): the open cannot block, and the descriptor does not carry the flag that made it so.
         let plain = OpenHow::new().flags(OFlag::O_RDONLY);
         let f = h.open(me, &anchor, "f", plain).unwrap();
         assert_eq!(
@@ -2247,8 +1940,8 @@ fn an_open_leaves_no_guard_nonblock_on_the_descriptor() {
             "the guard's O_NONBLOCK rode out on the descriptor"
         );
 
-        // A caller asking for it keeps it - the flag is theirs, and the
-        // kernel makes the same distinction with `nonblock_set`.
+        // A caller asking for it keeps it - the flag is theirs, and the kernel makes the same distinction with
+        // `nonblock_set`.
         let mine = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_NONBLOCK);
         let f = h.open(me, &anchor, "f", mine).unwrap();
         assert_ne!(
@@ -2258,8 +1951,7 @@ fn an_open_leaves_no_guard_nonblock_on_the_descriptor() {
         );
 
         // And opting out leaves the flags exactly as given.
-        let allow = FsOpenHow::from(plain)
-            .allow_blocking_special_files(std::time::Duration::from_secs(5));
+        let allow = FsOpenHow::from(plain).allow_blocking_special_files(std::time::Duration::from_secs(5));
         let f = h.open(me, &anchor, "f", allow).unwrap();
         assert_eq!(
             flags(&f) & libc::O_NONBLOCK,
@@ -2271,17 +1963,14 @@ fn an_open_leaves_no_guard_nonblock_on_the_descriptor() {
 
 /// A creating open does not park on a planted writer-less FIFO.
 ///
-/// `io_openat_force_async` (`io_uring/openclose.c:42-50`) puts every
-/// `O_CREAT`/`O_TRUNC`/`O_TMPFILE` open straight onto an io-wq worker, where
-/// the `op.open_flag |= O_NONBLOCK` the inline path applies never runs and
-/// `fifo_open` sleeps in `wait_for_partner` (`fs/pipe.c`) until a writer
-/// appears - forever, for a FIFO nobody will write to. The io-wq pool is
-/// `min(sq_entries, 4 * nr_cpus)`, so a handful of planted names pins every
-/// blocking fs op on the ring, and `into_outcome` waits with no deadline, so
-/// each pins a caller thread too.
+/// `io_openat_force_async` (`io_uring/openclose.c:42-50`) puts every `O_CREAT`/`O_TRUNC`/`O_TMPFILE` open straight onto
+/// an io-wq worker, where the `op.open_flag |= O_NONBLOCK` the inline path applies never runs and `fifo_open` sleeps in
+/// `wait_for_partner` (`fs/pipe.c`) until a writer appears - forever, for a FIFO nobody will write to. The io-wq pool
+/// is `min(sq_entries, 4 * nr_cpus)`, so a handful of planted names pins every blocking fs op on the ring, and
+/// `into_outcome` waits with no deadline, so each pins a caller thread too.
 ///
-/// Runs with a deadline on a worker thread: without the guard this does not
-/// fail, it hangs, and a hung test is a worse signal than a red one.
+/// Runs with a deadline on a worker thread: without the guard this does not fail, it hangs, and a hung test is a worse
+/// signal than a red one.
 #[test]
 fn a_creating_open_does_not_park_on_a_planted_fifo() {
     use std::sync::mpsc;
@@ -2290,8 +1979,7 @@ fn a_creating_open_does_not_park_on_a_planted_fifo() {
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let fifo = dir.join("planted");
-        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
-            .unwrap();
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: a NUL-terminated path we own.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo");
 
@@ -2315,24 +2003,16 @@ fn a_creating_open_does_not_park_on_a_planted_fifo() {
     });
 }
 
-/// An `Allow` open that blocks is bounded by its own deadline, and the
-/// worker it parked comes back.
+/// An `Allow` open that blocks is bounded by its own deadline, and the worker it parked comes back.
 ///
-/// The shape the mandatory deadline exists for: `O_WRONLY|O_CREAT` on a
-/// planted writer-less FIFO is forced onto an io-wq worker
-/// (`io_openat_force_async`) where `fifo_open` sleeps in
-/// `wait_for_partner` - with `Allow` and no deadline, forever, and the
-/// pool is one bounded set shared by every blocking fs op on the ring.
-/// The deadline is a guard timer in its own op slot whose expiry
-/// stages an `ASYNC_CANCEL` for the open (`core::TAG_OPEN_DEADLINE` -
-/// **not** a kernel `LINK_TIMEOUT`, which arms only after the blocking
-/// issue returns and so cannot bound this shape); the cancellation
-/// reaches the sleep as a signal, so the errno is `ECANCELED` or --
-/// where the open was already parked and returns `-ERESTARTSYS`,
-/// folded by `map_res` the way the kernel's own rw path folds it --
-/// `EINTR`. Either way the worker is freed, which the guarded open
-/// afterwards proves: it needs an io-wq worker of its own and
-/// completes.
+/// The shape the mandatory deadline exists for: `O_WRONLY|O_CREAT` on a planted writer-less FIFO is forced onto an
+/// io-wq worker (`io_openat_force_async`) where `fifo_open` sleeps in `wait_for_partner` - with `Allow` and no
+/// deadline, forever, and the pool is one bounded set shared by every blocking fs op on the ring. The deadline is a
+/// guard timer in its own op slot whose expiry stages an `ASYNC_CANCEL` for the open (`core::TAG_OPEN_DEADLINE` -
+/// **not** a kernel `LINK_TIMEOUT`, which arms only after the blocking issue returns and so cannot bound this shape);
+/// the cancellation reaches the sleep as a signal, so the errno is `ECANCELED` or -- where the open was already parked
+/// and returns `-ERESTARTSYS`, folded by `map_res` the way the kernel's own rw path folds it -- `EINTR`. Either way the
+/// worker is freed, which the guarded open afterwards proves: it needs an io-wq worker of its own and completes.
 #[test]
 fn an_allow_open_is_bounded_by_its_deadline() {
     use std::time::{Duration, Instant};
@@ -2342,8 +2022,7 @@ fn an_allow_open_is_bounded_by_its_deadline() {
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let fifo = dir.join("planted");
-        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
-            .unwrap();
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: a NUL-terminated path we own.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo");
         let anchor = Anchor::open(dir.as_path()).unwrap();
@@ -2351,8 +2030,7 @@ fn an_allow_open_is_bounded_by_its_deadline() {
         let how = OpenHow::new()
             .flags(OFlag::O_WRONLY | OFlag::O_CREAT)
             .mode(Mode::from_bits_truncate(0o644));
-        let allow = FsOpenHow::from(how)
-            .allow_blocking_special_files(Duration::from_millis(300));
+        let allow = FsOpenHow::from(how).allow_blocking_special_files(Duration::from_millis(300));
         let began = Instant::now();
         let got = h.open(me, &anchor, "planted", allow);
         let took = began.elapsed();
@@ -2382,15 +2060,12 @@ fn an_allow_open_is_bounded_by_its_deadline() {
     });
 }
 
-/// An `Allow` open that completes retracts its guard, giving both
-/// slots back long before the hour-long deadline.
+/// An `Allow` open that completes retracts its guard, giving both slots back long before the hour-long deadline.
 ///
-/// On a two-slot table, so the leak is the difference: an `Allow` open
-/// charges its own slot and its guard's, and a guard left armed after
-/// the open answered holds one of the two for the deadline's full
-/// length - the next `Allow` open, which needs both, then never fits.
-/// The retraction's slot returns with its own CQE, so the second open
-/// is retried briefly rather than demanded instantly.
+/// On a two-slot table, so the leak is the difference: an `Allow` open charges its own slot and its guard's, and a
+/// guard left armed after the open answered holds one of the two for the deadline's full length - the next `Allow`
+/// open, which needs both, then never fits. The retraction's slot returns with its own CQE, so the second open is
+/// retried briefly rather than demanded instantly.
 #[test]
 fn an_allow_open_that_completes_disarms_its_deadline() {
     use std::time::{Duration, Instant};
@@ -2404,8 +2079,7 @@ fn an_allow_open_that_completes_disarms_its_deadline() {
         let how = OpenHow::new()
             .flags(OFlag::O_RDWR | OFlag::O_CREAT)
             .mode(Mode::from_bits_truncate(0o600));
-        let allow = FsOpenHow::from(how)
-            .allow_blocking_special_files(Duration::from_secs(3600));
+        let allow = FsOpenHow::from(how).allow_blocking_special_files(Duration::from_secs(3600));
         let f = h
             .open(me, &anchor, "quick", allow)
             .expect("a regular file answers long before its deadline");
@@ -2416,9 +2090,7 @@ fn an_allow_open_that_completes_disarms_its_deadline() {
         loop {
             match h.open(me, &anchor, "again", allow) {
                 Ok(_) => break,
-                Err(truenas_ros::Error::Errno(
-                    truenas_ros::errno::Errno::EBUSY,
-                )) if Instant::now() < deadline => {
+                Err(truenas_ros::Error::Errno(truenas_ros::errno::Errno::EBUSY)) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(e) => panic!(
@@ -2430,8 +2102,8 @@ fn an_allow_open_that_completes_disarms_its_deadline() {
     });
 }
 
-/// A zero `Allow` deadline is refused at entry: it would cancel the
-/// open it exists to guard, so it is a shape defect like any other.
+/// A zero `Allow` deadline is refused at entry: it would cancel the open it exists to guard, so it is a shape defect
+/// like any other.
 #[test]
 fn a_zero_allow_deadline_is_refused() {
     use std::time::Duration;
@@ -2440,13 +2112,9 @@ fn a_zero_allow_deadline_is_refused() {
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
-        let allow = FsOpenHow::from(OpenHow::new().flags(OFlag::O_RDONLY))
-            .allow_blocking_special_files(Duration::ZERO);
+        let allow = FsOpenHow::from(OpenHow::new().flags(OFlag::O_RDONLY)).allow_blocking_special_files(Duration::ZERO);
         assert!(
-            matches!(
-                h.open(me, &anchor, "x", allow),
-                Err(truenas_ros::Error::Validation(_))
-            ),
+            matches!(h.open(me, &anchor, "x", allow), Err(truenas_ros::Error::Validation(_))),
             "a zero deadline must be refused before anything submits"
         );
     });
@@ -2454,19 +2122,15 @@ fn a_zero_allow_deadline_is_refused() {
 
 /// An entry whose descriptor could not be opened still reports metadata.
 ///
-/// `enrich` takes an entry's `statx` from the descriptor it opened, so that
-/// the metadata cannot describe a different inode than the content. Where the
-/// open fails there is no descriptor to stat - and equally nothing for a
-/// by-name answer to be mispaired against - so the by-name lookup is both
-/// safe there and the only answer available. A symlink under `O_NOFOLLOW`
-/// is the deterministic way to reach that arm as root.
+/// `enrich` takes an entry's `statx` from the descriptor it opened, so that the metadata cannot describe a different
+/// inode than the content. Where the open fails there is no descriptor to stat - and equally nothing for a by-name
+/// answer to be mispaired against - so the by-name lookup is both safe there and the only answer available. A symlink
+/// under `O_NOFOLLOW` is the deterministic way to reach that arm as root.
 #[test]
 fn an_unopenable_entry_still_reports_statx() {
     use std::collections::BTreeMap;
     use std::ffi::CString;
-    use truenas_ros::uring_fs::{
-        DirEntry, EnrichSpec, QueryOptions, query_directory,
-    };
+    use truenas_ros::uring_fs::{DirEntry, EnrichSpec, QueryOptions, query_directory};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("real"), b"xx").unwrap();
@@ -2474,8 +2138,7 @@ fn an_unopenable_entry_still_reports_statx() {
 
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let opts = QueryOptions {
-            // Both, so a descriptor is opened and the fd-keyed statx is the
-            // one that normally answers.
+            // Both, so a descriptor is opened and the fd-keyed statx is the one that normally answers.
             spec: EnrichSpec::STATX | EnrichSpec::XATTR,
             xattr_names: vec![CString::new("user.etag").unwrap()],
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
@@ -2507,9 +2170,7 @@ fn an_unopenable_entry_still_reports_statx() {
 fn query_directory_lists_and_enriches() {
     use std::collections::BTreeMap;
     use std::ffi::CString;
-    use truenas_ros::uring_fs::{
-        DirEntry, EnrichSpec, QueryOptions, query_directory,
-    };
+    use truenas_ros::uring_fs::{DirEntry, EnrichSpec, QueryOptions, query_directory};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("a.txt"), b"aa").unwrap();
@@ -2523,8 +2184,7 @@ fn query_directory_lists_and_enriches() {
         let xattr_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "a.txt", how).unwrap();
-            let (res, _) =
-                h.fsetxattr(me, &f, etag.clone(), b"deadbeef".to_vec(), 0);
+            let (res, _) = h.fsetxattr(me, &f, etag.clone(), b"deadbeef".to_vec(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.etag)", &res)
         };
@@ -2563,15 +2223,12 @@ fn query_directory_lists_and_enriches() {
     });
 }
 
-/// `XATTR_LIST` discovers the attributes present in the requested namespace and
-/// returns their values; a namespace the attributes are not in discovers none
-/// of them.
+/// `XATTR_LIST` discovers the attributes present in the requested namespace and returns their values; a namespace the
+/// attributes are not in discovers none of them.
 #[test]
 fn query_directory_discovers_user_xattrs() {
     use std::collections::BTreeMap;
-    use truenas_ros::uring_fs::{
-        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
-    };
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("a.txt"), b"aa").unwrap();
@@ -2581,8 +2238,7 @@ fn query_directory_discovers_user_xattrs() {
         let set = |name: &str, val: &[u8]| -> bool {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "a.txt", how).unwrap();
-            let (res, _) =
-                h.fsetxattr(me, &f, xattr_name(name), val.to_vec(), 0);
+            let (res, _) = h.fsetxattr(me, &f, xattr_name(name), val.to_vec(), 0);
             h.close(f).unwrap();
             fd_xattr_ok(&format!("fsetxattr({name})"), &res)
         };
@@ -2612,14 +2268,8 @@ fn query_directory_discovers_user_xattrs() {
         };
 
         let user = discover(XattrNamespaces::USER);
-        assert_eq!(
-            user.get("user.alpha").and_then(|v| v.as_deref()),
-            Some(&b"one"[..]),
-        );
-        assert_eq!(
-            user.get("user.beta").and_then(|v| v.as_deref()),
-            Some(&b"two"[..]),
-        );
+        assert_eq!(user.get("user.alpha").and_then(|v| v.as_deref()), Some(&b"one"[..]),);
+        assert_eq!(user.get("user.beta").and_then(|v| v.as_deref()), Some(&b"two"[..]),);
 
         let trusted = discover(XattrNamespaces::TRUSTED);
         assert!(
@@ -2629,15 +2279,12 @@ fn query_directory_discovers_user_xattrs() {
     });
 }
 
-/// A discovered attribute whose name is not UTF-8 is enriched under `who`: its
-/// bytes reach `fgetxattr` verbatim, so the value comes back rather than the
-/// attribute being dropped over a lossy name.
+/// A discovered attribute whose name is not UTF-8 is enriched under `who`: its bytes reach `fgetxattr` verbatim, so the
+/// value comes back rather than the attribute being dropped over a lossy name.
 #[test]
 fn query_directory_discovers_non_utf8_name() {
     use std::ffi::CString;
-    use truenas_ros::uring_fs::{
-        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
-    };
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("a.txt"), b"aa").unwrap();
@@ -2648,8 +2295,7 @@ fn query_directory_discovers_non_utf8_name() {
         let set_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "a.txt", how).unwrap();
-            let (res, _) =
-                h.fsetxattr(me, &f, name.clone(), b"present".to_vec(), 0);
+            let (res, _) = h.fsetxattr(me, &f, name.clone(), b"present".to_vec(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.<non-utf8>)", &res)
         };
@@ -2683,13 +2329,10 @@ fn query_directory_discovers_non_utf8_name() {
     });
 }
 
-/// A discovered value larger than the initial buffer is refetched at its true
-/// size, not silently truncated or dropped.
+/// A discovered value larger than the initial buffer is refetched at its true size, not silently truncated or dropped.
 #[test]
 fn query_directory_discovers_large_value() {
-    use truenas_ros::uring_fs::{
-        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
-    };
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("big.bin"), b"x").unwrap();
@@ -2699,8 +2342,7 @@ fn query_directory_discovers_large_value() {
         let set_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "big.bin", how).unwrap();
-            let (res, _) =
-                h.fsetxattr(me, &f, xattr_name("user.blob"), big.clone(), 0);
+            let (res, _) = h.fsetxattr(me, &f, xattr_name("user.blob"), big.clone(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.blob)", &res)
         };
@@ -2726,22 +2368,15 @@ fn query_directory_discovers_large_value() {
                 }
             }
         }
-        assert_eq!(
-            found.as_deref(),
-            Some(big.as_slice()),
-            "the whole value is refetched"
-        );
+        assert_eq!(found.as_deref(), Some(big.as_slice()), "the whole value is refetched");
     });
 }
 
-/// An explicitly requested value larger than the initial buffer is returned at
-/// its true size, not reported absent: the ERANGE the fixed buffer yields must
-/// not read as "no such attribute".
+/// An explicitly requested value larger than the initial buffer is returned at its true size, not reported absent: the
+/// ERANGE the fixed buffer yields must not read as "no such attribute".
 #[test]
 fn query_directory_explicit_large_value() {
-    use truenas_ros::uring_fs::{
-        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
-    };
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("big.bin"), b"x").unwrap();
@@ -2785,42 +2420,31 @@ fn query_directory_explicit_large_value() {
     });
 }
 
-/// A listing that lost nothing must not report itself short - and one that
-/// did must.
+/// A listing that lost nothing must not report itself short - and one that did must.
 ///
-/// The listing opens each entry `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` to read its
-/// values through, and two ordinary entry types can never satisfy that: a
-/// symbolic link answers `ELOOP` because of `O_NOFOLLOW`, and a socket
-/// answers `ENXIO`. They do not get the same verdict, because the errno is
-/// not what decides it - what the object can hold is.
+/// The listing opens each entry `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` to read its values through, and two ordinary entry
+/// types can never satisfy that: a symbolic link answers `ELOOP` because of `O_NOFOLLOW`, and a socket answers `ENXIO`.
+/// They do not get the same verdict, because the errno is not what decides it - what the object can hold is.
 ///
-/// A symlink can hold neither an access ACL (`vfs_get_acl` refuses one
-/// outright) nor a `user.*` attribute (`xattr(7)`), so "absent" is the true
-/// answer about it and flagging one would make `xattrs_incomplete`
-/// permanent for a directory containing nothing unusual - a consumer that
-/// re-queries on the flag would re-query for ever.
+/// A symlink can hold neither an access ACL (`vfs_get_acl` refuses one outright) nor a `user.*` attribute (`xattr(7)`),
+/// so "absent" is the true answer about it and flagging one would make `xattrs_incomplete` permanent for a directory
+/// containing nothing unusual - a consumer that re-queries on the flag would re-query for ever.
 ///
-/// A socket holds both, exactly as a regular file does, so its `ENXIO`
-/// leaves values the caller asked for genuinely unread. Reported as absent
-/// with the flag clear, a permissions layer mirroring ACLs out of a listing
-/// records "this object has no ACL" for one that has one, which is the
-/// trivial-versus-unread confusion the ACL arm in `next_batch` exists to
-/// refuse.
+/// A socket holds both, exactly as a regular file does, so its `ENXIO` leaves values the caller asked for genuinely
+/// unread. Reported as absent with the flag clear, a permissions layer mirroring ACLs out of a listing records "this
+/// object has no ACL" for one that has one, which is the trivial-versus-unread confusion the ACL arm in `next_batch`
+/// exists to refuse.
 ///
-/// The regular file is the live control - it opens, its value is read, and
-/// it is reported complete - so a blanket "everything is flagged" would not
-/// pass either.
+/// The regular file is the live control - it opens, its value is read, and it is reported complete - so a blanket
+/// "everything is flagged" would not pass either.
 #[test]
 fn query_directory_does_not_flag_an_entry_it_cannot_open() {
-    use truenas_ros::uring_fs::{
-        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
-    };
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("plain.bin"), b"x").unwrap();
         std::os::unix::fs::symlink("plain.bin", dir.join("link")).unwrap();
-        let sock = std::os::unix::net::UnixListener::bind(dir.join("sock"))
-            .expect("bind a unix socket in the listing");
+        let sock = std::os::unix::net::UnixListener::bind(dir.join("sock")).expect("bind a unix socket in the listing");
         std::fs::create_dir(dir.join("sub")).unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let name = xattr_name("user.probe");
@@ -2859,14 +2483,11 @@ fn query_directory_does_not_flag_an_entry_it_cannot_open() {
             "the listing must yield every entry it was given"
         );
         for (n, incomplete, _) in &seen {
-            // Nothing here lost a value. The only name asked for is
-            // `user.probe`, and `user.*` lives only on regular files and
-            // directories (`xattr_permission`, `fs/xattr.c`), so for the
-            // symlink and the socket - neither of which can be opened by
-            // this listing - "absent" is the true answer rather than an
-            // unread one. Flagging them makes the flag permanent: both
-            // answer the same errno on every call, so a consumer that
-            // re-queries on it re-queries for ever.
+            // Nothing here lost a value. The only name asked for is `user.probe`, and `user.*` lives only on regular
+            // files and directories (`xattr_permission`, `fs/xattr.c`), so for the symlink and the socket - neither of
+            // which can be opened by this listing - "absent" is the true answer rather than an unread one. Flagging
+            // them makes the flag permanent: both answer the same errno on every call, so a consumer that re-queries on
+            // it re-queries for ever.
             assert!(
                 !incomplete,
                 "{n}: flagged incomplete for a `user.*` name it cannot hold"
@@ -2884,34 +2505,28 @@ fn query_directory_does_not_flag_an_entry_it_cannot_open() {
     });
 }
 
-/// The narrowing is two-sided: an entry that could not be opened is flagged
-/// when the request named something its type *does* hold.
+/// The narrowing is two-sided: an entry that could not be opened is flagged when the request named something its type
+/// *does* hold.
 ///
-/// The companion above pins the other half - a socket asked only for
-/// `user.*`, which it cannot hold, is not flagged. Here the same socket, in
-/// the same unopenable state, is asked for its access ACL, which it holds
-/// and which this listing did not read. Without both, a fix for either half
-/// reads as correct: suppressing the flag for every socket passes the first
-/// test and loses a real value silently, which is the error the `ENXIO`
-/// classification was changed to remove in the first place.
+/// The companion above pins the other half - a socket asked only for `user.*`, which it cannot hold, is not flagged.
+/// Here the same socket, in the same unopenable state, is asked for its access ACL, which it holds and which this
+/// listing did not read. Without both, a fix for either half reads as correct: suppressing the flag for every socket
+/// passes the first test and loses a real value silently, which is the error the `ENXIO` classification was changed to
+/// remove in the first place.
 ///
-/// The ACL is put on the socket through the raw syscall because the listing
-/// itself cannot open one, and `fsetxattr` needs a descriptor.
+/// The ACL is put on the socket through the raw syscall because the listing itself cannot open one, and `fsetxattr`
+/// needs a descriptor.
 #[test]
 fn query_directory_flags_a_socket_whose_acl_it_could_not_read() {
-    use truenas_ros::uring_fs::{
-        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
-    };
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("plain.bin"), b"x").unwrap();
-        let sock = std::os::unix::net::UnixListener::bind(dir.join("sock"))
-            .expect("bind a unix socket in the listing");
+        let sock = std::os::unix::net::UnixListener::bind(dir.join("sock")).expect("bind a unix socket in the listing");
 
-        // A named user makes it a real ACL rather than one equivalent to
-        // the mode, so the value genuinely exists on the socket. Written out
-        // rather than built through `sync_fs::acl`, which is a different
-        // feature - this test compiles under `uring-fs` alone.
+        // A named user makes it a real ACL rather than one equivalent to the mode, so the value genuinely exists on the
+        // socket. Written out rather than built through `sync_fs::acl`, which is a different feature - this test
+        // compiles under `uring-fs` alone.
         // version 2, then USER_OBJ / USER:1000 / GROUP_OBJ / MASK / OTHER.
         let mut blob = 2u32.to_le_bytes().to_vec();
         for (tag, perm, id) in [
@@ -2927,8 +2542,7 @@ fn query_directory_flags_a_socket_whose_acl_it_could_not_read() {
         }
         use std::os::unix::ffi::OsStrExt as _;
         let sock_path = dir.join("sock");
-        let cp =
-            std::ffi::CString::new(sock_path.as_os_str().as_bytes()).unwrap();
+        let cp = std::ffi::CString::new(sock_path.as_os_str().as_bytes()).unwrap();
         // SAFETY: a valid NUL-terminated path and a sized buffer.
         let rc = unsafe {
             libc::setxattr(
@@ -2975,34 +2589,25 @@ fn query_directory_flags_a_socket_whose_acl_it_could_not_read() {
              reported as unread, not as having none: {sock_row:?}"
         );
         let plain = seen.iter().find(|(n, ..)| n == "plain.bin").expect("f");
-        assert!(
-            !plain.1,
-            "the control opened fine and lost nothing: {plain:?}"
-        );
+        assert!(!plain.1, "the control opened fine and lost nothing: {plain:?}");
         drop(sock);
     });
 }
 
-/// An ACL the filesystem does not implement is **absent**, not a listing that
-/// could not be completed.
+/// An ACL the filesystem does not implement is **absent**, not a listing that could not be completed.
 ///
-/// [`QueryOptions::acl_name`] is the caller's to choose, and a permissions
-/// layer that asks for `system.nfs4_acl_xdr` while listing an
-/// `acltype=posixacl` dataset gets `EOPNOTSUPP` for every entry - measured:
-/// tmpfs and a posixacl ZFS dataset both answer it. Classed as a failed read
-/// that raises `xattrs_incomplete` on every entry of a complete listing, for a
-/// filesystem doing exactly what it says, and a consumer that reads the flag
-/// re-queries or refuses for ever.
+/// [`QueryOptions::acl_name`] is the caller's to choose, and a permissions layer that asks for `system.nfs4_acl_xdr`
+/// while listing an `acltype=posixacl` dataset gets `EOPNOTSUPP` for every entry - measured: tmpfs and a posixacl ZFS
+/// dataset both answer it. Classed as a failed read that raises `xattrs_incomplete` on every entry of a complete
+/// listing, for a filesystem doing exactly what it says, and a consumer that reads the flag re-queries or refuses for
+/// ever.
 ///
-/// The first half is the live control. A `None` ACL proves nothing on its own -
-/// the slot reads `None` when `EnrichSpec::ACL` was never requested, when the
-/// entry could not be opened, and when the read was refused - so the same
-/// listing machinery is first shown fetching an `acl_name` that *is* readable.
+/// The first half is the live control. A `None` ACL proves nothing on its own - the slot reads `None` when
+/// `EnrichSpec::ACL` was never requested, when the entry could not be opened, and when the read was refused - so the
+/// same listing machinery is first shown fetching an `acl_name` that *is* readable.
 #[test]
 fn query_directory_reports_an_unimplemented_acl_as_absent() {
-    use truenas_ros::uring_fs::{
-        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
-    };
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("obj.bin"), b"x").unwrap();
@@ -3013,8 +2618,7 @@ fn query_directory_reports_an_unimplemented_acl_as_absent() {
         let set_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "obj.bin", how).unwrap();
-            let (res, _) =
-                h.fsetxattr(me, &f, readable.clone(), value.clone(), 0);
+            let (res, _) = h.fsetxattr(me, &f, readable.clone(), value.clone(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.pretend_acl)", &res)
         };
@@ -3060,16 +2664,13 @@ fn query_directory_reports_an_unimplemented_acl_as_absent() {
     });
 }
 
-/// Discovery runs each value read under the caller: an unprivileged identity
-/// sees the world-readable `user.*` attribute but never the `trusted.*` one,
-/// while a privileged identity does. The candidate-listing `flistxattr` runs at
-/// the reactor's privilege, so the per-value `who` read is what gates it.
+/// Discovery runs each value read under the caller: an unprivileged identity sees the world-readable `user.*` attribute
+/// but never the `trusted.*` one, while a privileged identity does. The candidate-listing `flistxattr` runs at the
+/// reactor's privilege, so the per-value `who` read is what gates it.
 #[test]
 fn query_directory_discovery_drops_unreadable_trusted() {
     use std::collections::BTreeMap;
-    use truenas_ros::uring_fs::{
-        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
-    };
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
 
     if !root_or_skip("query_directory_discovery_drops_unreadable_trusted") {
         return; // broker impersonation and trusted.* both need privilege
@@ -3079,30 +2680,22 @@ fn query_directory_discovery_drops_unreadable_trusted() {
 
     with_broker(|h, creds, me, dir| {
         std::fs::write(dir.join("f.txt"), b"hi").unwrap();
-        std::fs::set_permissions(
-            dir.join("f.txt"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("f.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
         let anchor = Anchor::open(dir).unwrap();
 
         let set = |who: Personality, name: &str, val: &[u8]| {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(who, &anchor, "f.txt", how).unwrap();
-            let (res, _) =
-                h.fsetxattr(who, &f, xattr_name(name), val.to_vec(), 0);
+            let (res, _) = h.fsetxattr(who, &f, xattr_name(name), val.to_vec(), 0);
             h.close(f).unwrap();
             res
         };
-        if !fd_xattr_ok("fsetxattr(user.pub)", &set(me, "user.pub", b"public"))
-        {
+        if !fd_xattr_ok("fsetxattr(user.pub)", &set(me, "user.pub", b"public")) {
             return; // fd xattrs unsupported
         }
         set(me, "trusted.secret", b"classified").unwrap();
 
-        let peer = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        let peer = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
 
         let discover = |who: Personality| {
             let opts = QueryOptions {
@@ -3146,9 +2739,7 @@ fn query_directory_discovery_drops_unreadable_trusted() {
 /// Discovery works through the pooled lister as well as the direct one.
 #[test]
 fn query_pool_discovers_xattrs() {
-    use truenas_ros::uring_fs::{
-        EnrichSpec, QueryOptions, QueryPool, XattrNamespaces,
-    };
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, QueryPool, XattrNamespaces};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("p.txt"), b"hi").unwrap();
@@ -3156,8 +2747,7 @@ fn query_pool_discovers_xattrs() {
         let set_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "p.txt", how).unwrap();
-            let (res, _) =
-                h.fsetxattr(me, &f, xattr_name("user.tag"), b"v".to_vec(), 0);
+            let (res, _) = h.fsetxattr(me, &f, xattr_name("user.tag"), b"v".to_vec(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.tag)", &res)
         };
@@ -3176,10 +2766,10 @@ fn query_pool_discovers_xattrs() {
         while let Some(batch) = handle.next() {
             for e in batch.unwrap() {
                 if e.name.as_bytes() == b"p.txt" {
-                    found = e.xattrs.iter().any(|(n, v)| {
-                        n.to_bytes() == b"user.tag"
-                            && v.as_deref() == Some(&b"v"[..])
-                    });
+                    found = e
+                        .xattrs
+                        .iter()
+                        .any(|(n, v)| n.to_bytes() == b"user.tag" && v.as_deref() == Some(&b"v"[..]));
                 }
             }
         }
@@ -3187,9 +2777,8 @@ fn query_pool_discovers_xattrs() {
     });
 }
 
-/// Enumeration is gated by the caller's list permission: opening the directory
-/// readable under `who` is the DAC check, so a non-root peer that cannot list a
-/// `0700` directory it does not own gets `EACCES` (never the reactor's root).
+/// Enumeration is gated by the caller's list permission: opening the directory readable under `who` is the DAC check,
+/// so a non-root peer that cannot list a `0700` directory it does not own gets `EACCES` (never the reactor's root).
 #[test]
 fn query_directory_enumeration_obeys_dac() {
     use std::ffi::CString;
@@ -3206,16 +2795,10 @@ fn query_directory_enumeration_obeys_dac() {
         // A root-owned 0700 subdir the peer cannot list.
         let secret = dir.join("secret");
         std::fs::create_dir(&secret).unwrap();
-        std::fs::set_permissions(
-            &secret,
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(secret.join("hidden.txt"), b"x").unwrap();
 
-        let peer = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        let peer = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
         let anchor = Anchor::open(&secret).unwrap();
         let opts = QueryOptions {
             spec: EnrichSpec::STATX,
@@ -3234,8 +2817,8 @@ fn query_directory_enumeration_obeys_dac() {
     });
 }
 
-/// Dropping a `QueryDir` mid-walk closes its directory fd (RAII), not at some
-/// later teardown - verified against `/proc/self/fd`.
+/// Dropping a `QueryDir` mid-walk closes its directory fd (RAII), not at some later teardown - verified against
+/// `/proc/self/fd`.
 #[test]
 fn query_directory_drop_closes_dir_fd() {
     use std::ffi::CString;
@@ -3261,14 +2844,12 @@ fn query_directory_drop_closes_dir_fd() {
         // Pull one batch, then drop mid-walk (files remain unread).
         let first = q.next().expect("a batch").unwrap();
         assert!(!first.is_empty());
-        let target =
-            std::fs::read_link(&link).expect("dir fd open during walk");
+        let target = std::fs::read_link(&link).expect("dir fd open during walk");
         drop(q);
-        // `Drop` closes the `DIR*` (and its dup fd) synchronously via `closedir`.
-        // The freed fd *number* can be reused by the reactor thread running
-        // concurrently, so assert the fd no longer names our directory - closed
-        // (`Err`) or reused for something else (a different target) - rather than
-        // that the number is merely absent, which fd reuse would race.
+        // `Drop` closes the `DIR*` (and its dup fd) synchronously via `closedir`. The freed fd *number* can be reused
+        // by the reactor thread running concurrently, so assert the fd no longer names our directory - closed (`Err`)
+        // or reused for something else (a different target) - rather than that the number is merely absent, which fd
+        // reuse would race.
         match std::fs::read_link(&link) {
             Err(_) => {}
             Ok(reused) => assert_ne!(
@@ -3280,9 +2861,8 @@ fn query_directory_drop_closes_dir_fd() {
     });
 }
 
-/// The off-loop async-fs API enumerates a file's xattrs directly (no directory
-/// walk): `flistxattr` lists names, `query_xattrs` returns namespace-filtered
-/// names and values read under `who`.
+/// The off-loop async-fs API enumerates a file's xattrs directly (no directory walk): `flistxattr` lists names,
+/// `query_xattrs` returns namespace-filtered names and values read under `who`.
 #[test]
 fn fs_handle_query_xattrs_reads_user_namespace() {
     use std::collections::BTreeMap;
@@ -3295,8 +2875,7 @@ fn fs_handle_query_xattrs_reads_user_namespace() {
         let f = h.open(me, &anchor, "f.txt", how).unwrap();
 
         let set = |name: &str, val: &[u8]| {
-            let (res, _) =
-                h.fsetxattr(me, &f, xattr_name(name), val.to_vec(), 0);
+            let (res, _) = h.fsetxattr(me, &f, xattr_name(name), val.to_vec(), 0);
             res
         };
         if !fd_xattr_ok("fsetxattr(user.a)", &set("user.a", b"1")) {
@@ -3326,9 +2905,8 @@ fn fs_handle_query_xattrs_reads_user_namespace() {
     });
 }
 
-/// Off-loop `query_xattrs` gates each value read under `who`: an unprivileged
-/// identity gets the world-readable `user.*` attribute but never the
-/// `trusted.*` one, while a privileged identity does.
+/// Off-loop `query_xattrs` gates each value read under `who`: an unprivileged identity gets the world-readable `user.*`
+/// attribute but never the `trusted.*` one, while a privileged identity does.
 #[test]
 fn fs_handle_query_xattrs_drops_unreadable_trusted() {
     use std::collections::BTreeMap;
@@ -3342,19 +2920,13 @@ fn fs_handle_query_xattrs_drops_unreadable_trusted() {
 
     with_broker(|h, creds, me, dir| {
         std::fs::write(dir.join("f.txt"), b"hi").unwrap();
-        std::fs::set_permissions(
-            dir.join("f.txt"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("f.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
         let anchor = Anchor::open(dir).unwrap();
-        let owner =
-            h.open(me, &anchor, "f.txt", OpenHow::new().flags(OFlag::O_RDWR));
+        let owner = h.open(me, &anchor, "f.txt", OpenHow::new().flags(OFlag::O_RDWR));
         let owner = owner.unwrap();
 
         let set = |name: &str, val: &[u8]| {
-            let (res, _) =
-                h.fsetxattr(me, &owner, xattr_name(name), val.to_vec(), 0);
+            let (res, _) = h.fsetxattr(me, &owner, xattr_name(name), val.to_vec(), 0);
             res
         };
         if !fd_xattr_ok("fsetxattr(user.pub)", &set("user.pub", b"public")) {
@@ -3363,9 +2935,7 @@ fn fs_handle_query_xattrs_drops_unreadable_trusted() {
         set("trusted.secret", b"classified").unwrap();
         h.close(owner).unwrap();
 
-        let peer = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        let peer = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
         let ns = XattrNamespaces::USER | XattrNamespaces::TRUSTED;
         let query = |who| {
             let how = OpenHow::new().flags(OFlag::O_RDONLY);
@@ -3395,9 +2965,8 @@ fn fs_handle_query_xattrs_drops_unreadable_trusted() {
     });
 }
 
-/// `FsHandle::fgetxattr_as_root` reads under the reactor's ambient (root)
-/// credentials, so it returns a `trusted.*` value that the same fd's normal
-/// `who`-attributed read (as an unprivileged identity) is denied.
+/// `FsHandle::fgetxattr_as_root` reads under the reactor's ambient (root) credentials, so it returns a `trusted.*`
+/// value that the same fd's normal `who`-attributed read (as an unprivileged identity) is denied.
 #[test]
 fn fs_handle_fgetxattr_as_root_reads_trusted() {
     if !root_or_skip("fs_handle_fgetxattr_as_root_reads_trusted") {
@@ -3408,31 +2977,23 @@ fn fs_handle_fgetxattr_as_root_reads_trusted() {
 
     with_broker(|h, creds, me, dir| {
         std::fs::write(dir.join("f.txt"), b"hi").unwrap();
-        std::fs::set_permissions(
-            dir.join("f.txt"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("f.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
         let anchor = Anchor::open(dir).unwrap();
         let how = OpenHow::new().flags(OFlag::O_RDWR);
         let f = h.open(me, &anchor, "f.txt", how).unwrap();
         let name = xattr_name("trusted.secret");
-        let (set, _) =
-            h.fsetxattr(me, &f, name.clone(), b"classified".to_vec(), 0);
+        let (set, _) = h.fsetxattr(me, &f, name.clone(), b"classified".to_vec(), 0);
         if !fd_xattr_ok("fsetxattr(trusted.secret)", &set) {
             return; // fd xattrs unsupported
         }
 
-        let peer = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        let peer = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
         // Attributed to the unprivileged peer, the read is denied.
         let (peer_res, _) = h.fgetxattr(peer, &f, name.clone(), vec![0u8; 64]);
         assert!(peer_res.is_err(), "peer cannot read trusted.* as itself");
 
         // As root, the same fd yields the value regardless of any `who`.
-        let (root_res, buf) =
-            h.fgetxattr_as_root(&f, name.clone(), vec![0u8; 64]);
+        let (root_res, buf) = h.fgetxattr_as_root(&f, name.clone(), vec![0u8; 64]);
         let n = root_res.expect("as-root read succeeds");
         assert_eq!(&buf[..n], b"classified");
 
@@ -3440,31 +3001,21 @@ fn fs_handle_fgetxattr_as_root_reads_trusted() {
     });
 }
 
-/// `FsHandle::fgetxattr_proc` reads an xattr of a file held `O_PATH`, which
-/// `fgetxattr` refuses, and reads it as the personality. So nobody reads a
-/// file of mode 0644 and is refused once it is 0600. A link held `O_PATH`
-/// with `O_NOFOLLOW` is read itself, which has no `user.` attribute, rather
-/// than the file it names.
+/// `FsHandle::fgetxattr_proc` reads an xattr of a file held `O_PATH`, which `fgetxattr` refuses, and reads it as the
+/// personality. So nobody reads a file of mode 0644 and is refused once it is 0600. A link held `O_PATH` with
+/// `O_NOFOLLOW` is read itself, which has no `user.` attribute, rather than the file it names.
 #[test]
 fn fgetxattr_proc_reads_a_file_held_o_path_as_the_personality() {
-    if !root_or_skip(
-        "fgetxattr_proc_reads_a_file_held_o_path_as_the_personality",
-    ) {
+    if !root_or_skip("fgetxattr_proc_reads_a_file_held_o_path_as_the_personality") {
         return; // the broker needs privilege
     }
     with_broker(|h, creds, me, dir| {
         std::fs::write(dir.join("f"), b"body").unwrap();
-        std::fs::set_permissions(
-            dir.join("f"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("f"), std::fs::Permissions::from_mode(0o644)).unwrap();
         std::os::unix::fs::symlink("f", dir.join("l")).unwrap();
         let anchor = Anchor::open(dir).unwrap();
         let name = xattr_name("user.proc");
-        let rw = h
-            .open(me, &anchor, "f", OpenHow::new().flags(OFlag::O_RDWR))
-            .unwrap();
+        let rw = h.open(me, &anchor, "f", OpenHow::new().flags(OFlag::O_RDWR)).unwrap();
         let (set, _) = h.fsetxattr(me, &rw, name.clone(), b"seen".to_vec(), 0);
         if !fd_xattr_ok("fsetxattr(user.proc)", &set) {
             return; // fd xattrs unsupported
@@ -3481,19 +3032,11 @@ fn fgetxattr_proc_reads_a_file_held_o_path_as_the_personality() {
         let (n, buf) = h.fgetxattr_proc(me, &f, name.clone(), vec![0u8; 16]);
         assert_eq!(&buf[..n.expect("read through /proc")], b"seen");
 
-        let nobody = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
-        let (n, buf) =
-            h.fgetxattr_proc(nobody, &f, name.clone(), vec![0u8; 16]);
+        let nobody = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
+        let (n, buf) = h.fgetxattr_proc(nobody, &f, name.clone(), vec![0u8; 16]);
         assert_eq!(&buf[..n.expect("nobody reads at 0644")], b"seen");
-        std::fs::set_permissions(
-            dir.join("f"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-        let (res, _) =
-            h.fgetxattr_proc(nobody, &f, name.clone(), vec![0u8; 16]);
+        std::fs::set_permissions(dir.join("f"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (res, _) = h.fgetxattr_proc(nobody, &f, name.clone(), vec![0u8; 16]);
         assert!(
             matches!(res, Err(Error::Errno(Errno::EACCES))),
             "nobody is refused at 0600, got {res:?}"
@@ -3513,11 +3056,9 @@ fn fgetxattr_proc_reads_a_file_held_o_path_as_the_personality() {
     });
 }
 
-/// The NFSv4-ACL dataset, or `None` to skip, which `TRUENAS_ROS_REQUIRE_ZFS`
-/// turns into a failure.
+/// The NFSv4-ACL dataset, or `None` to skip, which `TRUENAS_ROS_REQUIRE_ZFS` turns into a failure.
 fn nfs4_dataset_or_skip() -> Option<PathBuf> {
-    let dir = std::env::var_os("TRUENAS_ROS_NFS4_DATASET")
-        .map_or_else(|| PathBuf::from("/NFSV4ACL"), PathBuf::from);
+    let dir = std::env::var_os("TRUENAS_ROS_NFS4_DATASET").map_or_else(|| PathBuf::from("/NFSV4ACL"), PathBuf::from);
     if zfs_dir::is_zfs(&dir) == Some(true) {
         return Some(dir);
     }
@@ -3529,9 +3070,8 @@ fn nfs4_dataset_or_skip() -> Option<PathBuf> {
     None
 }
 
-/// An NFSv4 ACL as `system.nfs4_acl_xdr` holds it, with no flags of the
-/// whole ACL. Each entry is its type, flags, whether its who is special,
-/// mask and who, in that order (`acep_to_nfsace4i` in `zpl_xattr.c`).
+/// An NFSv4 ACL as `system.nfs4_acl_xdr` holds it, with no flags of the whole ACL. Each entry is its type, flags,
+/// whether its who is special, mask and who, in that order (`acep_to_nfsace4i` in `zpl_xattr.c`).
 fn nfs4_xdr(entries: &[[u32; 5]]) -> Vec<u8> {
     let mut xdr = Vec::new();
     xdr.extend(0u32.to_be_bytes());
@@ -3542,12 +3082,10 @@ fn nfs4_xdr(entries: &[[u32; 5]]) -> Vec<u8> {
     xdr
 }
 
-/// On an NFSv4 dataset `FsHandle::fgetxattr_proc` reads the ACL of a file
-/// and of a FIFO, both held `O_PATH`, as the personality, so ZFS checks
-/// READ_ACL for it (`__zpl_xattr_nfs41acl_get` in `zpl_xattr.c`). A user
-/// an entry grants READ_ACL reads what root reads, and nobody, whom no
-/// entry grants it, is refused. The FIFO is read with no open, so no
-/// writer is needed.
+/// On an NFSv4 dataset `FsHandle::fgetxattr_proc` reads the ACL of a file and of a FIFO, both held `O_PATH`, as the
+/// personality, so ZFS checks READ_ACL for it (`__zpl_xattr_nfs41acl_get` in `zpl_xattr.c`). A user an entry grants
+/// READ_ACL reads what root reads, and nobody, whom no entry grants it, is refused. The FIFO is read with no open, so
+/// no writer is needed.
 #[test]
 fn fgetxattr_proc_reads_an_nfs4_acl_as_the_personality() {
     if !root_or_skip("fgetxattr_proc_reads_an_nfs4_acl_as_the_personality") {
@@ -3557,15 +3095,13 @@ fn fgetxattr_proc_reads_an_nfs4_acl_as_the_personality() {
         return;
     };
     const READER: u32 = 8_675_309;
-    // OWNER@ is allowed everything, READER READ_ACL, READ_ATTRIBUTES and
-    // SYNCHRONIZE, and EVERYONE@ only the last two.
+    // OWNER@ is allowed everything, READER READ_ACL, READ_ATTRIBUTES and SYNCHRONIZE, and EVERYONE@ only the last two.
     let acl = nfs4_xdr(&[
         [0, 0, 1, 0x1f_01ff, 1],
         [0, 0, 0, 0x12_0080, READER],
         [0, 0, 1, 0x10_0080, 3],
     ]);
-    // An ACL takes 8 bytes of head and 20 for each of at most 1024 entries
-    // (`MAX_ACL_ENTRIES`).
+    // An ACL takes 8 bytes of head and 20 for each of at most 1024 entries (`MAX_ACL_ENTRIES`).
     const MOST: usize = 8 + 20 * 1024;
     with_broker(|h, creds, me, _dir| {
         let anchor = Anchor::open(ds.as_path()).unwrap();
@@ -3576,28 +3112,23 @@ fn fgetxattr_proc_reads_an_nfs4_acl_as_the_personality() {
         std::fs::write(ds.join(&file), b"acl").unwrap();
         mkfifo(&ds, &fifo);
         let reader = creds.register(&AsUser::new(READER, READER)).unwrap();
-        let nobody = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        let nobody = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
         let name = xattr_name("system.nfs4_acl_xdr");
         for leaf in [file.as_str(), fifo.as_str()] {
             let how = OpenHow::new().flags(OFlag::O_RDONLY);
             let open = h.open(me, &anchor, leaf, how).unwrap();
             let (set, _) = h.fsetxattr(me, &open, name.clone(), acl.clone(), 0);
             set.expect("root sets the ACL");
-            let (n, stored) =
-                h.fgetxattr(me, &open, name.clone(), vec![0; MOST]);
+            let (n, stored) = h.fgetxattr(me, &open, name.clone(), vec![0; MOST]);
             let stored = stored[..n.expect("root reads the ACL")].to_vec();
             h.close(open).unwrap();
 
             let how = OpenHow::new().flags(OFlag::O_PATH);
             let held = h.open(me, &anchor, leaf, how).unwrap();
-            let (n, got) =
-                h.fgetxattr_proc(reader, &held, name.clone(), vec![0; MOST]);
+            let (n, got) = h.fgetxattr_proc(reader, &held, name.clone(), vec![0; MOST]);
             let n = n.unwrap_or_else(|e| panic!("{leaf} for READER: {e}"));
             assert_eq!(got[..n], stored[..], "{leaf}");
-            let (res, _) =
-                h.fgetxattr_proc(nobody, &held, name.clone(), vec![0; MOST]);
+            let (res, _) = h.fgetxattr_proc(nobody, &held, name.clone(), vec![0; MOST]);
             assert!(
                 matches!(res, Err(Error::Errno(Errno::EACCES))),
                 "{leaf} refuses nobody READ_ACL, got {res:?}"
@@ -3611,26 +3142,21 @@ fn fgetxattr_proc_reads_an_nfs4_acl_as_the_personality() {
     });
 }
 
-/// On an NFSv4 dataset `FsHandle::fgetxattr_proc_as_root` reads the ACL of
-/// a file and of a FIFO held `O_PATH` under the ring owner's credentials,
-/// whose CAP_DAC_OVERRIDE has ZFS skip the check of READ_ACL
-/// (`__zpl_xattr_nfs41acl_get` in `zpl_xattr.c` passes `ATTR_NOACLCHECK`),
-/// so an ACL that grants nobody READ_ACL comes back whole where the same
-/// read as nobody is refused, and `fgetxattr_as_root` refuses the `O_PATH`
-/// descriptor itself. A server that answers an access check from the ACL
-/// on behalf of a caller relies on this.
+/// On an NFSv4 dataset `FsHandle::fgetxattr_proc_as_root` reads the ACL of a file and of a FIFO held `O_PATH` under the
+/// ring owner's credentials, whose CAP_DAC_OVERRIDE has ZFS skip the check of READ_ACL (`__zpl_xattr_nfs41acl_get` in
+/// `zpl_xattr.c` passes `ATTR_NOACLCHECK`), so an ACL that grants nobody READ_ACL comes back whole where the same read
+/// as nobody is refused, and `fgetxattr_as_root` refuses the `O_PATH` descriptor itself. A server that answers an
+/// access check from the ACL on behalf of a caller relies on this.
 #[test]
 fn fgetxattr_proc_as_root_reads_an_nfs4_acl_its_entries_hide() {
-    if !root_or_skip(
-        "fgetxattr_proc_as_root_reads_an_nfs4_acl_its_entries_hide",
-    ) {
+    if !root_or_skip("fgetxattr_proc_as_root_reads_an_nfs4_acl_its_entries_hide") {
         return; // the broker and the ACL need privilege
     }
     let Some(ds) = nfs4_dataset_or_skip() else {
         return;
     };
-    // OWNER@ is allowed everything and EVERYONE@ READ_ATTRIBUTES and
-    // SYNCHRONIZE alone, so no entry grants nobody READ_ACL.
+    // OWNER@ is allowed everything and EVERYONE@ READ_ATTRIBUTES and SYNCHRONIZE alone, so no entry grants nobody
+    // READ_ACL.
     let acl = nfs4_xdr(&[[0, 0, 1, 0x1f_01ff, 1], [0, 0, 1, 0x10_0080, 3]]);
     const MOST: usize = 8 + 20 * 1024;
     with_broker(|h, creds, me, _dir| {
@@ -3641,36 +3167,30 @@ fn fgetxattr_proc_as_root_reads_an_nfs4_acl_its_entries_hide() {
         let _ = std::fs::remove_file(ds.join(&fifo));
         std::fs::write(ds.join(&file), b"acl").unwrap();
         mkfifo(&ds, &fifo);
-        let nobody = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        let nobody = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
         let name = xattr_name("system.nfs4_acl_xdr");
         for leaf in [file.as_str(), fifo.as_str()] {
             let how = OpenHow::new().flags(OFlag::O_RDONLY);
             let open = h.open(me, &anchor, leaf, how).unwrap();
             let (set, _) = h.fsetxattr(me, &open, name.clone(), acl.clone(), 0);
             set.expect("root sets the ACL");
-            let (n, stored) =
-                h.fgetxattr(me, &open, name.clone(), vec![0; MOST]);
+            let (n, stored) = h.fgetxattr(me, &open, name.clone(), vec![0; MOST]);
             let stored = stored[..n.expect("root reads the ACL")].to_vec();
             h.close(open).unwrap();
 
             let how = OpenHow::new().flags(OFlag::O_PATH);
             let held = h.open(me, &anchor, leaf, how).unwrap();
-            let (res, _) =
-                h.fgetxattr_proc(nobody, &held, name.clone(), vec![0; MOST]);
+            let (res, _) = h.fgetxattr_proc(nobody, &held, name.clone(), vec![0; MOST]);
             assert!(
                 matches!(res, Err(Error::Errno(Errno::EACCES))),
                 "{leaf} refuses nobody READ_ACL, got {res:?}"
             );
-            let (res, _) =
-                h.fgetxattr_as_root(&held, name.clone(), vec![0; MOST]);
+            let (res, _) = h.fgetxattr_as_root(&held, name.clone(), vec![0; MOST]);
             assert!(
                 matches!(res, Err(Error::Errno(Errno::EBADF))),
                 "{leaf} held O_PATH refuses fgetxattr, got {res:?}"
             );
-            let (n, got) =
-                h.fgetxattr_proc_as_root(&held, name.clone(), vec![0; MOST]);
+            let (n, got) = h.fgetxattr_proc_as_root(&held, name.clone(), vec![0; MOST]);
             let n = n.unwrap_or_else(|e| panic!("{leaf} as root: {e}"));
             assert_eq!(got[..n], stored[..], "{leaf}");
             h.close(held).unwrap();
@@ -3710,10 +3230,7 @@ fn query_pool_lists_directory() {
                 names.insert(e.name.to_string_lossy().into_owned());
             }
         }
-        let want: BTreeSet<String> = ["x.txt", "y.txt", "z.txt"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let want: BTreeSet<String> = ["x.txt", "y.txt", "z.txt"].into_iter().map(String::from).collect();
         assert_eq!(names, want);
     });
 }
@@ -3722,9 +3239,7 @@ fn query_pool_lists_directory() {
 fn query_pool_runs_multiple_listings() {
     use std::collections::BTreeSet;
     use std::ffi::CString;
-    use truenas_ros::uring_fs::{
-        EnrichSpec, QueryHandle, QueryOptions, QueryPool,
-    };
+    use truenas_ros::uring_fs::{EnrichSpec, QueryHandle, QueryOptions, QueryPool};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let d1 = dir.join("d1");
@@ -3747,8 +3262,8 @@ fn query_pool_runs_multiple_listings() {
             same_device_only: false,
             ..Default::default()
         };
-        // Submit BOTH from this one thread before collecting either - the pool
-        // runs the walks (up to 2 concurrently), decoupled from the caller.
+        // Submit BOTH from this one thread before collecting either - the pool runs the walks (up to 2 concurrently),
+        // decoupled from the caller.
         let h1 = pool.query(me, a1, mk_opts());
         let h2 = pool.query(me, a2, mk_opts());
         let collect = |handle: &QueryHandle| {
@@ -3762,10 +3277,8 @@ fn query_pool_runs_multiple_listings() {
         };
         let n1 = collect(&h1);
         let n2 = collect(&h2);
-        let want1: BTreeSet<String> =
-            ["a", "b"].into_iter().map(String::from).collect();
-        let want2: BTreeSet<String> =
-            ["c"].into_iter().map(String::from).collect();
+        let want1: BTreeSet<String> = ["a", "b"].into_iter().map(String::from).collect();
+        let want2: BTreeSet<String> = ["c"].into_iter().map(String::from).collect();
         assert_eq!(n1, want1, "d1 listing");
         assert_eq!(n2, want2, "d2 listing");
     });
@@ -3783,20 +3296,13 @@ fn pool_copy_file_range_whole() {
         let src = h
             .open(me, &anchor, "src", OpenHow::new().flags(OFlag::O_RDONLY))
             .unwrap();
-        let dst = h
-            .open(me, &anchor, "dst", OpenHow::new().flags(OFlag::O_RDWR))
-            .unwrap();
+        let dst = h.open(me, &anchor, "dst", OpenHow::new().flags(OFlag::O_RDWR)).unwrap();
         let pool = QueryPool::new(h);
-        // Clones inline on a block-cloning fs, else offloads a byte copy --
-        // either way the bytes land.
-        let n = match pool
-            .copy_file_range(&src, &dst, 0, 0, content.len() as u64)
-            .wait()
-        {
+        // Clones inline on a block-cloning fs, else offloads a byte copy -- either way the bytes land.
+        let n = match pool.copy_file_range(&src, &dst, 0, 0, content.len() as u64).wait() {
             Ok(n) => n,
-            // Not a skip: every filesystem these tests run on serves
-            // copy_file_range, so an error here is the copy path broken, and
-            // swallowing it is how a green suite covers nothing.
+            // Not a skip: every filesystem these tests run on serves copy_file_range, so an error here is the copy path
+            // broken, and swallowing it is how a green suite covers nothing.
             Err(e) => panic!("copy_file_range: {e}"),
         };
         assert_eq!(n, content.len() as u64);
@@ -3817,12 +3323,10 @@ fn pool_copy_file_range_ranged_offload() {
         let src = h
             .open(me, &anchor, "src", OpenHow::new().flags(OFlag::O_RDONLY))
             .unwrap();
-        let dst = h
-            .open(me, &anchor, "dst", OpenHow::new().flags(OFlag::O_RDWR))
-            .unwrap();
+        let dst = h.open(me, &anchor, "dst", OpenHow::new().flags(OFlag::O_RDWR)).unwrap();
         let pool = QueryPool::new(h);
-        // A misaligned sub-block range forces the byte-copy offload path even on
-        // a block-cloning fs: copy src[100..200] -> dst[50..150].
+        // A misaligned sub-block range forces the byte-copy offload path even on a block-cloning fs: copy src[100..200]
+        // -> dst[50..150].
         let n = match pool.copy_file_range(&src, &dst, 100, 50, 100).wait() {
             Ok(n) => n,
             Err(e) => panic!("copy_file_range: {e}"),
@@ -3837,12 +3341,10 @@ fn pool_copy_file_range_ranged_offload() {
 
 /// The `EXDEV` byte-copy fallback, entered where it actually runs.
 ///
-/// `copy_file_range(2)` answers `EXDEV` when the endpoints are on different
-/// filesystems, and `copy_range_rw` is what carries the bytes then. Every
-/// other copy test puts both endpoints in one tempdir, where that answer
-/// never comes: with a `panic!` at the top of `copy_range_rw` the whole
-/// privileged lane stays green and the probe never fires. Here one endpoint
-/// is on the tempdir's filesystem and the other on a ZFS dataset.
+/// `copy_file_range(2)` answers `EXDEV` when the endpoints are on different filesystems, and `copy_range_rw` is what
+/// carries the bytes then. Every other copy test puts both endpoints in one tempdir, where that answer never comes:
+/// with a `panic!` at the top of `copy_range_rw` the whole privileged lane stays green and the probe never fires. Here
+/// one endpoint is on the tempdir's filesystem and the other on a ZFS dataset.
 #[test]
 fn pool_copy_file_range_across_filesystems_takes_the_byte_copy() {
     use truenas_ros::uring_fs::QueryPool;
@@ -3865,21 +3367,9 @@ fn pool_copy_file_range_across_filesystems_takes_the_byte_copy() {
                 let a_src = Anchor::open(dir.as_path()).unwrap();
                 let a_dst = Anchor::open(scratch.as_path()).unwrap();
                 let src = h
-                    .open(
-                        me,
-                        &a_src,
-                        "src",
-                        OpenHow::new().flags(OFlag::O_RDONLY),
-                    )
+                    .open(me, &a_src, "src", OpenHow::new().flags(OFlag::O_RDONLY))
                     .unwrap();
-                let dst = h
-                    .open(
-                        me,
-                        &a_dst,
-                        "dst",
-                        OpenHow::new().flags(OFlag::O_RDWR),
-                    )
-                    .unwrap();
+                let dst = h.open(me, &a_dst, "dst", OpenHow::new().flags(OFlag::O_RDWR)).unwrap();
                 let pool = QueryPool::new(h);
                 let n = pool
                     .copy_file_range(&src, &dst, 0, 0, content.len() as u64)
@@ -3902,11 +3392,9 @@ fn pool_copy_file_range_across_filesystems_takes_the_byte_copy() {
 
 /// The copy where the commit that added it actually runs: a ZFS dataset.
 ///
-/// `test/support/zfs_dir.rs` states the reason - "`copy_file_range` is the
-/// clearest case - tmpfs serves it as a plain copy while ZFS serves it as a
-/// block clone (`zfs_clone_range`), which is the code that actually ships".
-/// Both tests the commit added run in `crate::tempdir()`, so they exercise
-/// the plain copy and assert nothing about the clone.
+/// `test/support/zfs_dir.rs` states the reason - "`copy_file_range` is the clearest case - tmpfs serves it as a plain
+/// copy while ZFS serves it as a block clone (`zfs_clone_range`), which is the code that actually ships". Both tests
+/// the commit added run in `crate::tempdir()`, so they exercise the plain copy and assert nothing about the clone.
 #[test]
 fn pool_copy_file_range_on_a_dataset() {
     use truenas_ros::uring_fs::QueryPool;
@@ -3917,9 +3405,8 @@ fn pool_copy_file_range_on_a_dataset() {
     let scratch = ds.join(format!("ros-clone-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
 
-    // Several blocks, whole-range and block-aligned: the shape that can
-    // clone. A range split below MAX_CHUNK forfeits it, which no other test
-    // in the tree would notice.
+    // Several blocks, whole-range and block-aligned: the shape that can clone. A range split below MAX_CHUNK forfeits
+    // it, which no other test in the tree would notice.
     let content: Vec<u8> = (0..(1024u32 * 1024)).map(|i| i as u8).collect();
     let result = std::panic::catch_unwind({
         let scratch = scratch.clone();
@@ -3930,21 +3417,9 @@ fn pool_copy_file_range_on_a_dataset() {
                 std::fs::write(scratch.join("dst"), b"").unwrap();
                 let anchor = Anchor::open(scratch.as_path()).unwrap();
                 let src = h
-                    .open(
-                        me,
-                        &anchor,
-                        "src",
-                        OpenHow::new().flags(OFlag::O_RDONLY),
-                    )
+                    .open(me, &anchor, "src", OpenHow::new().flags(OFlag::O_RDONLY))
                     .unwrap();
-                let dst = h
-                    .open(
-                        me,
-                        &anchor,
-                        "dst",
-                        OpenHow::new().flags(OFlag::O_RDWR),
-                    )
-                    .unwrap();
+                let dst = h.open(me, &anchor, "dst", OpenHow::new().flags(OFlag::O_RDWR)).unwrap();
                 let pool = QueryPool::new(h);
                 let n = pool
                     .copy_file_range(&src, &dst, 0, 0, content.len() as u64)
@@ -3965,23 +3440,19 @@ fn pool_copy_file_range_on_a_dataset() {
     }
 }
 
-/// A uid/gid pair that exists nowhere - no files, no group memberships --
-/// so a personality for it has exactly the authority "other" grants.
+/// A uid/gid pair that exists nowhere - no files, no group memberships -- so a personality for it has exactly the
+/// authority "other" grants.
 const NOBODY_UID: u32 = 65_534;
 const NOBODY_GID: u32 = 65_534;
 
-/// The identity a test can actually register: root impersonates anyone, an
-/// unprivileged runner can only ask for what it already holds - *including*
-/// its supplementary groups. Naming uid/gid alone would request an empty
-/// group list, and dropping a group is itself a privileged change, so the
-/// broker's `setgroups` would fail with `EPERM`.
+/// The identity a test can actually register: root impersonates anyone, an unprivileged runner can only ask for what it
+/// already holds - *including* its supplementary groups. Naming uid/gid alone would request an empty group list, and
+/// dropping a group is itself a privileged change, so the broker's `setgroups` would fail with `EPERM`.
 fn registerable_user() -> AsUser {
     if is_root() {
-        // Carry two supplementary groups: the callers that exercise set
-        // normalization need something to shuffle, and an empty list would
-        // leave that check dead whenever the suite runs privileged.
-        return AsUser::new(NOBODY_UID, NOBODY_GID)
-            .groups(vec![NOBODY_GID, 65_533]);
+        // Carry two supplementary groups: the callers that exercise set normalization need something to shuffle, and an
+        // empty list would leave that check dead whenever the suite runs privileged.
+        return AsUser::new(NOBODY_UID, NOBODY_GID).groups(vec![NOBODY_GID, 65_533]);
     }
     // SAFETY: these cannot fail.
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
@@ -3998,10 +3469,8 @@ fn registerable_user() -> AsUser {
 
 #[test]
 fn broker_registers_own_identity_unprivileged() {
-    // Registering credentials identical to the broker's needs no privilege
-    // at all, so this leg runs everywhere and covers the IPC round trip:
-    // socketpair framing, the inherited ring fd, and a real op under the
-    // resulting id.
+    // Registering credentials identical to the broker's needs no privilege at all, so this leg runs everywhere and
+    // covers the IPC round trip: socketpair framing, the inherited ring fd, and a real op under the resulting id.
     with_broker(|h, creds, _me, dir| {
         if is_root() {
             // Root's own identity is refused by policy; covered below.
@@ -4023,27 +3492,21 @@ fn broker_registers_own_identity_unprivileged() {
 #[test]
 fn broker_refuses_uid_zero() {
     with_broker(|_h, creds, _me, _dir| {
-        // With no root limit fixed at spawn, uid 0 is refused outright. A
-        // root personality carrying the daemon's capabilities is the exact
-        // thing the broker exists to prevent.
-        assert!(matches!(
-            creds.register(&AsUser::new(0, 0)),
-            Err(Error::Validation(_))
-        ));
+        // With no root limit fixed at spawn, uid 0 is refused outright. A root personality carrying the daemon's
+        // capabilities is the exact thing the broker exists to prevent.
+        assert!(matches!(creds.register(&AsUser::new(0, 0)), Err(Error::Validation(_))));
     });
 }
 
 #[test]
 fn group_list_beyond_the_cap_is_rejected_not_truncated() {
     with_broker(|_h, creds, _me, _dir| {
-        // Distinct ids: repeating one gid would collapse under the set
-        // normalization and no longer exceed the cap.
+        // Distinct ids: repeating one gid would collapse under the set normalization and no longer exceed the cap.
         let over: Vec<u32> = (0..=truenas_ros::uring_fs::MAX_GROUPS)
             .map(|i| 400_000 + i as u32)
             .collect();
         let who = AsUser::new(NOBODY_UID, NOBODY_GID).groups(over);
-        // Truncating would silently change what the identity may do, so an
-        // over-long list must fail loudly instead.
+        // Truncating would silently change what the identity may do, so an over-long list must fail loudly instead.
         assert!(matches!(creds.register(&who), Err(Error::Validation(_))));
     });
 }
@@ -4056,17 +3519,9 @@ fn impersonated_open_obeys_dac() {
     with_broker(|h, creds, me, dir| {
         // A root-owned 0600 file, and a world-readable one beside it.
         std::fs::write(dir.join("secret"), b"root only").unwrap();
-        std::fs::set_permissions(
-            dir.join("secret"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(dir.join("public"), b"everyone").unwrap();
-        std::fs::set_permissions(
-            dir.join("public"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("public"), std::fs::Permissions::from_mode(0o644)).unwrap();
         let anchor = Anchor::open(dir).unwrap();
 
         let user = creds
@@ -4077,9 +3532,8 @@ fn impersonated_open_obeys_dac() {
         let f = h.open(me, &anchor, "secret", rdonly()).expect("root open");
         h.close(f).unwrap();
 
-        // ...the impersonated user cannot. This is the whole design in one
-        // assertion: the kernel refused, under credentials the daemon
-        // itself does not have.
+        // ...the impersonated user cannot. This is the whole design in one assertion: the kernel refused, under
+        // credentials the daemon itself does not have.
         assert!(
             matches!(
                 h.open(user, &anchor, "secret", rdonly()),
@@ -4107,43 +3561,24 @@ fn impersonated_personality_holds_no_dac_override() {
         // A directory the user cannot even traverse.
         std::fs::create_dir(dir.join("vault")).unwrap();
         std::fs::write(dir.join("vault/inner"), b"x").unwrap();
-        std::fs::set_permissions(
-            dir.join("vault"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("vault"), std::fs::Permissions::from_mode(0o700)).unwrap();
         let anchor = Anchor::open(dir).unwrap();
-        let user = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        let user = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
 
-        // CAP_DAC_OVERRIDE would sail through both of these. The snapshot
-        // must not carry it: dropping euid to a non-root uid clears the
-        // effective capability set, which is the property being pinned.
+        // CAP_DAC_OVERRIDE would sail through both of these. The snapshot must not carry it: dropping euid to a
+        // non-root uid clears the effective capability set, which is the property being pinned.
         assert!(matches!(
             h.open(user, &anchor, "vault/inner", rdonly()),
             Err(Error::Errno(Errno::EACCES))
         ));
         assert!(matches!(
-            h.statx(
-                user,
-                &anchor,
-                leaf("vault"),
-                AtFlags::empty(),
-                StatxMask::BASIC_STATS
-            )
-            .map(|st| st.is_dir()),
+            h.statx(user, &anchor, leaf("vault"), AtFlags::empty(), StatxMask::BASIC_STATS)
+                .map(|st| st.is_dir()),
             Ok(true)
         ));
         let sub = Anchor::open(dir.join("vault").as_path()).unwrap();
         assert!(matches!(
-            h.statx(
-                user,
-                &sub,
-                leaf("inner"),
-                AtFlags::empty(),
-                StatxMask::BASIC_STATS
-            ),
+            h.statx(user, &sub, leaf("inner"), AtFlags::empty(), StatxMask::BASIC_STATS),
             Err(Error::Errno(Errno::EACCES))
         ));
         creds.unregister(user).unwrap();
@@ -4157,15 +3592,12 @@ fn impersonated_create_is_owned_by_the_user() {
     }
     with_broker(|h, creds, _me, dir| {
         let anchor = Anchor::open(dir).unwrap();
-        let user = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        let user = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
 
-        // O_CREAT under the personality: the file belongs to the user, not
-        // to the (root) daemon that actually issued the syscall.
+        // O_CREAT under the personality: the file belongs to the user, not to the (root) daemon that actually issued
+        // the syscall.
         let f = h.open(user, &anchor, "theirs", creat_rw()).expect("create");
-        let (n, _b) =
-            h.pwritev2(user, &f, vec![b"mine".to_vec()], 0, RwFlags::empty());
+        let (n, _b) = h.pwritev2(user, &f, vec![b"mine".to_vec()], 0, RwFlags::empty());
         assert_eq!(n.unwrap(), 4);
         h.close(f).unwrap();
         let md = std::fs::metadata(dir.join("theirs")).unwrap();
@@ -4173,17 +3605,9 @@ fn impersonated_create_is_owned_by_the_user() {
         assert_eq!(md.gid(), NOBODY_GID);
 
         // Directory entries too: mkdir and unlink run as the user.
-        h.mkdirat(
-            user,
-            &anchor,
-            leaf("theirdir"),
-            Mode::from_bits_truncate(0o755),
-        )
-        .expect("mkdirat");
-        assert_eq!(
-            std::fs::metadata(dir.join("theirdir")).unwrap().uid(),
-            NOBODY_UID
-        );
+        h.mkdirat(user, &anchor, leaf("theirdir"), Mode::from_bits_truncate(0o755))
+            .expect("mkdirat");
+        assert_eq!(std::fs::metadata(dir.join("theirdir")).unwrap().uid(), NOBODY_UID);
         h.unlinkat(user, &anchor, leaf("theirs")).expect("unlinkat");
         assert!(!dir.join("theirs").exists());
         creds.unregister(user).unwrap();
@@ -4198,9 +3622,7 @@ fn impersonated_trusted_xattr_is_denied() {
     with_broker(|h, creds, me, dir| {
         let anchor = Anchor::open(dir).unwrap();
         let f = h.open(me, &anchor, "attr", creat_rw()).unwrap();
-        let user = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        let user = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
 
         let trusted = xattr_name("trusted.probe");
         let (res, _v) = h.fsetxattr(me, &f, trusted.clone(), b"v".to_vec(), 0);
@@ -4211,23 +3633,20 @@ fn impersonated_trusted_xattr_is_denied() {
         }
         res.expect("root may write trusted.*");
 
-        // trusted.* needs CAP_SYS_ADMIN, which the personality lacks. Note
-        // the kernel's masquerade: an unprivileged *read* reports ENODATA
-        // ("no such attribute"), not EPERM - it hides the attribute's
-        // existence rather than its contents.
+        // trusted.* needs CAP_SYS_ADMIN, which the personality lacks. Note the kernel's masquerade: an unprivileged
+        // *read* reports ENODATA ("no such attribute"), not EPERM - it hides the attribute's existence rather than its
+        // contents.
         let (res, _v) = h.fgetxattr(user, &f, trusted.clone(), vec![0u8; 16]);
         assert!(
             matches!(res, Err(Error::Errno(Errno::ENODATA))),
             "unprivileged trusted.* read must report ENODATA, got {res:?}"
         );
-        let (res, _v) =
-            h.fsetxattr(user, &f, trusted.clone(), b"z".to_vec(), 0);
+        let (res, _v) = h.fsetxattr(user, &f, trusted.clone(), b"z".to_vec(), 0);
         assert!(matches!(res, Err(Error::Errno(Errno::EPERM))));
 
         // user.* on a file the personality does not own is also refused.
         let user_attr = xattr_name("user.mine");
-        let (res, _v) =
-            h.fsetxattr(user, &f, user_attr.clone(), b"z".to_vec(), 0);
+        let (res, _v) = h.fsetxattr(user, &f, user_attr.clone(), b"z".to_vec(), 0);
         assert!(matches!(res, Err(Error::Errno(Errno::EACCES))));
 
         creds.unregister(user).unwrap();
@@ -4243,13 +3662,10 @@ fn broker_reverts_credentials_between_registrations() {
     with_broker(|h, creds, _me, dir| {
         let anchor = Anchor::open(dir).unwrap();
 
-        // Register a low-privilege identity, then another with a different
-        // uid. If the broker failed to revert, the second snapshot would
-        // inherit the first's (unprivileged) credentials and could not
-        // impersonate a different user at all.
-        let a = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        // Register a low-privilege identity, then another with a different uid. If the broker failed to revert, the
+        // second snapshot would inherit the first's (unprivileged) credentials and could not impersonate a different
+        // user at all.
+        let a = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
         let b = creds
             .register(&AsUser::new(NOBODY_UID - 1, NOBODY_GID - 1))
             .expect("second registration needs privilege back");
@@ -4259,10 +3675,7 @@ fn broker_reverts_credentials_between_registrations() {
         let f = h.open(b, &anchor, "b", creat_rw()).unwrap();
         h.close(f).unwrap();
         assert_eq!(std::fs::metadata(dir.join("a")).unwrap().uid(), NOBODY_UID);
-        assert_eq!(
-            std::fs::metadata(dir.join("b")).unwrap().uid(),
-            NOBODY_UID - 1
-        );
+        assert_eq!(std::fs::metadata(dir.join("b")).unwrap().uid(), NOBODY_UID - 1);
         creds.unregister(a).unwrap();
         creds.unregister(b).unwrap();
     });
@@ -4273,22 +3686,16 @@ fn unregistered_personality_stops_working() {
     with_broker(|h, creds, _me, dir| {
         let who = registerable_user();
         std::fs::write(dir.join("f"), b"x").unwrap();
-        std::fs::set_permissions(
-            dir.join("f"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("f"), std::fs::Permissions::from_mode(0o644)).unwrap();
         let anchor = Anchor::open(dir).unwrap();
 
         let id = creds.register(&who).expect("register");
-        let f = h
-            .open(id, &anchor, "f", rdonly())
-            .expect("works while live");
+        let f = h.open(id, &anchor, "f", rdonly()).expect("works while live");
         h.close(f).unwrap();
 
         creds.unregister(id).expect("unregister");
-        // The id is gone: the kernel refuses the SQE outright rather than
-        // falling back to the submitter's (root) credentials.
+        // The id is gone: the kernel refuses the SQE outright rather than falling back to the submitter's (root)
+        // credentials.
         assert!(matches!(
             h.open(id, &anchor, "f", rdonly()),
             Err(Error::Errno(Errno::EINVAL))
@@ -4305,9 +3712,7 @@ fn identity_cache_registers_once_per_identity() {
         let who = registerable_user();
 
         // Many "connections" for one identity -> one registration.
-        let leases: Vec<_> = (0..8)
-            .map(|_| cache.acquire(&who).expect("acquire"))
-            .collect();
+        let leases: Vec<_> = (0..8).map(|_| cache.acquire(&who).expect("acquire")).collect();
         assert_eq!(cache.len(), 1, "one cached identity");
         let id = leases[0].personality();
         assert!(
@@ -4315,8 +3720,8 @@ fn identity_cache_registers_once_per_identity() {
             "every lease shares the personality"
         );
 
-        // Group order and duplicates are not semantically meaningful, so an
-        // equivalent list must hit the same entry rather than mint another.
+        // Group order and duplicates are not semantically meaningful, so an equivalent list must hit the same entry
+        // rather than mint another.
         if !who.group_list().is_empty() {
             let mut shuffled = who.group_list().to_vec();
             shuffled.reverse();
@@ -4332,17 +3737,15 @@ fn identity_cache_registers_once_per_identity() {
         let f = h.open(id, &anchor, "c", creat_rw()).expect("open");
         h.close(f).unwrap();
 
-        // Every lease is gone, but the cache map holds the last reference --
-        // so the id survives and the next acquire reuses it rather than
-        // paying for a fresh registration.
+        // Every lease is gone, but the cache map holds the last reference -- so the id survives and the next acquire
+        // reuses it rather than paying for a fresh registration.
         drop(leases);
         let held = cache.acquire(&who).expect("re-acquire");
         assert_eq!(held.personality(), id, "still the same registration");
         let f = h.open(id, &anchor, "d", creat_rw()).expect("still live");
         h.close(f).unwrap();
 
-        // The last lease *and* the cache entry must both go before the
-        // kernel id is retired.
+        // The last lease *and* the cache entry must both go before the kernel id is retired.
         cache.invalidate(&who);
         drop(held);
         assert!(matches!(
@@ -4362,14 +3765,11 @@ fn identity_cache_invalidation_reregisters_without_disturbing_leases() {
         let old = cache.acquire(&who).expect("acquire");
         let old_id = old.personality();
 
-        // A directory-services change: forget the snapshot. Work already
-        // under way must not be disturbed - this is the property that lets
-        // re-registration happen while requests are in flight.
+        // A directory-services change: forget the snapshot. Work already under way must not be disturbed - this is the
+        // property that lets re-registration happen while requests are in flight.
         cache.invalidate(&who);
         assert_eq!(cache.len(), 0);
-        let f = h
-            .open(old_id, &anchor, "old", creat_rw())
-            .expect("old lives");
+        let f = h.open(old_id, &anchor, "old", creat_rw()).expect("old lives");
         h.close(f).unwrap();
 
         // The next acquire mints a *fresh* personality.
@@ -4398,8 +3798,7 @@ fn identity_cache_is_concurrency_safe() {
     with_broker(|_h, creds, _me, _dir| {
         let cache = IdentityCache::new(creds.clone());
         let who = registerable_user();
-        // A connection burst for one identity collapses to one registration
-        // rather than stampeding the broker.
+        // A connection burst for one identity collapses to one registration rather than stampeding the broker.
         let ids: Vec<Personality> = thread::scope(|s| {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
@@ -4423,52 +3822,38 @@ fn identity_cache_is_concurrency_safe() {
 
 #[test]
 fn large_ad_group_list_round_trips() {
-    // winbindd imposes no small ceiling (Samba grows its buffer and
-    // retries), and an AD Kerberos PAC carries on the order of 1000 group
-    // SIDs, so the wire format and the impersonation window must handle a
-    // list of that size - not just the handful a POSIX user has.
+    // winbindd imposes no small ceiling (Samba grows its buffer and retries), and an AD Kerberos PAC carries on the
+    // order of 1000 group SIDs, so the wire format and the impersonation window must handle a list of that size - not
+    // just the handful a POSIX user has.
     if !root_or_skip("large_ad_group_list_round_trips") {
         return; // setgroups with a foreign list needs CAP_SETGID
     }
     with_broker(|h, creds, _me, dir| {
         for n in [256usize, 1024, truenas_ros::uring_fs::MAX_GROUPS] {
             let groups: Vec<u32> = (0..n as u32).map(|i| 200_000 + i).collect();
-            // One of them is the group that will own the file, proving the
-            // supplementary list actually reached the kernel intact rather
-            // than being truncated somewhere in the middle.
+            // One of them is the group that will own the file, proving the supplementary list actually reached the
+            // kernel intact rather than being truncated somewhere in the middle.
             let marker = 200_000 + (n as u32 - 1);
-            let who =
-                AsUser::new(NOBODY_UID, NOBODY_GID).groups(groups.clone());
+            let who = AsUser::new(NOBODY_UID, NOBODY_GID).groups(groups.clone());
             assert_eq!(who.group_list().len(), n, "list preserved");
 
             let id = creds
                 .register(&who)
                 .unwrap_or_else(|e| panic!("register with {n} groups: {e}"));
 
-            // A directory only that last group may enter: reaching the file
-            // proves the tail of the list survived.
+            // A directory only that last group may enter: reaching the file proves the tail of the list survived.
             let dirname = format!("g{n}");
             std::fs::create_dir(dir.join(&dirname)).unwrap();
             std::fs::write(dir.join(&dirname).join("f"), b"deep").unwrap();
-            // SAFETY: valid path; chown to root:marker, mode 0710 - only a
-            // member of `marker` can traverse it.
-            let cpath = CString::new(dir.join(&dirname).as_os_str().as_bytes())
-                .unwrap();
-            assert_eq!(
-                unsafe { libc::chown(cpath.as_ptr(), 0, marker) },
-                0,
-                "chown"
-            );
-            std::fs::set_permissions(
-                dir.join(&dirname),
-                std::fs::Permissions::from_mode(0o710),
-            )
-            .unwrap();
+            // SAFETY: valid path; chown to root:marker, mode 0710 - only a member of `marker` can traverse it.
+            let cpath = CString::new(dir.join(&dirname).as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(cpath.as_ptr(), 0, marker) }, 0, "chown");
+            std::fs::set_permissions(dir.join(&dirname), std::fs::Permissions::from_mode(0o710)).unwrap();
 
             let sub = Anchor::open(dir.join(&dirname).as_path()).unwrap();
-            let f = h.open(id, &sub, "f", rdonly()).unwrap_or_else(|e| {
-                panic!("group {marker} (entry {} of {n}) lost: {e}", n - 1)
-            });
+            let f = h
+                .open(id, &sub, "f", rdonly())
+                .unwrap_or_else(|e| panic!("group {marker} (entry {} of {n}) lost: {e}", n - 1));
             let (got, buf) = pread1(h, id, &f, vec![0u8; 8], 0);
             assert_eq!(&buf[..got.unwrap()], b"deep");
             h.close(f).unwrap();
@@ -4481,10 +3866,9 @@ fn large_ad_group_list_round_trips() {
 
 #[test]
 fn personality_zero_is_not_constructible() {
-    // `sqe.personality == 0` means "no credential override" - an op stamped
-    // with it runs as the reactor thread (the root daemon), bypassing the
-    // whole per-op identity model. The public constructor must refuse 0 so
-    // that path is unreachable, as the module docs claim.
+    // `sqe.personality == 0` means "no credential override" - an op stamped with it runs as the reactor thread (the
+    // root daemon), bypassing the whole per-op identity model. The public constructor must refuse 0 so that path is
+    // unreachable, as the module docs claim.
     assert!(Personality::from_raw(0).is_none());
     assert_eq!(Personality::from_raw(1).map(|p| p.id()), Some(1));
     assert_eq!(Personality::from_raw(4242).map(|p| p.id()), Some(4242));
@@ -4492,10 +3876,9 @@ fn personality_zero_is_not_constructible() {
 
 #[test]
 fn sentinel_uid_gid_are_refused_by_the_api() {
-    // `(uid_t)-1`/`(gid_t)-1` are the kernel's "leave unchanged" sentinel for
-    // setres*id: a broker that passed them straight through would no-op the
-    // privilege drop and snapshot its own root creds. The API must reject
-    // them before they reach the impersonation window.
+    // `(uid_t)-1`/`(gid_t)-1` are the kernel's "leave unchanged" sentinel for setres*id: a broker that passed them
+    // straight through would no-op the privilege drop and snapshot its own root creds. The API must reject them before
+    // they reach the impersonation window.
     with_broker(|_h, creds, _me, _dir| {
         assert!(matches!(
             creds.register(&AsUser::new(u32::MAX, 1000)),
@@ -4511,12 +3894,7 @@ fn sentinel_uid_gid_are_refused_by_the_api() {
 // ---- ordered / filtered / resumable listing --------------------------------
 
 /// Every name a query yields, in the order it yields them.
-fn list_names(
-    h: &FsHandle,
-    me: Personality,
-    anchor: &Anchor,
-    opts: QueryOptions,
-) -> Vec<String> {
+fn list_names(h: &FsHandle, me: Personality, anchor: &Anchor, opts: QueryOptions) -> Vec<String> {
     let mut q = query_directory(h, me, anchor, opts).expect("list");
     let mut out = Vec::new();
     while let Some(batch) = q.next() {
@@ -4527,11 +3905,9 @@ fn list_names(
     out
 }
 
-/// A directory sorts where its trailing separator puts it, not where its bare
-/// name does. `/` is `0x2F`, above `-` (`0x2D`) and `.` (`0x2E`), so `a`
-/// belongs *between* `a.txt` and `aa.txt`. A walk that recursed in bare-name
-/// order would emit everything under `a/` before `a-1.txt`, disagreeing with
-/// the order the full paths actually compare in.
+/// A directory sorts where its trailing separator puts it, not where its bare name does. `/` is `0x2F`, above `-`
+/// (`0x2D`) and `.` (`0x2E`), so `a` belongs *between* `a.txt` and `aa.txt`. A walk that recursed in bare-name order
+/// would emit everything under `a/` before `a-1.txt`, disagreeing with the order the full paths actually compare in.
 #[test]
 fn path_order_places_a_directory_after_its_dotted_siblings() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -4540,8 +3916,8 @@ fn path_order_places_a_directory_after_its_dotted_siblings() {
             std::fs::write(dir.join(f), b"x").expect("write");
         }
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
-        // `clump` below the entry count, so the sorted buffer is drained
-        // across several batches rather than served in one.
+        // `clump` below the entry count, so the sorted buffer is drained across several batches rather than served in
+        // one.
         let opts = |order| QueryOptions {
             clump: 2,
             order,
@@ -4552,8 +3928,7 @@ fn path_order_places_a_directory_after_its_dotted_siblings() {
             list_names(&h, me, &anchor, opts(Order::ByPathBytes)),
             ["a-1.txt", "a.txt", "a", "aa.txt"],
         );
-        // The ordering a walk must not use, asserted so the difference stays
-        // visible if either mode is ever touched.
+        // The ordering a walk must not use, asserted so the difference stays visible if either mode is ever touched.
         assert_eq!(
             list_names(&h, me, &anchor, opts(Order::ByName)),
             ["a", "a-1.txt", "a.txt", "aa.txt"],
@@ -4565,9 +3940,8 @@ fn path_order_places_a_directory_after_its_dotted_siblings() {
     });
 }
 
-/// `name_prefix` drops entries during the `readdir` pass, and a batch is still
-/// filled to `clump` *kept* entries - so a short batch keeps meaning
-/// end-of-directory rather than "the filter ate this one".
+/// `name_prefix` drops entries during the `readdir` pass, and a batch is still filled to `clump` *kept* entries - so a
+/// short batch keeps meaning end-of-directory rather than "the filter ate this one".
 #[test]
 fn name_prefix_filters_without_shortening_batches() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -4589,9 +3963,7 @@ fn name_prefix_filters_without_shortening_batches() {
         while let Some(batch) = q.next() {
             let batch = batch.expect("batch");
             sizes.push(batch.len());
-            names.extend(
-                batch.iter().map(|e| e.name.to_string_lossy().into_owned()),
-            );
+            names.extend(batch.iter().map(|e| e.name.to_string_lossy().into_owned()));
         }
 
         assert_eq!(
@@ -4599,16 +3971,15 @@ fn name_prefix_filters_without_shortening_batches() {
             ["keep-0", "keep-1", "keep-2", "keep-3", "keep-4"],
             "only the prefixed names, in order"
         );
-        // 5 kept entries at clump 2: full, full, remainder. The interleaved
-        // `drop-*` names must not have shortened either full batch.
+        // 5 kept entries at clump 2: full, full, remainder. The interleaved `drop-*` names must not have shortened
+        // either full batch.
         assert_eq!(sizes, [2, 2, 1], "batches fill to clump on kept entries");
     });
 }
 
-/// `start_after` resumes an ordered listing exactly at the cut, with no key
-/// repeated and none skipped. The cursor is a **literal key**, so resuming
-/// past the directory `a` means passing `a/` - where `a/` sorts - rather than
-/// `a`, where a file of that name would sort.
+/// `start_after` resumes an ordered listing exactly at the cut, with no key repeated and none skipped. The cursor is a
+/// **literal key**, so resuming past the directory `a` means passing `a/` - where `a/` sorts - rather than `a`, where a
+/// file of that name would sort.
 #[test]
 fn start_after_resumes_a_path_ordered_listing_without_gaps() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -4634,8 +4005,8 @@ fn start_after_resumes_a_path_ordered_listing_without_gaps() {
         let all = page(None);
         assert_eq!(all, ["a-1.txt", "a.txt", "a", "aa.txt"]);
 
-        // Cutting after each key in turn yields exactly the remainder. The
-        // directory's key carries its separator; the files' do not.
+        // Cutting after each key in turn yields exactly the remainder. The directory's key carries its separator; the
+        // files' do not.
         let keys = ["a-1.txt", "a.txt", "a/", "aa.txt"];
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(
@@ -4645,29 +4016,25 @@ fn start_after_resumes_a_path_ordered_listing_without_gaps() {
             );
         }
 
-        // The bare name `a` is *not* the directory's key: it sorts where a
-        // file `a` would, before `a-1.txt`, so nothing is consumed.
+        // The bare name `a` is *not* the directory's key: it sorts where a file `a` would, before `a-1.txt`, so nothing
+        // is consumed.
         assert_eq!(page(Some(b"a".to_vec())), all);
     });
 }
 
-/// The change cookie is the exact validator for anything cached per file, so
-/// two properties have to hold: it moves when the file is modified, and it
-/// does **not** move when the file is merely read. A cookie that advanced on
-/// reads would invalidate every cache entry on every access.
+/// The change cookie is the exact validator for anything cached per file, so two properties have to hold: it moves when
+/// the file is modified, and it does **not** move when the file is merely read. A cookie that advanced on reads would
+/// invalidate every cache entry on every access.
 ///
-/// Skips where the kernel does not hand the cookie to userspace, which is a
-/// property of the *kernel*, not the filesystem: upstream strips the bit in
-/// `cp_statx` and clears it from the request mask ("kernel-only for now",
-/// fs/stat.c), while the TrueNAS fork exposes it under `CONFIG_TRUENAS`.
-/// Runs on a **ZFS dataset**, not the default `tempdir`. tmpfs carries
-/// `i_version` too (`SB_I_VERSION`, mm/shmem.c:5375), so a tempdir fixture
-/// would pass - but it would be pinning tmpfs's cookie, and the product only
-/// ships on ZFS. What has to hold is that *ZFS* moves the cookie on a write
-/// and holds it across a read.
+/// Skips where the kernel does not hand the cookie to userspace, which is a property of the *kernel*, not the
+/// filesystem: upstream strips the bit in `cp_statx` and clears it from the request mask ("kernel-only for now",
+/// fs/stat.c), while the TrueNAS fork exposes it under `CONFIG_TRUENAS`. Runs on a **ZFS dataset**, not the default
+/// `tempdir`. tmpfs carries `i_version` too (`SB_I_VERSION`, mm/shmem.c:5375), so a tempdir fixture would pass - but it
+/// would be pinning tmpfs's cookie, and the product only ships on ZFS. What has to hold is that *ZFS* moves the cookie
+/// on a write and holds it across a read.
 ///
-/// Two gates, both armed in the QEMU job: `TRUENAS_ROS_REQUIRE_ZFS` for the
-/// dataset, and `TRUENAS_ROS_REQUIRE_CHANGE_COOKIE` for the kernel.
+/// Two gates, both armed in the QEMU job: `TRUENAS_ROS_REQUIRE_ZFS` for the dataset, and
+/// `TRUENAS_ROS_REQUIRE_CHANGE_COOKIE` for the kernel.
 #[test]
 fn change_cookie_moves_on_writes_and_not_on_reads() {
     let Some(ds) = zfs_dir_or_skip() else {
@@ -4680,11 +4047,7 @@ fn change_cookie_moves_on_writes_and_not_on_reads() {
             .mode(Mode::from_bits_truncate(0o600));
         let f = h.open(me, &anchor, "cookie.bin", how).expect("open");
         let mask = StatxMask::BASIC_STATS | StatxMask::CHANGE_COOKIE;
-        let cookie = |f: &_| {
-            h.fstatx(me, f, AtFlags::empty(), mask)
-                .expect("fstatx")
-                .change_cookie()
-        };
+        let cookie = |f: &_| h.fstatx(me, f, AtFlags::empty(), mask).expect("fstatx").change_cookie();
 
         let Some(first) = cookie(&f) else {
             assert!(
@@ -4715,12 +4078,11 @@ fn change_cookie_moves_on_writes_and_not_on_reads() {
     });
 }
 
-/// The ring's statx gives the ZFS flags the ioctl gives, since
-/// `IORING_OP_STATX` ends in the same `cp_statx` as the blocking call.
+/// The ring's statx gives the ZFS flags the ioctl gives, since `IORING_OP_STATX` ends in the same `cp_statx` as the
+/// blocking call.
 ///
-/// Runs on a **ZFS dataset**, and as root, since it sets a flag. Two gates are
-/// armed in the QEMU job, `TRUENAS_ROS_REQUIRE_ZFS` for the dataset and
-/// `TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS` for the field.
+/// Runs on a **ZFS dataset**, and as root, since it sets a flag. Two gates are armed in the QEMU job,
+/// `TRUENAS_ROS_REQUIRE_ZFS` for the dataset and `TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS` for the field.
 #[test]
 fn the_rings_statx_gives_the_zfs_flags() {
     use std::os::fd::{AsFd, OwnedFd};
@@ -4732,13 +4094,8 @@ fn the_rings_statx_gives_the_zfs_flags() {
     with_fs(test_cfg(), |h, me, _dir, _stop| {
         let path = ds.join(format!("rostest_zfsflags_{}", std::process::id()));
         std::fs::write(&path, b"").unwrap();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        // The setter takes the whole mask, so the bits ZFS set at create
-        // stay.
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        // The setter takes the whole mask, so the bits ZFS set at create stay.
         let attrs = fget_zfs_attrs(file.as_fd()).unwrap() | ZfsAttr::HIDDEN;
         fset_zfs_attrs(file.as_fd(), attrs).unwrap();
         let f = File::from_fd(OwnedFd::from(file));
@@ -4748,8 +4105,7 @@ fn the_rings_statx_gives_the_zfs_flags() {
         let st = st.expect("fstatx");
         let Some(seen) = st.zfs_attrs() else {
             assert!(
-                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS")
-                    .is_none(),
+                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS").is_none(),
                 "TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS is set but the dataset at \
                  {} reports none through the ring",
                 ds.display()
@@ -4760,19 +4116,16 @@ fn the_rings_statx_gives_the_zfs_flags() {
     });
 }
 
-/// The ring's statx says whether a file has a POSIX access ACL and a folder
-/// a default one, as the blocking call does, since `IORING_OP_STATX` ends in
-/// the same `vfs_getattr_nosec` (`statx_posix_acls` in fs/stat.c).
+/// The ring's statx says whether a file has a POSIX access ACL and a folder a default one, as the blocking call does,
+/// since `IORING_OP_STATX` ends in the same `vfs_getattr_nosec` (`statx_posix_acls` in fs/stat.c).
 ///
-/// Runs in the tempdir, whose POSIX ACLs `TRUENAS_ROS_REQUIRE_POSIX_ACL`
-/// demands, and `TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS` turns a kernel that
-/// does not answer into a failure. Both are armed in the QEMU job.
+/// Runs in the tempdir, whose POSIX ACLs `TRUENAS_ROS_REQUIRE_POSIX_ACL` demands, and
+/// `TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS` turns a kernel that does not answer into a failure. Both are armed in the
+/// QEMU job.
 #[cfg(feature = "acl")]
 #[test]
 fn the_rings_statx_says_whether_a_file_has_a_posix_acl() {
-    use truenas_ros::sync_fs::acl::{
-        Acl, PosixAce, PosixAcl, PosixPerm, PosixTag, fsetacl,
-    };
+    use truenas_ros::sync_fs::acl::{Acl, PosixAce, PosixAcl, PosixPerm, PosixTag, fsetacl};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("plain"), b"").unwrap();
@@ -4799,13 +4152,8 @@ fn the_rings_statx_says_whether_a_file_has_a_posix_acl() {
             fsetacl(&f, Some(&acl))
         };
         let both = [aces(false), aces(true)].concat();
-        if let Err(e) =
-            set("named", aces(false).to_vec()).and_then(|()| set("both", both))
-        {
-            return xattr_probe::posix_acl_refusal_is_allowed(
-                "a POSIX ACL on the tempdir",
-                e,
-            );
+        if let Err(e) = set("named", aces(false).to_vec()).and_then(|()| set("both", both)) {
+            return xattr_probe::posix_acl_refusal_is_allowed("a POSIX ACL on the tempdir", e);
         }
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let acls = |name: &str| {
@@ -4816,8 +4164,7 @@ fn the_rings_statx_says_whether_a_file_has_a_posix_acl() {
         };
         if acls("plain").0.is_none() {
             assert!(
-                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS")
-                    .is_none(),
+                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS").is_none(),
                 "TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS is set but the kernel \
                  does not answer STATX_ACL through the ring at {}",
                 dir.display()
@@ -4830,15 +4177,12 @@ fn the_rings_statx_says_whether_a_file_has_a_posix_acl() {
     });
 }
 
-/// A file opened by handle outside the ring and wrapped answers the ring's
-/// statx with the object number and generation its handle carries, and a
-/// ring read gives back its bytes.
+/// A file opened by handle outside the ring and wrapped answers the ring's statx with the object number and generation
+/// its handle carries, and a ring read gives back its bytes.
 ///
-/// Runs on a **ZFS dataset**, since the fid layout checked is the one
-/// `zfs_fid` writes. `open_by_handle_at` needs `CAP_DAC_READ_SEARCH`
-/// (`may_decode_fh`, fs/fhandle.c), so it runs only as root. Three gates
-/// are armed in the QEMU job, `TRUENAS_ROS_REQUIRE_ZFS` for the dataset,
-/// `TRUENAS_ROS_REQUIRE_FHANDLE` for the open and
+/// Runs on a **ZFS dataset**, since the fid layout checked is the one `zfs_fid` writes. `open_by_handle_at` needs
+/// `CAP_DAC_READ_SEARCH` (`may_decode_fh`, fs/fhandle.c), so it runs only as root. Three gates are armed in the QEMU
+/// job, `TRUENAS_ROS_REQUIRE_ZFS` for the dataset, `TRUENAS_ROS_REQUIRE_FHANDLE` for the open and
 /// `TRUENAS_ROS_REQUIRE_STATX_GEN` for the generation.
 #[cfg(feature = "fhandle")]
 #[test]
@@ -4852,18 +4196,12 @@ fn a_file_opened_by_handle_serves_ring_ops_once_wrapped() {
     with_fs(test_cfg(), |h, me, _dir, _stop| {
         let path = ds.join(format!("rostest_from_fd_{}", std::process::id()));
         std::fs::write(&path, b"by handle").unwrap();
-        let handle = name_to_handle_at(
-            truenas_ros::AT_FDCWD,
-            &path,
-            FhFlags::AT_HANDLE_MNT_ID_UNIQUE,
-        )
-        .expect("name_to_handle_at");
+        let handle = name_to_handle_at(truenas_ros::AT_FDCWD, &path, FhFlags::AT_HANDLE_MNT_ID_UNIQUE)
+            .expect("name_to_handle_at");
         let mount = std::fs::File::open(&ds).unwrap();
         let fd = match handle.open(mount.as_fd(), OFlag::O_RDONLY) {
             Ok(fd) => fd,
-            Err(Error::Errno(
-                e @ (Errno::EPERM | Errno::EACCES | Errno::ENOSYS),
-            )) => {
+            Err(Error::Errno(e @ (Errno::EPERM | Errno::EACCES | Errno::ENOSYS))) => {
                 std::fs::remove_file(&path).unwrap();
                 assert!(
                     std::env::var_os("TRUENAS_ROS_REQUIRE_FHANDLE").is_none(),
@@ -4875,8 +4213,7 @@ fn a_file_opened_by_handle_serves_ring_ops_once_wrapped() {
             Err(e) => panic!("open_by_handle_at failed with {e}"),
         };
         let f = File::from_fd(fd);
-        let st =
-            h.fstatx(me, &f, AtFlags::empty(), StatxMask::INO | StatxMask::GEN);
+        let st = h.fstatx(me, &f, AtFlags::empty(), StatxMask::INO | StatxMask::GEN);
         let (n, buf) = pread1(&h, me, &f, vec![0u8; 9], 0);
         h.close(f).expect("close");
         std::fs::remove_file(&path).unwrap();
@@ -4884,10 +4221,8 @@ fn a_file_opened_by_handle_serves_ring_ops_once_wrapped() {
         assert_eq!(n.expect("read"), 9);
         assert_eq!(&buf[..9], b"by handle");
 
-        // `zfs_fid`'s short form, after the eight byte `struct file_handle`
-        // head. It is a `u16` length of ten, the object number in six little
-        // endian bytes, then the generation in four with a zero remapped to
-        // one.
+        // `zfs_fid`'s short form, after the eight byte `struct file_handle` head. It is a `u16` length of ten, the
+        // object number in six little endian bytes, then the generation in four with a zero remapped to one.
         let raw = handle.to_bytes();
         let fid = &raw[8..];
         assert_eq!(fid.len(), 12, "{raw:02x?}");
@@ -4919,38 +4254,26 @@ fn a_file_opened_by_handle_serves_ring_ops_once_wrapped() {
 const CAP_NOBODY_UID: u32 = 65_534;
 const CAP_NOBODY_GID: u32 = 65_534;
 
-/// The traversal problem this capability exists for: an object the identity is
-/// entitled to, under a directory it cannot search. Without the capability the
-/// walk stops at `vault/`; with it the kernel resolves through and the read
+/// The traversal problem this capability exists for: an object the identity is entitled to, under a directory it cannot
+/// search. Without the capability the walk stops at `vault/`; with it the kernel resolves through and the read
 /// succeeds.
 ///
-/// The second assertion is the uncomfortable half, and it is here on purpose:
-/// `CAP_DAC_READ_SEARCH` is not traverse-only. It reads the file too, and no
-/// narrower capability exists (`CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH`
-/// are the only two DAC bypasses Linux defines). Anyone loosening this should
-/// have to change a test that says so.
+/// The second assertion is the uncomfortable half, and it is here on purpose: `CAP_DAC_READ_SEARCH` is not
+/// traverse-only. It reads the file too, and no narrower capability exists (`CAP_DAC_OVERRIDE` and
+/// `CAP_DAC_READ_SEARCH` are the only two DAC bypasses Linux defines). Anyone loosening this should have to change a
+/// test that says so.
 #[test]
 fn dac_read_search_traverses_a_directory_the_identity_cannot_search() {
-    if !root_or_skip(
-        "dac_read_search_traverses_a_directory_the_identity_cannot_search",
-    ) {
+    if !root_or_skip("dac_read_search_traverses_a_directory_the_identity_cannot_search") {
         return;
     }
     with_broker_caps(Caps::DAC_READ_SEARCH, |h, creds, _me, dir| {
         std::fs::create_dir(dir.join("vault")).unwrap();
         std::fs::write(dir.join("vault/inner"), b"secret").unwrap();
-        std::fs::set_permissions(
-            dir.join("vault"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
-        // Unreadable to the identity in its own right, so the successful read
-        // below is the capability's doing and not the mode's.
-        std::fs::set_permissions(
-            dir.join("vault/inner"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("vault"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Unreadable to the identity in its own right, so the successful read below is the capability's doing and not
+        // the mode's.
+        std::fs::set_permissions(dir.join("vault/inner"), std::fs::Permissions::from_mode(0o600)).unwrap();
         let anchor = Anchor::open(dir).unwrap();
         let plain = AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID);
         let privileged = plain.clone().caps(Caps::DAC_READ_SEARCH);
@@ -4978,10 +4301,9 @@ fn dac_read_search_traverses_a_directory_the_identity_cannot_search() {
     });
 }
 
-/// `CAP_DAC_READ_SEARCH` grants a *pure* read and nothing wider: `fs/namei.c`
-/// tests `mask == MAY_READ` with exact equality, so adding a write bit drops
-/// out of the grant entirely. `O_RDONLY` succeeds on a file `O_RDWR` cannot
-/// even open - asymmetric enough to be worth pinning.
+/// `CAP_DAC_READ_SEARCH` grants a *pure* read and nothing wider: `fs/namei.c` tests `mask == MAY_READ` with exact
+/// equality, so adding a write bit drops out of the grant entirely. `O_RDONLY` succeeds on a file `O_RDWR` cannot even
+/// open - asymmetric enough to be worth pinning.
 #[test]
 fn dac_read_search_grants_o_rdonly_but_not_o_rdwr() {
     if !root_or_skip("dac_read_search_grants_o_rdonly_but_not_o_rdwr") {
@@ -4989,17 +4311,10 @@ fn dac_read_search_grants_o_rdonly_but_not_o_rdwr() {
     }
     with_broker_caps(Caps::DAC_READ_SEARCH, |h, creds, _me, dir| {
         std::fs::write(dir.join("locked"), b"x").unwrap();
-        std::fs::set_permissions(
-            dir.join("locked"),
-            std::fs::Permissions::from_mode(0o000),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
         let anchor = Anchor::open(dir).unwrap();
         let who = creds
-            .register(
-                &AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID)
-                    .caps(Caps::DAC_READ_SEARCH),
-            )
+            .register(&AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID).caps(Caps::DAC_READ_SEARCH))
             .unwrap();
 
         let f = h
@@ -5009,12 +4324,7 @@ fn dac_read_search_grants_o_rdonly_but_not_o_rdwr() {
 
         assert!(
             matches!(
-                h.open(
-                    who,
-                    &anchor,
-                    "locked",
-                    OpenHow::new().flags(OFlag::O_RDWR)
-                ),
+                h.open(who, &anchor, "locked", OpenHow::new().flags(OFlag::O_RDWR)),
                 Err(Error::Errno(Errno::EACCES))
             ),
             "read|write is not `mask == MAY_READ`, so the grant does not apply"
@@ -5024,10 +4334,9 @@ fn dac_read_search_grants_o_rdonly_but_not_o_rdwr() {
     });
 }
 
-/// The spawn-time mask is a ceiling the broker enforces, not a hint the caller
-/// may exceed. This is the property that keeps a compromised main - which can
-/// already mint any non-root identity - from minting itself read access to
-/// every file on the system.
+/// The spawn-time mask is a ceiling the broker enforces, not a hint the caller may exceed. This is the property that
+/// keeps a compromised main - which can already mint any non-root identity - from minting itself read access to every
+/// file on the system.
 #[test]
 fn spawn_time_mask_is_a_ceiling_on_requested_caps() {
     if !root_or_skip("spawn_time_mask_is_a_ceiling_on_requested_caps") {
@@ -5036,15 +4345,9 @@ fn spawn_time_mask_is_a_ceiling_on_requested_caps() {
     with_broker(|_h, creds, _me, _dir| {
         // `with_broker` spawns with `Caps::empty()`.
         let err = creds
-            .register(
-                &AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID)
-                    .caps(Caps::DAC_READ_SEARCH),
-            )
+            .register(&AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID).caps(Caps::DAC_READ_SEARCH))
             .expect_err("a capability outside the ceiling must be refused");
-        assert!(
-            matches!(err, Error::Errno(Errno::EPERM)),
-            "expected EPERM, got {err:?}"
-        );
+        assert!(matches!(err, Error::Errno(Errno::EPERM)), "expected EPERM, got {err:?}");
         // The same identity without capabilities still registers.
         let ok = creds
             .register(&AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID))
@@ -5053,10 +4356,9 @@ fn spawn_time_mask_is_a_ceiling_on_requested_caps() {
     });
 }
 
-/// `caps` participates in `AsUser`'s identity, so the cache mints a separate
-/// personality rather than handing back one registered without them. Getting
-/// this wrong would silently serve whichever variant was requested first --
-/// either leaking a capability or withholding one, depending on the order.
+/// `caps` participates in `AsUser`'s identity, so the cache mints a separate personality rather than handing back one
+/// registered without them. Getting this wrong would silently serve whichever variant was requested first -- either
+/// leaking a capability or withholding one, depending on the order.
 #[test]
 fn identity_cache_keys_on_the_capability_set() {
     if !root_or_skip("identity_cache_keys_on_the_capability_set") {
@@ -5076,15 +4378,11 @@ fn identity_cache_keys_on_the_capability_set() {
             "distinct capability sets must not share a personality"
         );
         // And each is stable on re-acquire.
-        assert_eq!(
-            cache.acquire(&plain).unwrap().personality().id(),
-            a.personality().id()
-        );
+        assert_eq!(cache.acquire(&plain).unwrap().personality().id(), a.personality().id());
     });
 }
 
-/// The six capabilities a file service grants its superuser, the ones its
-/// file calls check.
+/// The six capabilities a file service grants its superuser, the ones its file calls check.
 const ROOT_SET: Caps = Caps::CHOWN
     .union(Caps::DAC_OVERRIDE)
     .union(Caps::DAC_READ_SEARCH)
@@ -5092,13 +4390,11 @@ const ROOT_SET: Caps = Caps::CHOWN
     .union(Caps::FSETID)
     .union(Caps::MKNOD);
 
-/// A root personality carries exactly what it asked for within the root
-/// limit, and nothing of the broker's own authority. Asking for nothing,
-/// uid 0 cannot open its own mode-0000 file for writing. Asking for the set,
-/// it can, through `CAP_DAC_OVERRIDE`. What it creates is owned by uid 0 and
-/// the gid it asked for. It still cannot set a `trusted.` xattr, which needs
-/// `CAP_SYS_ADMIN` (`xattr_permission`, `fs/xattr.c`), though the daemon's
-/// own personality can.
+/// A root personality carries exactly what it asked for within the root limit, and nothing of the broker's own
+/// authority. Asking for nothing, uid 0 cannot open its own mode-0000 file for writing. Asking for the set, it can,
+/// through `CAP_DAC_OVERRIDE`. What it creates is owned by uid 0 and the gid it asked for. It still cannot set a
+/// `trusted.` xattr, which needs `CAP_SYS_ADMIN` (`xattr_permission`, `fs/xattr.c`), though the daemon's own
+/// personality can.
 #[test]
 fn a_root_personality_carries_exactly_what_it_asked_for() {
     if !root_or_skip("a_root_personality_carries_exactly_what_it_asked_for") {
@@ -5106,11 +4402,7 @@ fn a_root_personality_carries_exactly_what_it_asked_for() {
     }
     with_broker_root(Caps::empty(), ROOT_SET, |h, creds, me, dir| {
         std::fs::write(dir.join("locked"), b"x").unwrap();
-        std::fs::set_permissions(
-            dir.join("locked"),
-            std::fs::Permissions::from_mode(0o000),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
         let anchor = Anchor::open(dir).unwrap();
         let rdwr = || OpenHow::new().flags(OFlag::O_RDWR);
 
@@ -5134,9 +4426,7 @@ fn a_root_personality_carries_exactly_what_it_asked_for() {
             .flags(OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR)
             .mode(Mode::from_bits_truncate(0o644));
         let f = h.open(full, &anchor, "made", create).expect("create");
-        let seen = h
-            .fstatx(full, &f, AtFlags::empty(), StatxMask::BASIC_STATS)
-            .unwrap();
+        let seen = h.fstatx(full, &f, AtFlags::empty(), StatxMask::BASIC_STATS).unwrap();
         assert_eq!((seen.uid(), seen.gid()), (0, 4400));
 
         let name = xattr_name("trusted.truenas_ros_root_test");
@@ -5154,11 +4444,9 @@ fn a_root_personality_carries_exactly_what_it_asked_for() {
     });
 }
 
-/// The root limit is a ceiling for uid 0, as the other limit is for every
-/// other identity, and neither stands in for the other. A root request for
-/// a capability outside the root limit is refused `EPERM`, and so is a
-/// request of another identity for a capability that only the root limit
-/// holds.
+/// The root limit is a ceiling for uid 0, as the other limit is for every other identity, and neither stands in for the
+/// other. A root request for a capability outside the root limit is refused `EPERM`, and so is a request of another
+/// identity for a capability that only the root limit holds.
 #[test]
 fn the_root_limit_binds_uid_0_alone() {
     if !root_or_skip("the_root_limit_binds_uid_0_alone") {
@@ -5166,9 +4454,7 @@ fn the_root_limit_binds_uid_0_alone() {
     }
     let (allowed, root) = (Caps::DAC_READ_SEARCH, Caps::DAC_OVERRIDE);
     with_broker_root(allowed, root, |_h, creds, _me, _dir| {
-        let eperm = |who: &AsUser| {
-            matches!(creds.register(who), Err(Error::Errno(Errno::EPERM)))
-        };
+        let eperm = |who: &AsUser| matches!(creds.register(who), Err(Error::Errno(Errno::EPERM)));
         assert!(eperm(&AsUser::new(0, 0).caps(Caps::DAC_READ_SEARCH)));
         let nobody = AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID);
         assert!(eperm(&nobody.clone().caps(Caps::DAC_OVERRIDE)));
@@ -5179,9 +4465,8 @@ fn the_root_limit_binds_uid_0_alone() {
     });
 }
 
-/// `Caps::ROOT_ONLY` belongs to the root limit alone. In the limit for
-/// other identities it is refused before the broker forks, so the caller
-/// keeps the power to impersonate and may spawn again.
+/// `Caps::ROOT_ONLY` belongs to the root limit alone. In the limit for other identities it is refused before the broker
+/// forks, so the caller keeps the power to impersonate and may spawn again.
 #[test]
 fn root_only_capabilities_are_refused_in_the_other_limit() {
     let afs = match UringFs::new(test_cfg()) {
@@ -5201,12 +4486,10 @@ fn root_only_capabilities_are_refused_in_the_other_limit() {
     }
 }
 
-/// Minting root narrows the broker's own effective set without leaving uid
-/// 0, so the window's revert must give it back before it restores the gid
-/// and the groups, which need `CAP_SETGID`. Done in the wrong order, the
-/// broker would keep the root personality's gid, groups and capabilities,
-/// and refuse the next identity. Here it impersonates nobody after root,
-/// and that personality still holds nothing beyond nobody's own authority.
+/// Minting root narrows the broker's own effective set without leaving uid 0, so the window's revert must give it back
+/// before it restores the gid and the groups, which need `CAP_SETGID`. Done in the wrong order, the broker would keep
+/// the root personality's gid, groups and capabilities, and refuse the next identity. Here it impersonates nobody after
+/// root, and that personality still holds nothing beyond nobody's own authority.
 #[test]
 fn the_broker_impersonates_again_after_minting_root() {
     if !root_or_skip("the_broker_impersonates_again_after_minting_root") {
@@ -5214,11 +4497,7 @@ fn the_broker_impersonates_again_after_minting_root() {
     }
     with_broker_root(Caps::empty(), ROOT_SET, |h, creds, _me, dir| {
         std::fs::write(dir.join("secret"), b"root only").unwrap();
-        std::fs::set_permissions(
-            dir.join("secret"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
         let anchor = Anchor::open(dir).unwrap();
         let root = AsUser::new(0, 4400).groups(vec![4401]).caps(ROOT_SET);
         let root = creds.register(&root).unwrap();
@@ -5245,32 +4524,19 @@ fn the_broker_impersonates_again_after_minting_root() {
 
 // ---- recursive, resumable subtree walk -------------------------------------
 
-/// A tree whose root level exercises the `/`-vs-`.`-vs-`-` ordering trap at
-/// more than one depth, so a walk that got the comparator right at one level
-/// and wrong at another still fails.
+/// A tree whose root level exercises the `/`-vs-`.`-vs-`-` ordering trap at more than one depth, so a walk that got the
+/// comparator right at one level and wrong at another still fails.
 fn make_tree(dir: &Path) {
     std::fs::create_dir(dir.join("a")).unwrap();
     std::fs::create_dir(dir.join("a/c")).unwrap();
     std::fs::create_dir(dir.join("z")).unwrap();
-    for f in [
-        "a-1.txt",
-        "a.txt",
-        "aa.txt",
-        "a/b.txt",
-        "a/c/d.txt",
-        "z/y.txt",
-    ] {
+    for f in ["a-1.txt", "a.txt", "aa.txt", "a/b.txt", "a/c/d.txt", "z/y.txt"] {
         std::fs::write(dir.join(f), b"x").unwrap();
     }
 }
 
 /// Every key the walk yields, in order, as strings.
-fn walk_keys(
-    h: &FsHandle,
-    me: Personality,
-    anchor: &Anchor,
-    opts: TreeOptions,
-) -> Vec<String> {
+fn walk_keys(h: &FsHandle, me: Personality, anchor: &Anchor, opts: TreeOptions) -> Vec<String> {
     let mut t = query_tree(h, me, anchor, opts).expect("query_tree");
     let mut out = Vec::new();
     while let Some(e) = t.next() {
@@ -5280,10 +4546,9 @@ fn walk_keys(
     out
 }
 
-/// Per-directory sorting composes into global path order. Note where `a/`
-/// lands: after `a.txt` because `/` outranks `.`, and its whole subtree
-/// follows immediately - `a/c/d.txt` still precedes `aa.txt`, which is the
-/// property a naive bare-name sort breaks.
+/// Per-directory sorting composes into global path order. Note where `a/` lands: after `a.txt` because `/` outranks
+/// `.`, and its whole subtree follows immediately - `a/c/d.txt` still precedes `aa.txt`, which is the property a naive
+/// bare-name sort breaks.
 #[test]
 fn tree_walk_emits_the_subtree_in_global_path_order() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -5316,17 +4581,16 @@ fn tree_walk_emits_the_subtree_in_global_path_order() {
             ]
         );
 
-        // The same set, sorted independently as flat byte strings, must agree
-        // -- that is what "global path order" means, and it is checked here
-        // rather than trusted from the literal above.
+        // The same set, sorted independently as flat byte strings, must agree -- that is what "global path order"
+        // means, and it is checked here rather than trusted from the literal above.
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted);
     });
 }
 
-/// `max_depth: 1` and `skip_descent` are the two ways to get the
-/// non-recursive listing a delimiter asks for, and they must agree.
+/// `max_depth: 1` and `skip_descent` are the two ways to get the non-recursive listing a delimiter asks for, and they
+/// must agree.
 #[test]
 fn depth_one_and_skip_descent_both_stop_at_the_top_level() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -5345,10 +4609,9 @@ fn depth_one_and_skip_descent_both_stop_at_the_top_level() {
         );
         assert_eq!(capped, expected, "max_depth 1");
 
-        // Pruning every directory as it is yielded reaches the same place,
-        // and is how a caller folds one into a common prefix.
-        let mut t = query_tree(&h, me, &anchor, TreeOptions::default())
-            .expect("query_tree");
+        // Pruning every directory as it is yielded reaches the same place, and is how a caller folds one into a common
+        // prefix.
+        let mut t = query_tree(&h, me, &anchor, TreeOptions::default()).expect("query_tree");
         let mut pruned = Vec::new();
         while let Some(e) = t.next() {
             let e = e.expect("entry");
@@ -5362,11 +4625,9 @@ fn depth_one_and_skip_descent_both_stop_at_the_top_level() {
     });
 }
 
-/// The pagination property, and the reason the cursor is key-based rather
-/// than a directory offset: paging through the tree must reproduce the whole
-/// walk **exactly** - no key repeated, none skipped - including when a page
-/// boundary falls on a directory, which is the case a position-based cursor
-/// gets wrong.
+/// The pagination property, and the reason the cursor is key-based rather than a directory offset: paging through the
+/// tree must reproduce the whole walk **exactly** - no key repeated, none skipped - including when a page boundary
+/// falls on a directory, which is the case a position-based cursor gets wrong.
 #[test]
 fn paging_with_a_cursor_reproduces_the_walk_exactly() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -5374,8 +4635,8 @@ fn paging_with_a_cursor_reproduces_the_walk_exactly() {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let full = walk_keys(&h, me, &anchor, TreeOptions::default());
 
-        // Every page size from 1 up, so the boundary lands on each entry in
-        // turn - files, directories, and the last entry of a level alike.
+        // Every page size from 1 up, so the boundary lands on each entry in turn - files, directories, and the last
+        // entry of a level alike.
         for page in 1..=full.len() {
             let mut paged: Vec<String> = Vec::new();
             let mut resume: Option<TreeCursor> = None;
@@ -5411,21 +4672,18 @@ fn paging_with_a_cursor_reproduces_the_walk_exactly() {
     });
 }
 
-/// Resuming a listing must tolerate a subtree that vanished between pages, the
-/// same way the forward walk tolerates one removed mid-walk: the walk emits a
-/// directory before its contents, so a page can end on `a/c/` with the resume
-/// about to re-open it. If `a/c` is gone by then, the rebuild must skip its
-/// subtree and advance to the next sibling, not fail the whole listing.
+/// Resuming a listing must tolerate a subtree that vanished between pages, the same way the forward walk tolerates one
+/// removed mid-walk: the walk emits a directory before its contents, so a page can end on `a/c/` with the resume about
+/// to re-open it. If `a/c` is gone by then, the rebuild must skip its subtree and advance to the next sibling, not fail
+/// the whole listing.
 #[test]
 fn a_subtree_removed_between_pages_is_skipped_not_fatal() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         make_tree(&dir);
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let full = walk_keys(&h, me, &anchor, TreeOptions::default());
-        // `a/c/` is emitted before its contents, so removing it once yielded
-        // drops only `a/c/d.txt`.
-        let expected: Vec<String> =
-            full.iter().filter(|k| *k != "a/c/d.txt").cloned().collect();
+        // `a/c/` is emitted before its contents, so removing it once yielded drops only `a/c/d.txt`.
+        let expected: Vec<String> = full.iter().filter(|k| *k != "a/c/d.txt").cloned().collect();
 
         let mut paged: Vec<String> = Vec::new();
         let mut resume: Option<TreeCursor> = None;
@@ -5444,9 +4702,8 @@ fn a_subtree_removed_between_pages_is_skipped_not_fatal() {
             let Some(e) = t.next() else { break };
             let key = String::from_utf8(e.expect("entry").key()).unwrap();
             if key == "a/c/" && !removed {
-                // The next page re-opens `a/c`; remove it first so the rebuild
-                // hits ENOENT on that level (the walk has not descended into it
-                // yet - a directory is emitted before its contents).
+                // The next page re-opens `a/c`; remove it first so the rebuild hits ENOENT on that level (the walk has
+                // not descended into it yet - a directory is emitted before its contents).
                 std::fs::remove_dir_all(dir.join("a/c")).unwrap();
                 removed = true;
             }
@@ -5458,20 +4715,16 @@ fn a_subtree_removed_between_pages_is_skipped_not_fatal() {
     });
 }
 
-/// The other half of the restore guard: a level that fails for a reason
-/// that is *not* a subtree skip aborts the resume.
+/// The other half of the restore guard: a level that fails for a reason that is *not* a subtree skip aborts the resume.
 ///
-/// `a_subtree_removed_between_pages_is_skipped_not_fatal` pins the skip
-/// half - EACCES/EPERM/ENOENT are levels the forward walk would have
-/// skipped too, so a resume that cannot re-enter them is still at the
-/// position it saved. Everything else is not: the cursor names a place the
-/// rebuild could not reach, so continuing from a shallower level would hand
-/// back a short listing with no error in it - which is data loss for the
-/// recursive copy and delete built on this.
+/// `a_subtree_removed_between_pages_is_skipped_not_fatal` pins the skip half - EACCES/EPERM/ENOENT are levels the
+/// forward walk would have skipped too, so a resume that cannot re-enter them is still at the position it saved.
+/// Everything else is not: the cursor names a place the rebuild could not reach, so continuing from a shallower level
+/// would hand back a short listing with no error in it - which is data loss for the recursive copy and delete built on
+/// this.
 ///
-/// Provoked by replacing the directory with a regular file between pages.
-/// The rebuild opens each level `O_DIRECTORY`, so the file answers ENOTDIR,
-/// which `is_subtree_skip` deliberately does not cover.
+/// Provoked by replacing the directory with a regular file between pages. The rebuild opens each level `O_DIRECTORY`,
+/// so the file answers ENOTDIR, which `is_subtree_skip` deliberately does not cover.
 #[test]
 fn a_level_that_became_a_file_between_pages_aborts_the_resume() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -5491,8 +4744,7 @@ fn a_level_that_became_a_file_between_pages_aborts_the_resume() {
                 },
             );
             if swapped {
-                // The page after the swap must refuse rather than resume
-                // somewhere shallower.
+                // The page after the swap must refuse rather than resume somewhere shallower.
                 let err = match opened {
                     Ok(_) => panic!(
                         "a level the rebuild could not re-enter was resumed \
@@ -5500,8 +4752,7 @@ fn a_level_that_became_a_file_between_pages_aborts_the_resume() {
                     ),
                     Err(e) => e,
                 };
-                let truenas_ros::Error::IteratorRestore { path, .. } = &err
-                else {
+                let truenas_ros::Error::IteratorRestore { path, .. } = &err else {
                     panic!("expected IteratorRestore, got {err:?}");
                 };
                 assert!(
@@ -5517,8 +4768,8 @@ fn a_level_that_became_a_file_between_pages_aborts_the_resume() {
             };
             let key = String::from_utf8(e.expect("entry").key()).unwrap();
             if key == "a/c/" {
-                // The next page re-opens `a/c`. Replace it with a regular
-                // file so the rebuild's O_DIRECTORY open answers ENOTDIR.
+                // The next page re-opens `a/c`. Replace it with a regular file so the rebuild's O_DIRECTORY open
+                // answers ENOTDIR.
                 std::fs::remove_dir_all(dir.join("a/c")).unwrap();
                 std::fs::write(dir.join("a/c"), b"").unwrap();
                 swapped = true;
@@ -5528,13 +4779,11 @@ fn a_level_that_became_a_file_between_pages_aborts_the_resume() {
     });
 }
 
-/// `skip_descent` and `cursor` are both documented delimiter primitives, so
-/// the obvious composition of them - fold a directory into a common prefix,
-/// then page - has to work. It is the page boundary that makes it hard: the
-/// walk emits a directory *before* its contents, so a cursor sitting on a
-/// folded directory is positioned at the start of the subtree the caller just
-/// said to skip. Resuming there must not re-enter it, and must not re-emit
-/// the directory either.
+/// `skip_descent` and `cursor` are both documented delimiter primitives, so the obvious composition of them - fold a
+/// directory into a common prefix, then page - has to work. It is the page boundary that makes it hard: the walk emits
+/// a directory *before* its contents, so a cursor sitting on a folded directory is positioned at the start of the
+/// subtree the caller just said to skip. Resuming there must not re-enter it, and must not re-emit the directory
+/// either.
 #[test]
 fn a_folded_subtree_stays_folded_across_a_page_boundary() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -5577,20 +4826,15 @@ fn a_folded_subtree_stays_folded_across_a_page_boundary() {
                 }
                 // Round-trip the token, since a real pager persists it.
                 let blob = t.cursor().to_bytes();
-                resume = Some(
-                    TreeCursor::from_bytes(&blob).expect("cursor decodes"),
-                );
+                resume = Some(TreeCursor::from_bytes(&blob).expect("cursor decodes"));
             }
-            assert_eq!(
-                paged, expected,
-                "folding every directory, {page} entries at a time"
-            );
+            assert_eq!(paged, expected, "folding every directory, {page} entries at a time");
         }
     });
 }
 
-/// A cursor survives serialization, so a listing can be resumed by a later
-/// request - or a later process - and not just within one walk.
+/// A cursor survives serialization, so a listing can be resumed by a later request - or a later process - and not just
+/// within one walk.
 #[test]
 fn a_serialized_cursor_resumes_the_walk() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -5598,8 +4842,7 @@ fn a_serialized_cursor_resumes_the_walk() {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let full = walk_keys(&h, me, &anchor, TreeOptions::default());
 
-        let mut t = query_tree(&h, me, &anchor, TreeOptions::default())
-            .expect("query_tree");
+        let mut t = query_tree(&h, me, &anchor, TreeOptions::default()).expect("query_tree");
         for _ in 0..4 {
             t.next().expect("entry").expect("ok");
         }
@@ -5620,9 +4863,8 @@ fn a_serialized_cursor_resumes_the_walk() {
     });
 }
 
-/// Descent resolves one component against the descriptor the walk already
-/// holds, under `CONFINED_RESOLVE` - so a symlink planted in the tree is not
-/// a way out of it, whether it points outside or back inside.
+/// Descent resolves one component against the descriptor the walk already holds, under `CONFINED_RESOLVE` - so a
+/// symlink planted in the tree is not a way out of it, whether it points outside or back inside.
 #[test]
 fn the_walk_does_not_follow_symlinks_out_of_the_tree() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -5634,9 +4876,8 @@ fn the_walk_does_not_follow_symlinks_out_of_the_tree() {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let keys = walk_keys(&h, me, &anchor, TreeOptions::default());
 
-        // The links are yielded as entries - they exist - but neither is
-        // descended into, so nothing from /etc and no second copy of
-        // `real/`'s contents appears.
+        // The links are yielded as entries - they exist - but neither is descended into, so nothing from /etc and no
+        // second copy of `real/`'s contents appears.
         assert!(keys.contains(&"real/".to_string()));
         assert!(keys.contains(&"real/inside.txt".to_string()));
         assert!(
@@ -5652,10 +4893,9 @@ fn the_walk_does_not_follow_symlinks_out_of_the_tree() {
 
 // ---- fadvise / fremovexattr / copy_file_range ------------------------------
 
-/// `fadvise` is advisory, so the assertion is that it is *accepted* and does
-/// not disturb the file - both advices ZFS implements natively (`WILLNEED` is
-/// a `dmu_prefetch`, `DONTNEED` a `dmu_evict_range`) plus the whole-file `0`
-/// length form.
+/// `fadvise` is advisory, so the assertion is that it is *accepted* and does not disturb the file - both advices ZFS
+/// implements natively (`WILLNEED` is a `dmu_prefetch`, `DONTNEED` a `dmu_evict_range`) plus the whole-file `0` length
+/// form.
 #[test]
 fn fadvise_is_accepted_and_leaves_contents_alone() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -5674,9 +4914,8 @@ fn fadvise_is_accepted_and_leaves_contents_alone() {
             h.fadvise(me, &f, 0, 10, advice)
                 .unwrap_or_else(|e| panic!("fadvise {advice:?}: {e}"));
         }
-        // Length 0 means "to end of file" - the form used after syncing a
-        // whole object, and the one most likely to be mis-encoded since the
-        // kernel reads the length from `addr`, not `len`.
+        // Length 0 means "to end of file" - the form used after syncing a whole object, and the one most likely to be
+        // mis-encoded since the kernel reads the length from `addr`, not `len`.
         h.fadvise(me, &f, 0, 0, Advice::DontNeed).expect("dontneed");
         h.fadvise(me, &f, 4, 6, Advice::DontNeed).expect("ranged");
 
@@ -5687,8 +4926,8 @@ fn fadvise_is_accepted_and_leaves_contents_alone() {
     });
 }
 
-/// Drive `client` against a reactor whose [`PrivilegedXattrs`] policy claims
-/// `trusted.example_`, the namespace these two tests treat as server-owned.
+/// Drive `client` against a reactor whose [`PrivilegedXattrs`] policy claims `trusted.example_`, the namespace these
+/// two tests treat as server-owned.
 fn with_priv_xattr_fs<F>(client: F)
 where
     F: FnOnce(&FsHandle, Personality, &Path) + Send,
@@ -5721,13 +4960,11 @@ where
     });
 }
 
-/// The allowlist is the whole security contract for `fremovexattr`: it takes
-/// no [`Personality`], so an attribute the server does not own must be
-/// refused outright rather than removed under the reactor's credentials.
+/// The allowlist is the whole security contract for `fremovexattr`: it takes no [`Personality`], so an attribute the
+/// server does not own must be refused outright rather than removed under the reactor's credentials.
 ///
-/// Deliberately needs no privilege - the refusal is decided from the policy
-/// before any syscall, so this runs everywhere and is the half worth having
-/// unconditional coverage of.
+/// Deliberately needs no privilege - the refusal is decided from the policy before any syscall, so this runs everywhere
+/// and is the half worth having unconditional coverage of.
 #[test]
 fn fremovexattr_refuses_attributes_outside_the_allowlist() {
     with_priv_xattr_fs(|h, me, dir| {
@@ -5739,10 +4976,7 @@ fn fremovexattr_refuses_attributes_outside_the_allowlist() {
             .expect("an unprivileged user.* set");
 
         assert!(
-            matches!(
-                h.fremovexattr(&f, user.clone()),
-                Err(Error::Errno(Errno::EPERM))
-            ),
+            matches!(h.fremovexattr(&f, user.clone()), Err(Error::Errno(Errno::EPERM))),
             "an attribute the server does not own must not be removable"
         );
         assert!(
@@ -5753,13 +4987,11 @@ fn fremovexattr_refuses_attributes_outside_the_allowlist() {
     });
 }
 
-/// The other half: an allowlisted attribute really is removed, and is *gone
-/// from the listing* rather than left present with an empty value - which is
-/// all a zero-length `FSETXATTR` would have achieved.
+/// The other half: an allowlisted attribute really is removed, and is *gone from the listing* rather than left present
+/// with an empty value - which is all a zero-length `FSETXATTR` would have achieved.
 ///
-/// Root-only: writing `trusted.*` needs `CAP_SYS_ADMIN`, and the allowlist
-/// promotion runs under the reactor's own credentials, so an unprivileged
-/// reactor cannot set the attribute this removes.
+/// Root-only: writing `trusted.*` needs `CAP_SYS_ADMIN`, and the allowlist promotion runs under the reactor's own
+/// credentials, so an unprivileged reactor cannot set the attribute this removes.
 #[test]
 fn fremovexattr_removes_allowlisted_attributes() {
     if !root_or_skip("fremovexattr_removes_allowlisted_attributes") {
@@ -5777,8 +5009,7 @@ fn fremovexattr_removes_allowlisted_attributes() {
             .0
             .expect("user set");
 
-        h.fremovexattr(&f, owned.clone())
-            .expect("server-owned removal");
+        h.fremovexattr(&f, owned.clone()).expect("server-owned removal");
         let names = h.flistxattr(&f).unwrap();
         assert!(!names.contains(&owned), "removed, not emptied: {names:?}");
         assert!(names.contains(&user), "the other attribute is untouched");
@@ -5789,21 +5020,17 @@ fn fremovexattr_removes_allowlisted_attributes() {
     });
 }
 
-/// A subtree that cannot be *opened* for a non-permission reason must surface
-/// as an error, not vanish from the walk the way the readdir path already
-/// refuses to. A silently dropped subtree is data loss for the recursive
-/// delete/copy this walk backs.
+/// A subtree that cannot be *opened* for a non-permission reason must surface as an error, not vanish from the walk the
+/// way the readdir path already refuses to. A silently dropped subtree is data loss for the recursive delete/copy this
+/// walk backs.
 ///
-/// The trigger is a real race: a directory is yielded, and the descent into it
-/// is deferred to the next call so `skip_descent` can cancel it - swap the
-/// directory for a regular file inside that window and the deferred
+/// The trigger is a real race: a directory is yielded, and the descent into it is deferred to the next call so
+/// `skip_descent` can cancel it - swap the directory for a regular file inside that window and the deferred
 /// `O_DIRECTORY` open fails `ENOTDIR`.
 ///
-/// Keep any provocation here *local* to the walk. `cargo test` runs a
-/// binary's tests as threads in one process, so anything that exhausts a
-/// process-wide resource - the fd table above all - starves whatever else is
-/// running rather than only this test, and fails a different innocent test on
-/// each run depending on the fd limit.
+/// Keep any provocation here *local* to the walk. `cargo test` runs a binary's tests as threads in one process, so
+/// anything that exhausts a process-wide resource - the fd table above all - starves whatever else is running rather
+/// than only this test, and fails a different innocent test on each run depending on the fd limit.
 #[test]
 fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -5812,13 +5039,12 @@ fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
         std::fs::write(dir.join("z.txt"), b"x").unwrap();
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
 
-        let mut t = query_tree(&h, me, &anchor, TreeOptions::default())
-            .expect("query_tree");
+        let mut t = query_tree(&h, me, &anchor, TreeOptions::default()).expect("query_tree");
         // "sub/" sorts before "z.txt"; its descent is deferred to the next call.
         assert_eq!(t.next().expect("some").expect("ok").key(), b"sub/");
 
-        // The window: replace the directory with a regular file of the same
-        // name, so the deferred open of "sub" cannot be a directory open.
+        // The window: replace the directory with a regular file of the same name, so the deferred open of "sub" cannot
+        // be a directory open.
         std::fs::remove_file(dir.join("sub/f.txt")).unwrap();
         std::fs::remove_dir(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub"), b"x").unwrap();
@@ -5826,12 +5052,9 @@ fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
         match t.next() {
             // triggers descend("sub")
             Some(Err(Error::Errno(Errno::ENOTDIR))) => {}
-            other => panic!(
-                "an unopenable subtree must surface an error, got {other:?}"
-            ),
+            other => panic!("an unopenable subtree must surface an error, got {other:?}"),
         }
-        // The error is per-subtree, not fatal: the walk carries on in the
-        // parent with the sibling it had already read.
+        // The error is per-subtree, not fatal: the walk carries on in the parent with the sibling it had already read.
         assert_eq!(
             t.next().expect("some").expect("ok").key(),
             b"z.txt",
@@ -5840,11 +5063,10 @@ fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
     });
 }
 
-/// The other side of that race, and the common one: a directory removed
-/// between the parent's `readdir` and the deferred descent leaves no subtree
-/// to list, so it drops out quietly rather than failing the walk. Any walk
-/// over a tree being written to hits this routinely, and a recursive copy that
-/// aborted every time a directory went away underneath it would be unusable.
+/// The other side of that race, and the common one: a directory removed between the parent's `readdir` and the deferred
+/// descent leaves no subtree to list, so it drops out quietly rather than failing the walk. Any walk over a tree being
+/// written to hits this routinely, and a recursive copy that aborted every time a directory went away underneath it
+/// would be unusable.
 #[test]
 fn a_subtree_removed_under_the_walk_is_skipped_quietly() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -5853,12 +5075,10 @@ fn a_subtree_removed_under_the_walk_is_skipped_quietly() {
         std::fs::write(dir.join("z.txt"), b"x").unwrap();
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
 
-        let mut t = query_tree(&h, me, &anchor, TreeOptions::default())
-            .expect("query_tree");
+        let mut t = query_tree(&h, me, &anchor, TreeOptions::default()).expect("query_tree");
         assert_eq!(t.next().expect("some").expect("ok").key(), b"sub/");
 
-        // Same deferred-descent window as the ENOTDIR case, but the entry is
-        // gone rather than replaced.
+        // Same deferred-descent window as the ENOTDIR case, but the entry is gone rather than replaced.
         std::fs::remove_file(dir.join("sub/f.txt")).unwrap();
         std::fs::remove_dir(dir.join("sub")).unwrap();
 
@@ -5873,30 +5093,22 @@ fn a_subtree_removed_under_the_walk_is_skipped_quietly() {
 
 /// An entry the listing cannot open must not report its ACL as *absent*.
 ///
-/// A unix socket answers `ENXIO` to `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` and
-/// carries a POSIX access ACL exactly as a regular file does, so the ACL
-/// the caller asked for was not read. With that classed as a definite
-/// answer, `DirEntry::acl` is `None` - its rustdoc's spelling of "not
-/// present" - and `xattrs_incomplete` is clear, so a permissions layer
-/// mirroring ACLs out of a listing records "no ACL" for an object that has
-/// one.
+/// A unix socket answers `ENXIO` to `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` and carries a POSIX access ACL exactly as a
+/// regular file does, so the ACL the caller asked for was not read. With that classed as a definite answer,
+/// `DirEntry::acl` is `None` - its rustdoc's spelling of "not present" - and `xattrs_incomplete` is clear, so a
+/// permissions layer mirroring ACLs out of a listing records "no ACL" for an object that has one.
 ///
-/// A symbolic link is the opposite control and must STAY unflagged: the
-/// kernel refuses an access ACL on one outright (`vfs_get_acl`), so
-/// "absent" is true of it, and flagging it would make the flag permanent
-/// for an ordinary directory.
+/// A symbolic link is the opposite control and must STAY unflagged: the kernel refuses an access ACL on one outright
+/// (`vfs_get_acl`), so "absent" is true of it, and flagging it would make the flag permanent for an ordinary directory.
 #[test]
 fn query_directory_does_not_call_an_unread_acl_absent() {
     use std::collections::BTreeMap;
     use std::ffi::CString;
     use std::os::unix::ffi::OsStringExt;
-    use truenas_ros::uring_fs::{
-        DirEntry, EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
-    };
+    use truenas_ros::uring_fs::{DirEntry, EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
 
-    // system.posix_acl_access: u32 version, then 8-byte (tag, perm, id).
-    // A named user, so the ACL is not equivalent to the mode and the
-    // filesystem really stores one.
+    // system.posix_acl_access: u32 version, then 8-byte (tag, perm, id). A named user, so the ACL is not equivalent to
+    // the mode and the filesystem really stores one.
     let acl: Vec<u8> = {
         let mut v = Vec::new();
         v.extend_from_slice(&2u32.to_le_bytes());
@@ -5917,23 +5129,13 @@ fn query_directory_does_not_call_an_unread_acl_absent() {
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("f"), b"x").expect("regular file");
-        let _sock = std::os::unix::net::UnixListener::bind(dir.join("s"))
-            .expect("unix socket");
+        let _sock = std::os::unix::net::UnixListener::bind(dir.join("s")).expect("unix socket");
         std::os::unix::fs::symlink("f", dir.join("l")).expect("symlink");
 
         for name in ["f", "s"] {
-            let p = CString::new(dir.join(name).into_os_string().into_vec())
-                .expect("path");
+            let p = CString::new(dir.join(name).into_os_string().into_vec()).expect("path");
             // SAFETY: valid NUL-terminated path/name and a sized buffer.
-            let rc = unsafe {
-                libc::setxattr(
-                    p.as_ptr(),
-                    aclname.as_ptr(),
-                    acl.as_ptr().cast(),
-                    acl.len(),
-                    0,
-                )
-            };
+            let rc = unsafe { libc::setxattr(p.as_ptr(), aclname.as_ptr(), acl.as_ptr().cast(), acl.len(), 0) };
             if rc != 0 {
                 // Not a POSIX-ACL filesystem for this node type.
                 let e = std::io::Error::last_os_error();
@@ -5981,16 +5183,14 @@ fn query_directory_does_not_call_an_unread_acl_absent() {
 
 // --- system.truenas_setattr ------------------------------------------------
 
-/// The setter of the TrueNAS ZFS fork, `system.truenas_setattr`, through the
-/// ring. These run as root on ZFS, since they chown and act as other users.
-/// `TRUENAS_ROS_REQUIRE_ZFS` fails a runner with no dataset, and
+/// The setter of the TrueNAS ZFS fork, `system.truenas_setattr`, through the ring. These run as root on ZFS, since they
+/// chown and act as other users. `TRUENAS_ROS_REQUIRE_ZFS` fails a runner with no dataset, and
 /// `TRUENAS_ROS_REQUIRE_ZFS_SETATTR` one whose ZFS lacks the handler.
 mod zfs_setattr {
     use super::*;
     use std::os::fd::AsFd;
     use truenas_ros::sync_fs::{
-        SetTime, Statx, StatxTimestamp, ZFS_SETATTR, ZfsSetattr,
-        fget_zfs_attrs, fset_zfs_attrs, statx,
+        SetTime, Statx, StatxTimestamp, ZFS_SETATTR, ZfsSetattr, fget_zfs_attrs, fset_zfs_attrs, statx,
     };
 
     const OWNER: u32 = 61_001;
@@ -5998,18 +5198,11 @@ mod zfs_setattr {
     const GROUP: u32 = 61_100;
 
     const T0: StatxTimestamp = StatxTimestamp { sec: 500, nsec: 3 };
-    const T1: StatxTimestamp = StatxTimestamp {
-        sec: 1_000,
-        nsec: 5,
-    };
-    const T2: StatxTimestamp = StatxTimestamp {
-        sec: 2_000,
-        nsec: 7,
-    };
+    const T1: StatxTimestamp = StatxTimestamp { sec: 1_000, nsec: 5 };
+    const T2: StatxTimestamp = StatxTimestamp { sec: 2_000, nsec: 7 };
 
-    /// Whether the ZFS here answered. A `system.` name no handler takes is
-    /// `EOPNOTSUPP` (`xattr_resolve_name`, `fs/xattr.c`), which
-    /// `TRUENAS_ROS_REQUIRE_ZFS_SETATTR` turns into a failure.
+    /// Whether the ZFS here answered. A `system.` name no handler takes is `EOPNOTSUPP` (`xattr_resolve_name`,
+    /// `fs/xattr.c`), which `TRUENAS_ROS_REQUIRE_ZFS_SETATTR` turns into a failure.
     fn handled(res: &Result<(), Error>) -> bool {
         if !matches!(res, Err(Error::Errno(Errno::EOPNOTSUPP))) {
             return true;
@@ -6024,15 +5217,13 @@ mod zfs_setattr {
 
     /// The datasets the runner provides, NFSv4 then POSIX.
     fn datasets() -> Vec<PathBuf> {
-        let found: Vec<PathBuf> =
-            ["TRUENAS_ROS_NFS4_DATASET", "TRUENAS_ROS_POSIX_DATASET"]
-                .iter()
-                .filter_map(|v| std::env::var_os(v).map(PathBuf::from))
-                .filter(|d| zfs_dir::is_zfs(d) == Some(true))
-                .collect();
+        let found: Vec<PathBuf> = ["TRUENAS_ROS_NFS4_DATASET", "TRUENAS_ROS_POSIX_DATASET"]
+            .iter()
+            .filter_map(|v| std::env::var_os(v).map(PathBuf::from))
+            .filter(|d| zfs_dir::is_zfs(d) == Some(true))
+            .collect();
         assert!(
-            !found.is_empty()
-                || std::env::var_os("TRUENAS_ROS_REQUIRE_ZFS").is_none(),
+            !found.is_empty() || std::env::var_os("TRUENAS_ROS_REQUIRE_ZFS").is_none(),
             "TRUENAS_ROS_REQUIRE_ZFS is set but neither ACL dataset is ZFS"
         );
         found
@@ -6040,12 +5231,10 @@ mod zfs_setattr {
 
     /// A fresh folder anyone may enter under `ds`.
     fn fresh(ds: &Path, tag: &str) -> PathBuf {
-        let d =
-            ds.join(format!("rostest_setattr_{tag}_{}", std::process::id()));
+        let d = ds.join(format!("rostest_setattr_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir(&d).unwrap();
-        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
         d
     }
 
@@ -6054,20 +5243,13 @@ mod zfs_setattr {
         let p = dir.join(name);
         std::fs::write(&p, b"setattr").unwrap();
         std::os::unix::fs::chown(&p, Some(uid), Some(uid)).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode))
-            .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
         p
     }
 
-    /// `name` under `dir`, opened by root on the ring. `fsetxattr` asks
-    /// nothing of how a file was opened (`file_setxattr`, `fs/xattr.c`), so
-    /// the setter's checks are those of the identity it runs as.
-    fn ring_file(
-        h: &FsHandle,
-        me: Personality,
-        dir: &Path,
-        name: &str,
-    ) -> File {
+    /// `name` under `dir`, opened by root on the ring. `fsetxattr` asks nothing of how a file was opened
+    /// (`file_setxattr`, `fs/xattr.c`), so the setter's checks are those of the identity it runs as.
+    fn ring_file(h: &FsHandle, me: Personality, dir: &Path, name: &str) -> File {
         let anchor = Anchor::open(dir).unwrap();
         h.open(me, &anchor, name, rdonly()).expect("open")
     }
@@ -6090,9 +5272,7 @@ mod zfs_setattr {
         };
         let times = [ts(atime), ts(mtime)];
         // SAFETY: a valid NUL-terminated path and two timespecs.
-        let rc = unsafe {
-            libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0)
-        };
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
         assert_eq!(rc, 0, "utimensat {}", p.display());
     }
 
@@ -6100,13 +5280,11 @@ mod zfs_setattr {
         matches!(res, Err(Error::Errno(Errno::EPERM)))
     }
 
-    /// What the owner sets in one call is what chmod, utimensat and the
-    /// ioctl set on a twin, and the birth time is the one given.
+    /// What the owner sets in one call is what chmod, utimensat and the ioctl set on a twin, and the birth time is the
+    /// one given.
     #[test]
     fn the_owner_sets_what_chmod_utimensat_and_the_ioctl_set() {
-        if !root_or_skip(
-            "the_owner_sets_what_chmod_utimensat_and_the_ioctl_set",
-        ) {
+        if !root_or_skip("the_owner_sets_what_chmod_utimensat_and_the_ioctl_set") {
             return;
         }
         with_broker(|h, creds, me, _tmp| {
@@ -6131,17 +5309,11 @@ mod zfs_setattr {
                 res.expect("the owner's set");
 
                 // The twin, through the calls the setter stands for.
-                std::fs::set_permissions(
-                    &a,
-                    std::fs::Permissions::from_mode(0o640),
-                )
-                .unwrap();
+                std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o640)).unwrap();
                 utimens(&a, T1, T2);
                 let file = std::fs::File::open(&a).unwrap();
-                let want = (fget_zfs_attrs(file.as_fd()).unwrap()
-                    | ZfsAttr::HIDDEN
-                    | ZfsAttr::SYSTEM)
-                    - ZfsAttr::ARCHIVE;
+                let want =
+                    (fget_zfs_attrs(file.as_fd()).unwrap() | ZfsAttr::HIDDEN | ZfsAttr::SYSTEM) - ZfsAttr::ARCHIVE;
                 fset_zfs_attrs(file.as_fd(), want).unwrap();
 
                 let (sa, sb) = (stat(&a), stat(&b));
@@ -6162,10 +5334,9 @@ mod zfs_setattr {
         });
     }
 
-    /// Root sets the owner and group as chown does, which takes set-user-ID
-    /// from a file. With a mode in the same call set-user-ID goes too, as
-    /// `nfsd_sanitize_attrs` (`fs/nfsd/vfs.c`) clears it, since
-    /// `notify_change` cannot take a mode beside `ATTR_KILL_SUID`.
+    /// Root sets the owner and group as chown does, which takes set-user-ID from a file. With a mode in the same call
+    /// set-user-ID goes too, as `nfsd_sanitize_attrs` (`fs/nfsd/vfs.c`) clears it, since `notify_change` cannot take a
+    /// mode beside `ATTR_KILL_SUID`.
     #[test]
     fn root_sets_the_owner_as_chown_does() {
         if !root_or_skip("root_sets_the_owner_as_chown_does") {
@@ -6178,11 +5349,7 @@ mod zfs_setattr {
                 let b = owned(&dir, "setter", OWNER, 0o4755);
                 let c = owned(&dir, "with_mode", OWNER, 0o644);
                 let f = ring_file(&h, me, &dir, "setter");
-                let res = h.fset_attrs(
-                    me,
-                    &f,
-                    &ZfsSetattr::new().uid(OTHER).gid(GROUP),
-                );
+                let res = h.fset_attrs(me, &f, &ZfsSetattr::new().uid(OTHER).gid(GROUP));
                 h.close(f).unwrap();
                 if !handled(&res) {
                     std::fs::remove_dir_all(&dir).unwrap();
@@ -6200,9 +5367,7 @@ mod zfs_setattr {
                 assert_eq!(sb.mode() & 0o7777, 0o755, "{}", ds.display());
 
                 let f = ring_file(&h, me, &dir, "with_mode");
-                let set = ZfsSetattr::new()
-                    .uid(OTHER)
-                    .mode(Mode::from_bits_truncate(0o4755));
+                let set = ZfsSetattr::new().uid(OTHER).mode(Mode::from_bits_truncate(0o4755));
                 h.fset_attrs(me, &f, &set).expect("owner and mode");
                 h.close(f).unwrap();
                 let sc = stat(&c);
@@ -6212,10 +5377,8 @@ mod zfs_setattr {
         });
     }
 
-    /// Another user is refused what chmod, chown and utimensat refuse it,
-    /// and the ZFS attributes too, write permission or not, and a refused
-    /// call changes nothing. A touch, which write permission allows, goes
-    /// through.
+    /// Another user is refused what chmod, chown and utimensat refuse it, and the ZFS attributes too, write permission
+    /// or not, and a refused call changes nothing. A touch, which write permission allows, goes through.
     #[test]
     fn another_user_is_refused_what_the_owner_may_set() {
         if !root_or_skip("another_user_is_refused_what_the_owner_may_set") {
@@ -6229,23 +5392,14 @@ mod zfs_setattr {
                 let f = ring_file(h, me, &dir, "f");
                 let before = stat(&p);
                 let now = SetTime::Now;
-                let hidden =
-                    |s: ZfsSetattr| s.dos(ZfsAttr::HIDDEN, ZfsAttr::empty());
+                let hidden = |s: ZfsSetattr| s.dos(ZfsAttr::HIDDEN, ZfsAttr::empty());
                 let refused = [
                     ("mode", ZfsSetattr::new().mode(Mode::S_IRUSR)),
                     ("uid", ZfsSetattr::new().uid(OTHER)),
-                    (
-                        "times",
-                        ZfsSetattr::new()
-                            .atime(SetTime::At(T1))
-                            .mtime(SetTime::At(T2)),
-                    ),
+                    ("times", ZfsSetattr::new().atime(SetTime::At(T1)).mtime(SetTime::At(T2))),
                     ("btime", ZfsSetattr::new().btime(SetTime::At(T0))),
                     ("hidden", hidden(ZfsSetattr::new())),
-                    (
-                        "touch and hidden",
-                        hidden(ZfsSetattr::new().atime(now).mtime(now)),
-                    ),
+                    ("touch and hidden", hidden(ZfsSetattr::new().atime(now).mtime(now))),
                 ];
                 for (what, set) in refused {
                     let res = h.fset_attrs(other, &f, &set);
@@ -6257,25 +5411,12 @@ mod zfs_setattr {
                     assert!(eperm(&res), "{what} on {}: {res:?}", ds.display());
                 }
                 let after = stat(&p);
-                let seen = |s: &Statx| {
-                    (
-                        s.mode(),
-                        s.uid(),
-                        s.atime(),
-                        s.mtime(),
-                        s.btime(),
-                        s.ctime(),
-                    )
-                };
+                let seen = |s: &Statx| (s.mode(), s.uid(), s.atime(), s.mtime(), s.btime(), s.ctime());
                 assert_eq!(seen(&after), seen(&before), "{}", ds.display());
                 assert!(!dos(&p).contains(ZfsAttr::HIDDEN), "{}", ds.display());
 
-                h.fset_attrs(
-                    other,
-                    &f,
-                    &ZfsSetattr::new().atime(now).mtime(now),
-                )
-                .expect("a touch with write permission");
+                h.fset_attrs(other, &f, &ZfsSetattr::new().atime(now).mtime(now))
+                    .expect("a touch with write permission");
                 h.close(f).unwrap();
                 std::fs::remove_dir_all(&dir).unwrap();
             }
@@ -6283,15 +5424,13 @@ mod zfs_setattr {
         });
     }
 
-    /// An NFSv4 ACL that grants another user write attributes lets it set
-    /// readonly, hidden and system, but not nodump, which needs the owner,
-    /// nor the birth time, which needs the owner as any explicit time does.
+    /// An NFSv4 ACL that grants another user write attributes lets it set readonly, hidden and system, but not nodump,
+    /// which needs the owner, nor the birth time, which needs the owner as any explicit time does.
     #[cfg(feature = "acl")]
     #[test]
     fn write_attributes_from_an_nfsv4_acl_lets_another_user_set_dos_bits() {
         use truenas_ros::sync_fs::acl::{
-            Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag,
-            Nfs4Perm, Nfs4Who, fgetacl, fsetacl,
+            Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm, Nfs4Who, fgetacl, fsetacl,
         };
         if !root_or_skip("write_attributes_from_an_nfsv4_acl") {
             return;
@@ -6325,22 +5464,16 @@ mod zfs_setattr {
                     OTHER.into(),
                 ),
             );
-            let granted =
-                Acl::Nfs4(Nfs4Acl::from_aces(aces, Nfs4AclFlag::empty()));
+            let granted = Acl::Nfs4(Nfs4Acl::from_aces(aces, Nfs4AclFlag::empty()));
             fsetacl(file.as_fd(), Some(&granted)).expect("fsetacl");
 
             let f = ring_file(h, me, &dir, "f");
             let bits = ZfsAttr::READONLY | ZfsAttr::HIDDEN | ZfsAttr::SYSTEM;
-            let res = h.fset_attrs(
-                other,
-                &f,
-                &ZfsSetattr::new().dos(bits, ZfsAttr::empty()),
-            );
+            let res = h.fset_attrs(other, &f, &ZfsSetattr::new().dos(bits, ZfsAttr::empty()));
             if handled(&res) {
                 res.expect("write attributes from the ACL");
                 assert!(dos(&p).contains(bits));
-                let nodump =
-                    ZfsSetattr::new().dos(ZfsAttr::NODUMP, ZfsAttr::empty());
+                let nodump = ZfsSetattr::new().dos(ZfsAttr::NODUMP, ZfsAttr::empty());
                 assert!(eperm(&h.fset_attrs(other, &f, &nodump)));
                 let btime = ZfsSetattr::new().btime(SetTime::At(T0));
                 assert!(eperm(&h.fset_attrs(other, &f, &btime)));
@@ -6351,9 +5484,8 @@ mod zfs_setattr {
         });
     }
 
-    /// IMMUTABLE needs `CAP_LINUX_IMMUTABLE` beside the owner. Once it is
-    /// set the VFS refuses the setter itself (`may_write_xattr`,
-    /// `fs/xattr.c`), so only the ioctl clears it.
+    /// IMMUTABLE needs `CAP_LINUX_IMMUTABLE` beside the owner. Once it is set the VFS refuses the setter itself
+    /// (`may_write_xattr`, `fs/xattr.c`), so only the ioctl clears it.
     #[test]
     fn immutable_needs_cap_linux_immutable_and_only_the_ioctl_clears_it() {
         if !root_or_skip("immutable_needs_cap_linux_immutable") {
@@ -6361,10 +5493,8 @@ mod zfs_setattr {
         }
         with_broker(|h, creds, me, _tmp| {
             let owner = creds.register(&AsUser::new(OWNER, OWNER)).unwrap();
-            let lock =
-                ZfsSetattr::new().dos(ZfsAttr::IMMUTABLE, ZfsAttr::empty());
-            let unlock =
-                ZfsSetattr::new().dos(ZfsAttr::empty(), ZfsAttr::IMMUTABLE);
+            let lock = ZfsSetattr::new().dos(ZfsAttr::IMMUTABLE, ZfsAttr::empty());
+            let unlock = ZfsSetattr::new().dos(ZfsAttr::empty(), ZfsAttr::IMMUTABLE);
             for ds in datasets() {
                 let dir = fresh(&ds, "immutable");
                 let p = owned(&dir, "f", OWNER, 0o644);
@@ -6382,16 +5512,14 @@ mod zfs_setattr {
                 h.close(f).unwrap();
                 let file = std::fs::File::open(&p).unwrap();
                 let attrs = fget_zfs_attrs(file.as_fd()).unwrap();
-                fset_zfs_attrs(file.as_fd(), attrs - ZfsAttr::IMMUTABLE)
-                    .unwrap();
+                fset_zfs_attrs(file.as_fd(), attrs - ZfsAttr::IMMUTABLE).unwrap();
                 std::fs::remove_dir_all(&dir).unwrap();
             }
             creds.unregister(owner).unwrap();
         });
     }
 
-    /// The handler refuses with `EINVAL` a value it cannot apply, and one
-    /// of a version it does not know.
+    /// The handler refuses with `EINVAL` a value it cannot apply, and one of a version it does not know.
     #[test]
     fn the_handler_refuses_a_value_it_cannot_apply() {
         if !root_or_skip("the_handler_refuses_a_value_it_cannot_apply") {
@@ -6416,48 +5544,25 @@ mod zfs_setattr {
                     ("nothing to set", empty),
                     (
                         "a mask of no bits",
-                        h.fset_attrs(
-                            me,
-                            &f,
-                            &ZfsSetattr::new()
-                                .mode_masked(Mode::S_IRUSR, Mode::empty()),
-                        ),
+                        h.fset_attrs(me, &f, &ZfsSetattr::new().mode_masked(Mode::S_IRUSR, Mode::empty())),
                     ),
-                    (
-                        "uid u32::MAX",
-                        h.fset_attrs(me, &f, &ZfsSetattr::new().uid(u32::MAX)),
-                    ),
+                    ("uid u32::MAX", h.fset_attrs(me, &f, &ZfsSetattr::new().uid(u32::MAX))),
                     (
                         "a bit to set and to clear",
-                        h.fset_attrs(
-                            me,
-                            &f,
-                            &ZfsSetattr::new()
-                                .dos(ZfsAttr::HIDDEN, ZfsAttr::HIDDEN),
-                        ),
+                        h.fset_attrs(me, &f, &ZfsSetattr::new().dos(ZfsAttr::HIDDEN, ZfsAttr::HIDDEN)),
                     ),
                     (
                         "a second of nanoseconds",
-                        h.fset_attrs(
-                            me,
-                            &f,
-                            &ZfsSetattr::new().atime(SetTime::At(second)),
-                        ),
+                        h.fset_attrs(me, &f, &ZfsSetattr::new().atime(SetTime::At(second))),
                     ),
                 ];
                 for (what, res) in refused {
-                    assert!(
-                        matches!(res, Err(Error::Errno(Errno::EINVAL))),
-                        "{what}: {res:?}"
-                    );
+                    assert!(matches!(res, Err(Error::Errno(Errno::EINVAL))), "{what}: {res:?}");
                 }
                 let mut later = ZfsSetattr::new().uid(OWNER).to_bytes();
                 later[0] = 2;
                 let (res, _) = h.fsetxattr(me, &f, ZFS_SETATTR, later, 0);
-                assert!(
-                    matches!(res, Err(Error::Errno(Errno::EINVAL))),
-                    "{res:?}"
-                );
+                assert!(matches!(res, Err(Error::Errno(Errno::EINVAL))), "{res:?}");
                 h.close(f).unwrap();
                 std::fs::remove_dir_all(&dir).unwrap();
             }
@@ -6467,19 +5572,14 @@ mod zfs_setattr {
 
 /// The access mode, `O_NONBLOCK` and close on exec of the descriptor of `f`.
 fn fd_flags(f: &File) -> (i32, bool, bool) {
-    // SAFETY: `f` holds the descriptor open, and F_GETFL and F_GETFD only
-    // read its flags.
+    // SAFETY: `f` holds the descriptor open, and F_GETFL and F_GETFD only read its flags.
     let (fl, fd) = unsafe {
         (
             libc::fcntl(f.as_raw_fd(), libc::F_GETFL),
             libc::fcntl(f.as_raw_fd(), libc::F_GETFD),
         )
     };
-    assert!(
-        fl >= 0 && fd >= 0,
-        "fcntl: {}",
-        std::io::Error::last_os_error()
-    );
+    assert!(fl >= 0 && fd >= 0, "fcntl: {}", std::io::Error::last_os_error());
     (
         fl & libc::O_ACCMODE,
         fl & libc::O_NONBLOCK != 0,
@@ -6496,15 +5596,11 @@ fn errno_of<T>(res: &Result<T, Error>) -> Option<Errno> {
     }
 }
 
-/// `FsHandle::reopen_proc` opens a file held `O_PATH` again through
-/// `/proc/thread-self/fd` with the access asked, close on exec and with no
-/// `O_NONBLOCK` left by the guard, and the file system checks the
-/// personality. So nobody reads a file of mode 0644 but may not write it,
-/// and is refused at 0600, which the ring owner is not. The reopen skips the
-/// walk to the file, so a folder nobody may not search, which refuses the
-/// open by name, does not refuse it. A link held `O_PATH` with `O_NOFOLLOW`
-/// is reached itself and refused (`may_open` in `fs/namei.c`), and a FIFO
-/// answers at once.
+/// `FsHandle::reopen_proc` opens a file held `O_PATH` again through `/proc/thread-self/fd` with the access asked, close
+/// on exec and with no `O_NONBLOCK` left by the guard, and the file system checks the personality. So nobody reads a
+/// file of mode 0644 but may not write it, and is refused at 0600, which the ring owner is not. The reopen skips the
+/// walk to the file, so a folder nobody may not search, which refuses the open by name, does not refuse it. A link held
+/// `O_PATH` with `O_NOFOLLOW` is reached itself and refused (`may_open` in `fs/namei.c`), and a FIFO answers at once.
 #[test]
 fn reopen_proc_opens_a_held_file_again_as_the_personality() {
     if !root_or_skip("reopen_proc_opens_a_held_file_again_as_the_personality") {
@@ -6512,11 +5608,7 @@ fn reopen_proc_opens_a_held_file_again_as_the_personality() {
     }
     with_broker(|h, creds, me, dir| {
         let mode = |name: &str, bits: u32| {
-            std::fs::set_permissions(
-                dir.join(name),
-                std::fs::Permissions::from_mode(bits),
-            )
-            .unwrap();
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(bits)).unwrap();
         };
         std::fs::write(dir.join("f"), b"body").unwrap();
         mode("f", 0o644);
@@ -6547,9 +5639,7 @@ fn reopen_proc_opens_a_held_file_again_as_the_personality() {
         assert_eq!(&buf[..n.unwrap()], b"body");
         h.close(again).unwrap();
 
-        let nobody = creds
-            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
-            .unwrap();
+        let nobody = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
         let reopened = |who, f: &File, access| {
             let res = h.reopen_proc(who, f, access);
             let errno = errno_of(&res);
@@ -6590,17 +5680,13 @@ fn reopen_proc_opens_a_held_file_again_as_the_personality() {
     });
 }
 
-/// On a POSIX and an NFSv4 dataset `FsHandle::reopen_proc` allows and
-/// refuses what an open by name does, for the owner of a file of mode
-/// 0600, a reader an ACL entry grants reading, and a stranger, each for
-/// reading, writing and both. The owner may do all three, the reader read
-/// alone and the stranger nothing, so the two agree on refusals as well as
+/// On a POSIX and an NFSv4 dataset `FsHandle::reopen_proc` allows and refuses what an open by name does, for the owner
+/// of a file of mode 0600, a reader an ACL entry grants reading, and a stranger, each for reading, writing and both.
+/// The owner may do all three, the reader read alone and the stranger nothing, so the two agree on refusals as well as
 /// on grants.
 #[test]
 fn reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs() {
-    if !root_or_skip(
-        "reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs",
-    ) {
+    if !root_or_skip("reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs") {
         return; // the broker, the owners and the ACLs need privilege
     }
     const OWNER: u32 = 8_675_301;
@@ -6624,8 +5710,7 @@ fn reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs() {
         );
         return;
     }
-    // USER_OBJ rw, USER READER r, GROUP_OBJ nothing, MASK r and OTHER
-    // nothing, as `system.posix_acl_access` holds them.
+    // USER_OBJ rw, USER READER r, GROUP_OBJ nothing, MASK r and OTHER nothing, as `system.posix_acl_access` holds them.
     let posix: Vec<u8> = {
         let mut v = 2u32.to_le_bytes().to_vec();
         for (tag, perm, id) in [
@@ -6641,38 +5726,23 @@ fn reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs() {
         }
         v
     };
-    // OWNER@ is allowed everything, READER READ_DATA, READ_ATTRIBUTES,
-    // READ_ACL and SYNCHRONIZE, and EVERYONE@ the last three.
+    // OWNER@ is allowed everything, READER READ_DATA, READ_ATTRIBUTES, READ_ACL and SYNCHRONIZE, and EVERYONE@ the last
+    // three.
     let nfs4 = nfs4_xdr(&[
         [0, 0, 1, 0x1f_01ff, 1],
         [0, 0, 0, 0x12_0081, READER],
         [0, 0, 1, 0x12_0080, 3],
     ]);
     with_broker(|h, creds, me, _dir| {
-        let people = [OWNER, READER, STRANGER]
-            .map(|uid| (uid, creds.register(&AsUser::new(uid, uid)).unwrap()));
+        let people = [OWNER, READER, STRANGER].map(|uid| (uid, creds.register(&AsUser::new(uid, uid)).unwrap()));
         for (kind, ds) in &datasets {
-            let folder =
-                ds.join(format!("rostest_reopen_{}", std::process::id()));
+            let folder = ds.join(format!("rostest_reopen_{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&folder);
             std::fs::create_dir(&folder).unwrap();
-            std::fs::set_permissions(
-                &folder,
-                std::fs::Permissions::from_mode(0o777),
-            )
-            .unwrap();
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o777)).unwrap();
             std::fs::write(folder.join("f"), b"reopen").unwrap();
-            std::os::unix::fs::chown(
-                folder.join("f"),
-                Some(OWNER),
-                Some(OWNER),
-            )
-            .unwrap();
-            std::fs::set_permissions(
-                folder.join("f"),
-                std::fs::Permissions::from_mode(0o600),
-            )
-            .unwrap();
+            std::os::unix::fs::chown(folder.join("f"), Some(OWNER), Some(OWNER)).unwrap();
+            std::fs::set_permissions(folder.join("f"), std::fs::Permissions::from_mode(0o600)).unwrap();
             let anchor = Anchor::open(&folder).unwrap();
             let (name, acl) = match *kind {
                 "posix" => ("system.posix_acl_access", posix.clone()),
@@ -6683,9 +5753,7 @@ fn reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs() {
             let (set, _) = h.fsetxattr(me, &open, xattr_name(name), acl, 0);
             set.unwrap_or_else(|e| panic!("{kind}: root sets the ACL: {e}"));
             h.close(open).unwrap();
-            let held = h
-                .open(me, &anchor, "f", OpenHow::new().flags(OFlag::O_PATH))
-                .unwrap();
+            let held = h.open(me, &anchor, "f", OpenHow::new().flags(OFlag::O_PATH)).unwrap();
             for (uid, who) in people {
                 for (access, flags) in [
                     (ReopenAccess::Read, OFlag::O_RDONLY),
@@ -6697,8 +5765,7 @@ fn reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs() {
                     let again = h.reopen_proc(who, &held, access);
                     let case = format!("{kind} uid {uid} {access:?}");
                     assert_eq!(errno_of(&again), errno_of(&by_name), "{case}");
-                    let granted = uid == OWNER
-                        || (uid == READER && access == ReopenAccess::Read);
+                    let granted = uid == OWNER || (uid == READER && access == ReopenAccess::Read);
                     assert_eq!(again.is_ok(), granted, "{case}");
                     for file in [by_name, again].into_iter().flatten() {
                         h.close(file).unwrap();
@@ -6714,8 +5781,7 @@ fn reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs() {
     });
 }
 
-/// A path too long for the name an op slot holds, 255 bytes with its NUL,
-/// still opens, through a copy the op owns.
+/// A path too long for the name an op slot holds, 255 bytes with its NUL, still opens, through a copy the op owns.
 #[test]
 fn an_open_of_a_path_longer_than_the_slot_holds_still_opens() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -6733,12 +5799,10 @@ fn an_open_of_a_path_longer_than_the_slot_holds_still_opens() {
     });
 }
 
-/// `File::from_shared` makes a handle of the caller's own descriptor, with
-/// no `dup`: a read through it gives what was written, the number is the
-/// caller's, and the caller's clone is not the last while the handle lives
-/// and is once it drops, when `Arc::into_inner` gives the same descriptor.
-// Under `--cfg loom` the crate's `Arc` is loom's, which a std `Arc` is
-// not, and the loom lane runs no ring.
+/// `File::from_shared` makes a handle of the caller's own descriptor, with no `dup`: a read through it gives what was
+/// written, the number is the caller's, and the caller's clone is not the last while the handle lives and is once it
+/// drops, when `Arc::into_inner` gives the same descriptor.
+// Under `--cfg loom` the crate's `Arc` is loom's, which a std `Arc` is not, and the loom lane runs no ring.
 #[cfg(not(loom))]
 #[test]
 fn from_shared_reads_through_the_callers_descriptor() {
@@ -6764,10 +5828,9 @@ fn from_shared_reads_through_the_callers_descriptor() {
     });
 }
 
-/// `File::into_shared` gives back the very `Arc` its handle holds, so a
-/// caller keeps the reactor's `Arc` rather than a second one.
-// Under `--cfg loom` the crate's `Arc` is loom's, which a std `Arc` is
-// not, and the loom lane runs no ring.
+/// `File::into_shared` gives back the very `Arc` its handle holds, so a caller keeps the reactor's `Arc` rather than a
+/// second one.
+// Under `--cfg loom` the crate's `Arc` is loom's, which a std `Arc` is not, and the loom lane runs no ring.
 #[cfg(not(loom))]
 #[test]
 fn into_shared_gives_the_arc_the_file_holds() {
@@ -6781,9 +5844,8 @@ fn into_shared_gives_the_arc_the_file_holds() {
     });
 }
 
-/// `File::into_fd` gives the same `File` back while a clone holds it, and
-/// once the clone drops takes out the same descriptor, which then writes
-/// and reads as a `std::fs::File` the caller owns.
+/// `File::into_fd` gives the same `File` back while a clone holds it, and once the clone drops takes out the same
+/// descriptor, which then writes and reads as a `std::fs::File` the caller owns.
 #[test]
 fn into_fd_takes_the_descriptor_only_when_nothing_else_holds_it() {
     use std::io::{Read, Seek, SeekFrom, Write};

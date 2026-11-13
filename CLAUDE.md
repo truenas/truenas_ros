@@ -686,6 +686,10 @@ Cite sources rather than asserting behaviour: kernel and ZFS claims are
 checked against `/CODE/linux` and `/CODE/zfs` and cited by function or
 `file:line`.
 
+Code and comments wrap at 120 columns, and Markdown at 80. `rustfmt.toml`
+sets the width for code, and a comment is filled to it by hand, since
+rustfmt leaves comments as they are.
+
 ## Splitting files
 
 A file past 1,500 lines is split, tests and code alike, in a commit of its

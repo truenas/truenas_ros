@@ -2,16 +2,13 @@
 
 //! Fuzz the decoder of the bytes a read of a fanotify group returns.
 //!
-//! `parse` walks events by their `event_len`, the info records of each by
-//! their `len`, and a FID record by the `handle_bytes` of its file handle and
-//! the NUL that ends its name. Every one of those lengths comes from the
-//! buffer, so the properties are that each slice handed back lies inside the
-//! input, that an error ends its iteration, and that every step consumes
-//! bytes, so the walk always ends.
+//! `parse` walks events by their `event_len`, the info records of each by their `len`, and a FID record by the
+//! `handle_bytes` of its file handle and the NUL that ends its name. Every one of those lengths comes from the buffer,
+//! so the properties are that each slice handed back lies inside the input, that an error ends its iteration, and that
+//! every step consumes bytes, so the walk always ends.
 //!
-//! Only the pure decoder is driven. `Fanotify::read` would adopt the
-//! descriptors the bytes name, which is sound only for bytes the kernel
-//! wrote.
+//! Only the pure decoder is driven. `Fanotify::read` would adopt the descriptors the bytes name, which is sound only
+//! for bytes the kernel wrote.
 
 use libfuzzer_sys::fuzz_target;
 use std::os::unix::ffi::OsStrExt;
@@ -42,10 +39,7 @@ fuzz_target!(|data: &[u8]| {
             assert!(records * 4 <= data.len());
             match info {
                 Err(_) => {
-                    assert!(
-                        infos.next().is_none(),
-                        "an error must end the records"
-                    );
+                    assert!(infos.next().is_none(), "an error must end the records");
                     break;
                 }
                 Ok(Info::Fid(fid)) => {

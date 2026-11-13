@@ -1,9 +1,8 @@
 //! The rich crate-level [`Error`] type.
 //!
-//! Low-level syscall wrappers return [`crate::errno::Result`] (a bare
-//! [`Errno`]). Higher-level APIs that can also fail validation, parsing, or
-//! traversal invariants return [`Result`] (this module's `Error`). `Errno`
-//! converts into `Error` via `From`, so `?` bridges the two layers.
+//! Low-level syscall wrappers return [`crate::errno::Result`] (a bare [`Errno`]). Higher-level APIs that can also fail
+//! validation, parsing, or traversal invariants return [`Result`] (this module's `Error`). `Errno` converts into
+//! `Error` via `From`, so `?` bridges the two layers.
 
 use crate::errno::Errno;
 use std::fmt;
@@ -20,16 +19,14 @@ pub enum Error {
     /// A raw syscall failure.
     Errno(Errno),
 
-    /// A precondition, range, or shape check failed (the analogue of Python's
-    /// `ValueError` / `TypeError`).
+    /// A precondition, range, or shape check failed (the analogue of Python's `ValueError` / `TypeError`).
     Validation(String),
 
     /// On-disk / wire data could not be parsed (e.g. a malformed ACL xattr).
     Parse(String),
 
-    /// A filesystem iterator could not be resumed from a saved directory
-    /// stack: the directory recorded at `depth` no longer exists or changed
-    /// inode.
+    /// A filesystem iterator could not be resumed from a saved directory stack: the directory recorded at `depth` no
+    /// longer exists or changed inode.
     IteratorRestore {
         /// Directory-stack depth (0-indexed) at which restoration failed.
         depth: usize,
@@ -37,8 +34,8 @@ pub enum Error {
         path: PathBuf,
     },
 
-    /// A filesystem iterator's root did not belong to the expected mount
-    /// source (its `statmount` `sb_source` did not match).
+    /// A filesystem iterator's root did not belong to the expected mount source (its `statmount` `sb_source` did not
+    /// match).
     MountSourceMismatch {
         /// The filesystem source name that was expected.
         expected: String,
@@ -48,24 +45,21 @@ pub enum Error {
         path: PathBuf,
     },
 
-    /// A symlink was encountered on a path opened with `RESOLVE_NO_SYMLINKS`
-    /// (the underlying `errno` is `ELOOP`).
+    /// A symlink was encountered on a path opened with `RESOLVE_NO_SYMLINKS` (the underlying `errno` is `ELOOP`).
     SymlinkInPath {
         /// The path that contained a symlink component.
         path: PathBuf,
     },
 
-    /// A path that must name a regular file named something else - a FIFO,
-    /// device, socket, or directory - whose stat size does not describe any
-    /// content to read. Distinct from [`Validation`](Error::Validation) so a
-    /// multi-file read can skip one unusable candidate without aborting.
+    /// A path that must name a regular file named something else - a FIFO, device, socket, or directory - whose stat
+    /// size does not describe any content to read. Distinct from [`Validation`](Error::Validation) so a multi-file read
+    /// can skip one unusable candidate without aborting.
     NotRegularFile {
         /// The path that is not a regular file.
         path: PathBuf,
     },
 
-    /// The kernel refused a `memfd_secret` page under `RLIMIT_MEMLOCK`,
-    /// a limit shared by every process of the user.
+    /// The kernel refused a `memfd_secret` page under `RLIMIT_MEMLOCK`, a limit shared by every process of the user.
     SecretMemRefused,
 }
 
@@ -81,16 +75,10 @@ impl fmt::Display for Error {
             Error::Errno(e) => write!(f, "{e}"),
             Error::Validation(msg) => write!(f, "invalid argument: {msg}"),
             Error::Parse(msg) => write!(f, "parse error: {msg}"),
-            Error::IteratorRestore { depth, path } => write!(
-                f,
-                "cannot restore iterator at depth {depth}: {}",
-                path.display()
-            ),
-            Error::MountSourceMismatch {
-                expected,
-                found,
-                path,
-            } => write!(
+            Error::IteratorRestore { depth, path } => {
+                write!(f, "cannot restore iterator at depth {depth}: {}", path.display())
+            }
+            Error::MountSourceMismatch { expected, found, path } => write!(
                 f,
                 "mount source mismatch at {}: expected {expected:?}, \
                  found {found:?}",
@@ -102,9 +90,7 @@ impl fmt::Display for Error {
             Error::NotRegularFile { path } => {
                 write!(f, "not a regular file: {}", path.display())
             }
-            Error::SecretMemRefused => {
-                f.write_str("secret memory refused under RLIMIT_MEMLOCK")
-            }
+            Error::SecretMemRefused => f.write_str("secret memory refused under RLIMIT_MEMLOCK"),
         }
     }
 }
@@ -122,9 +108,7 @@ impl From<Error> for io::Error {
     fn from(err: Error) -> Self {
         match err {
             Error::Errno(e) => e.into(),
-            Error::SymlinkInPath { .. } => {
-                io::Error::from_raw_os_error(libc::ELOOP)
-            }
+            Error::SymlinkInPath { .. } => io::Error::from_raw_os_error(libc::ELOOP),
             other => io::Error::new(io::ErrorKind::InvalidInput, other),
         }
     }

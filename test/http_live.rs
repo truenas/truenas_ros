@@ -1,22 +1,17 @@
-//! Integration tests for the `http` codec through the **real** reactor --
-//! live loopback TCP, exercising the full ring path (multishot accept ->
-//! recv-header -> the http framer -> recv/scan -> delivery -> handler ->
-//! serialize -> send -> keep-alive re-arm). The codec's unit tests drive
-//! `frame`/`step` as plain functions; these pin the seams only a socket can
-//! prove: the interim `100 Continue` flushing **before** the body is sent,
-//! farewell responses arriving as bytes before FIN (never a slam), buffer
-//! accumulate/consume across requests on one connection, and the owned-body
+//! Integration tests for the `http` codec through the **real** reactor -- live loopback TCP, exercising the full ring
+//! path (multishot accept -> recv-header -> the http framer -> recv/scan -> delivery -> handler -> serialize -> send ->
+//! keep-alive re-arm). The codec's unit tests drive `frame`/`step` as plain functions; these pin the seams only a
+//! socket can prove: the interim `100 Continue` flushing **before** the body is sent, farewell responses arriving as
+//! bytes before FIN (never a slam), buffer accumulate/consume across requests on one connection, and the owned-body
 //! handoff a large chunked dance takes.
 //!
-//! Like `test/net_server.rs`, these **skip** (return early) when io_uring is
-//! unavailable - the CI/dev sandbox blocks the io_uring syscalls
-//! (ENOSYS/EPERM/EACCES), so `cargo test` stays green in a bare sandbox. Set
-//! `TRUENAS_ROS_REQUIRE_IO_URING=1` (as CI on a real kernel does) to turn a
-//! skip into a hard failure so coverage can't silently vanish.
+//! Like `test/net_server.rs`, these **skip** (return early) when io_uring is unavailable - the CI/dev sandbox blocks
+//! the io_uring syscalls (ENOSYS/EPERM/EACCES), so `cargo test` stays green in a bare sandbox. Set
+//! `TRUENAS_ROS_REQUIRE_IO_URING=1` (as CI on a real kernel does) to turn a skip into a hard failure so coverage can't
+//! silently vanish.
 //!
-//! `Server` is `!Send` (its ring is single-thread-owned), so it stays on the
-//! test thread running `serve_forever`; the client runs on a spawned thread
-//! and stops the server via the `Send` [`ShutdownHandle`] when done.
+//! `Server` is `!Send` (its ring is single-thread-owned), so it stays on the test thread running `serve_forever`; the
+//! client runs on a spawned thread and stops the server via the `Send` [`ShutdownHandle`] when done.
 #![cfg(all(target_os = "linux", feature = "http"))]
 
 use std::io::{self, Read, Write};
@@ -30,18 +25,14 @@ use truenas_ros::{Errno, Error};
 
 /// Errors that mean "io_uring is unavailable here" - an environmental skip.
 ///
-/// Deliberately *excludes* `EINVAL`: for io_uring that means the kernel
-/// rejected our setup arguments - a real bug we want to fail on, not skip.
+/// Deliberately *excludes* `EINVAL`: for io_uring that means the kernel rejected our setup arguments - a real bug we
+/// want to fail on, not skip.
 fn is_unavailable(e: &Error) -> bool {
     matches!(
         e,
-        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded
-        // box exhausts it and ring creation fails - environmental, and
-        // the REQUIRE variable turns the skip red where it must not
-        // happen.
-        Error::Errno(
-            Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM
-        )
+        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded box exhausts it and ring creation fails -
+        // environmental, and the REQUIRE variable turns the skip red where it must not happen.
+        Error::Errno(Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM)
     )
 }
 
@@ -87,63 +78,49 @@ fn connect_tcp(addr: SocketAddrV4) -> io::Result<TcpStream> {
 
 /// The shared echo handler behind [`with_http_server`] and
 /// [`with_ktls_http_server`]: `GET /hi` answers `hello`; `GET /big` the
-/// 6 MiB patterned owned body ([`big_body`]); `GET /canned` a `'static`
-/// body (served from a borrowed reply segment); `HEAD /sized` a bare 200
-/// declaring `Content-Length: 4096` with no bytes in hand (the HeadObject
-/// shape); `PUT /echo` answers the request body verbatim, with the surfaced
-/// trailer names joined into an `x-trailers` response header (so a client
+/// 6 MiB patterned owned body ([`big_body`]); `GET /canned` a `'static` body (served from a borrowed reply segment);
+/// `HEAD /sized` a bare 200 declaring `Content-Length: 4096` with no bytes in hand (the HeadObject shape); `PUT /echo`
+/// answers the request body verbatim, with the surfaced trailer names joined into an `x-trailers` response header (so a
+/// client
 /// can assert exactly which trailers reached [`HttpRequest::trailers`]);
 /// other `HEAD` requests answer like GET (the codec elides the body);
 /// anything else is a 404.
 fn echo_handler(mut req: HttpRequest<'_>, _: &mut ()) -> HttpResponse {
     match (req.method, req.target) {
-        ("GET", "/hi") | ("HEAD", "/hi") => {
-            HttpResponse::new(200).body("hello")
-        }
+        ("GET", "/hi") | ("HEAD", "/hi") => HttpResponse::new(200).body("hello"),
         ("GET", "/big") => HttpResponse::new(200).body(big_body()),
         ("GET", "/canned") => HttpResponse::new(200).body(CANNED),
         ("HEAD", "/sized") => HttpResponse::new(200).head_content_length(4096),
         ("PUT", "/echo") => {
-            let names: Vec<&str> =
-                req.trailers.iter().map(|t| t.name).collect();
+            let names: Vec<&str> = req.trailers.iter().map(|t| t.name).collect();
             let body = req.body.take();
-            HttpResponse::new(200)
-                .header("x-trailers", names.join(","))
-                .body(body)
+            HttpResponse::new(200).header("x-trailers", names.join(",")).body(body)
         }
         _ => HttpResponse::new(404).body("not found\n"),
     }
 }
 
-/// A canned `'static` reply body - served from a borrowed segment, the path
-/// a real handler's fixed error/health bodies take.
+/// A canned `'static` reply body - served from a borrowed segment, the path a real handler's fixed error/health bodies
+/// take.
 const CANNED: &str = "a canned static body, sent by reference";
 
-/// A 6 MiB body, sized so a stalled reader forces a short send completion:
-/// above what the kernel will buffer for a peer that isn't reading --
-/// `tcp_wmem[2]` caps the send buffer at 4 MiB by default, and a stalled
-/// reader's window stays near `tcp_rmem[1]` - and below the server's 8 MiB
-/// `max_send_backlog`, so the reply is admissible. Patterned (not constant)
-/// so truncation, reordering, or a send-cursor slip shows up as a byte
-/// mismatch rather than a length that happens to agree.
+/// A 6 MiB body, sized so a stalled reader forces a short send completion: above what the kernel will buffer for a peer
+/// that isn't reading -- `tcp_wmem[2]` caps the send buffer at 4 MiB by default, and a stalled reader's window stays
+/// near `tcp_rmem[1]` - and below the server's 8 MiB `max_send_backlog`, so the reply is admissible. Patterned (not
+/// constant) so truncation, reordering, or a send-cursor slip shows up as a byte mismatch rather than a length that
+/// happens to agree.
 fn big_body() -> Vec<u8> {
     (0..6 * 1024 * 1024).map(|i| (i % 251) as u8).collect()
 }
 
-/// Bind an http server with the shared [`echo_handler`], run the client
-/// closure against its address on a spawned thread, and serve until the
-/// client stops it. `None` means io_uring is unavailable (the caller
-/// returns - a skip).
+/// Bind an http server with the shared [`echo_handler`], run the client closure against its address on a spawned
+/// thread, and serve until the client stops it. `None` means io_uring is unavailable (the caller returns - a skip).
 fn with_http_server<T: Send + 'static>(
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
 ) -> Option<T> {
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let proto = protocol(
-        HttpConfig::default(),
-        |_inc: Incoming<'_>| Some(()),
-        echo_handler,
-    )
-    .expect("codec config is valid");
+    let proto =
+        protocol(HttpConfig::default(), |_inc: Incoming<'_>| Some(()), echo_handler).expect("codec config is valid");
     let mut server = match Server::bind([addr], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return None,
@@ -163,19 +140,14 @@ fn with_http_server<T: Send + 'static>(
     Some(join.join().expect("client thread").expect("client io"))
 }
 
-/// [`with_http_server`] with the server's tuning spelled out - for the
-/// tests whose subject IS a clock or a bound.
+/// [`with_http_server`] with the server's tuning spelled out - for the tests whose subject IS a clock or a bound.
 fn with_http_server_cfg<T: Send + 'static>(
     cfg: truenas_ros::net::server::ServerConfig,
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
 ) -> Option<T> {
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let proto = protocol(
-        HttpConfig::default(),
-        |_inc: Incoming<'_>| Some(()),
-        echo_handler,
-    )
-    .expect("codec config is valid");
+    let proto =
+        protocol(HttpConfig::default(), |_inc: Incoming<'_>| Some(()), echo_handler).expect("codec config is valid");
     let mut server = match Server::with_config([addr], cfg, proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return None,
@@ -195,18 +167,14 @@ fn with_http_server_cfg<T: Send + 'static>(
     Some(join.join().expect("client thread").expect("client io"))
 }
 
-/// Read one response head off the stream, byte-by-byte to its CRLFCRLF (no
-/// over-read - the connection may carry more). Returns `(status, head
-/// text)`; any body is left unread (a HEAD answer has none to read).
+/// Read one response head off the stream, byte-by-byte to its CRLFCRLF (no over-read - the connection may carry more).
+/// Returns `(status, head text)`; any body is left unread (a HEAD answer has none to read).
 fn read_head<R: Read>(s: &mut R) -> io::Result<(u16, String)> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
         if s.read(&mut byte)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "eof inside response head",
-            ));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof inside response head"));
         }
         head.push(byte[0]);
         assert!(head.len() <= 64 * 1024, "unterminated response head");
@@ -221,8 +189,8 @@ fn read_head<R: Read>(s: &mut R) -> io::Result<(u16, String)> {
     Ok((status, head))
 }
 
-/// Read one HTTP response off the stream: the head ([`read_head`]), then
-/// exactly `Content-Length` body bytes. Returns `(status, head text, body)`.
+/// Read one HTTP response off the stream: the head ([`read_head`]), then exactly `Content-Length` body bytes. Returns
+/// `(status, head text, body)`.
 fn read_response<R: Read>(s: &mut R) -> io::Result<(u16, String, Vec<u8>)> {
     let (status, head) = read_head(s)?;
     let len: usize = head
@@ -244,8 +212,8 @@ fn assert_eof<R: Read>(s: &mut R) -> io::Result<()> {
 
 #[test]
 fn get_keepalive_then_close() {
-    // Two GETs on one connection prove accumulate/consume re-arms; a third
-    // with `Connection: close` gets its response and then a clean FIN.
+    // Two GETs on one connection prove accumulate/consume re-arms; a third with `Connection: close` gets its response
+    // and then a clean FIN.
     let Some(()) = with_http_server(|v4| {
         let mut s = connect_tcp(v4)?;
         for _ in 0..2 {
@@ -256,9 +224,7 @@ fn get_keepalive_then_close() {
             assert!(!head.contains("\r\nConnection:"), "keep-alive is bare");
             assert_eq!(body, b"hello");
         }
-        s.write_all(
-            b"GET /hi HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
-        )?;
+        s.write_all(b"GET /hi HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")?;
         let (status, head, body) = read_response(&mut s)?;
         assert_eq!(status, 200);
         assert!(head.contains("\r\nConnection: close\r\n"));
@@ -272,9 +238,8 @@ fn get_keepalive_then_close() {
 
 #[test]
 fn content_length_put_roundtrips() {
-    // A small body (inline delivery) and a 100 KiB body (placed - at the
-    // default 64 KiB threshold the reactor reads it into its own
-    // allocation) both reach the handler intact and echo back.
+    // A small body (inline delivery) and a 100 KiB body (placed - at the default 64 KiB threshold the reactor reads it
+    // into its own allocation) both reach the handler intact and echo back.
     let Some(()) = with_http_server(|v4| {
         let mut s = connect_tcp(v4)?;
         for body in [b"hello".to_vec(), vec![b'B'; 100 * 1024]] {
@@ -307,8 +272,8 @@ fn chunked_put_and_trailers() {
         assert_eq!(status, 200);
         assert!(head.contains("\r\nx-trailers: \r\n"), "no trailers");
         assert_eq!(body, b"foobars");
-        // A genuine trailer is surfaced; a forbidden one (Content-Length,
-        // RFC 9110 sec. 6.5.1's framing set) is consumed but never shown.
+        // A genuine trailer is surfaced; a forbidden one (Content-Length, RFC 9110 sec. 6.5.1's framing set) is
+        // consumed but never shown.
         s.write_all(
             b"PUT /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n\
               3\r\nabc\r\n0\r\nContent-Length: 9\r\nx-amz-checksum-crc32: ok==\r\n\r\n",
@@ -328,15 +293,12 @@ fn chunked_put_and_trailers() {
 
 #[test]
 fn expect_dance_flushes_interim_before_body() {
-    // The ordering only a socket can prove: the client sends the head
-    // alone and BLOCKS reading the interim - if the codec didn't flush
-    // `100 Continue` before seeing any body byte, this read would hang
-    // (and fail on the 10s timeout). Only then is the body sent.
+    // The ordering only a socket can prove: the client sends the head alone and BLOCKS reading the interim - if the
+    // codec didn't flush `100 Continue` before seeing any body byte, this read would hang (and fail on the 10s
+    // timeout). Only then is the body sent.
     let Some(()) = with_http_server(|v4| {
         let mut s = connect_tcp(v4)?;
-        s.write_all(
-            b"PUT /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n",
-        )?;
+        s.write_all(b"PUT /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n")?;
         let mut interim = [0u8; 25];
         s.read_exact(&mut interim)?;
         assert_eq!(&interim[..], b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -352,12 +314,10 @@ fn expect_dance_flushes_interim_before_body() {
 
 #[test]
 fn botocore_golden_streaming_put() {
-    // The default boto3-over-TLS PutObject shape, byte-for-byte as captured
-    // on the dev box (boto3 1.37.9): Expect + TE chunked, one HTTP chunk
-    // wrapping the aws-chunked entity, checksum trailer *inside* the
-    // entity, bare HTTP terminator. The codec de-chunks its own layer only
-    // -- the aws-chunked entity must reach the handler untouched, and no
-    // HTTP trailers exist.
+    // The default boto3-over-TLS PutObject shape, byte-for-byte as captured on the dev box (boto3 1.37.9): Expect + TE
+    // chunked, one HTTP chunk wrapping the aws-chunked entity, checksum trailer *inside* the entity, bare HTTP
+    // terminator. The codec de-chunks its own layer only -- the aws-chunked entity must reach the handler untouched,
+    // and no HTTP trailers exist.
     let Some(()) = with_http_server(|v4| {
         let mut s = connect_tcp(v4)?;
         s.write_all(
@@ -376,17 +336,13 @@ fn botocore_golden_streaming_put() {
 
         let mut wire = b"8e\r\n64\r\n".to_vec();
         wire.extend_from_slice(&[b'A'; 100]);
-        wire.extend_from_slice(
-            b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n\r\n0\r\n\r\n",
-        );
+        wire.extend_from_slice(b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n\r\n0\r\n\r\n");
         assert_eq!(wire.len(), 153);
         s.write_all(&wire)?;
 
         let mut entity = b"64\r\n".to_vec();
         entity.extend_from_slice(&[b'A'; 100]);
-        entity.extend_from_slice(
-            b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n",
-        );
+        entity.extend_from_slice(b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n");
         let (status, head, body) = read_response(&mut s)?;
         assert_eq!(status, 200);
         assert!(head.contains("\r\nx-trailers: \r\n"), "no HTTP trailers");
@@ -399,9 +355,8 @@ fn botocore_golden_streaming_put() {
 
 #[test]
 fn farewells_are_real_responses() {
-    // A failed connection gets a real HTTP response and then a clean FIN --
-    // never a bare slam. Each case is its own connection; read_to_end
-    // terminates because the server flush-closes.
+    // A failed connection gets a real HTTP response and then a clean FIN -- never a bare slam. Each case is its own
+    // connection; read_to_end terminates because the server flush-closes.
     let Some(()) = with_http_server(|v4| {
         // Malformed head: 400 with the diagnostic body.
         let mut s = connect_tcp(v4)?;
@@ -413,9 +368,8 @@ fn farewells_are_real_responses() {
         assert!(text.contains("\r\nConnection: close\r\n"));
         assert!(text.ends_with("error 400\n"));
 
-        // A head that outruns the 16 KiB cap: 431. Sent in one write so
-        // the reactor consumes every byte before the verdict (no unread
-        // tail to turn the close into an RST).
+        // A head that outruns the 16 KiB cap: 431. Sent in one write so the reactor consumes every byte before the
+        // verdict (no unread tail to turn the close into an RST).
         let mut s = connect_tcp(v4)?;
         let mut req = b"GET / HTTP/1.1\r\nHost: t\r\nX-Pad: ".to_vec();
         req.extend(std::iter::repeat_n(b'a', 17 * 1024));
@@ -425,12 +379,10 @@ fn farewells_are_real_responses() {
         let text = String::from_utf8_lossy(&all);
         assert!(text.starts_with("HTTP/1.1 431 "), "{text}");
 
-        // A dying HEAD: the status and Content-Length arrive, the body is
-        // elided (a HEAD response must not carry content).
+        // A dying HEAD: the status and Content-Length arrive, the body is elided (a HEAD response must not carry
+        // content).
         let mut s = connect_tcp(v4)?;
-        s.write_all(
-            b"HEAD /hi HTTP/1.1\r\nHost: t\r\nContent-Length: 99999999999\r\n\r\n",
-        )?;
+        s.write_all(b"HEAD /hi HTTP/1.1\r\nHost: t\r\nContent-Length: 99999999999\r\n\r\n")?;
         let mut all = Vec::new();
         s.read_to_end(&mut all)?;
         let text = String::from_utf8_lossy(&all);
@@ -445,17 +397,13 @@ fn farewells_are_real_responses() {
 
 #[test]
 fn large_chunked_dance_takes_the_handoff_path() {
-    // A 100 KiB single-chunk dance body: over the 64 KiB placement
-    // threshold, delivered body-only, so the reactor hands its buffer to
-    // the codec and the entity is de-chunked in place (the owned-body
-    // path). Content equality end to end is the live proof; the zero-copy
-    // pointer identity is pinned by the unit tests.
+    // A 100 KiB single-chunk dance body: over the 64 KiB placement threshold, delivered body-only, so the reactor hands
+    // its buffer to the codec and the entity is de-chunked in place (the owned-body path). Content equality end to end
+    // is the live proof; the zero-copy pointer identity is pinned by the unit tests.
     let Some(()) = with_http_server(|v4| {
         let payload = vec![b'C'; 100 * 1024];
         let mut s = connect_tcp(v4)?;
-        s.write_all(
-            b"PUT /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n",
-        )?;
+        s.write_all(b"PUT /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n")?;
         let mut interim = [0u8; 25];
         s.read_exact(&mut interim)?;
         assert_eq!(&interim[..], b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -472,8 +420,8 @@ fn large_chunked_dance_takes_the_handoff_path() {
     };
 }
 
-/// Bind a **deferrable** http server: `/warm` parks on a cold shared cache
-/// and a worker warms it then redrives; `/deadline` parks and the worker
+/// Bind a **deferrable** http server: `/warm` parks on a cold shared cache and a worker warms it then redrives;
+/// `/deadline` parks and the worker
 /// replies 503 directly; `/drop` parks and the worker drops the handle;
 /// `/hi` answers inline. `None` means io_uring is unavailable (a skip).
 fn with_parking_server<T: Send + 'static>(
@@ -486,15 +434,13 @@ fn with_parking_server<T: Send + 'static>(
     let cache = Arc::new(AtomicBool::new(false));
     let handler = move |req: HttpRequest<'_>, _: &mut ()| {
         match (req.method, req.target) {
-            ("GET", "/hi") => {
-                HttpVerdict::Respond(HttpResponse::new(200).body("hello"))
-            }
+            ("GET", "/hi") => HttpVerdict::Respond(HttpResponse::new(200).body("hello")),
             ("GET", "/warm") => {
                 if cache.load(Ordering::Acquire) {
                     HttpVerdict::Respond(HttpResponse::new(200).body("warm"))
                 } else {
-                    // Cold: park, warm the cache off-thread, redrive. The
-                    // second invocation takes the inline path above.
+                    // Cold: park, warm the cache off-thread, redrive. The second invocation takes the inline path
+                    // above.
                     let (deferred, permit) = req.defer();
                     let cache = Arc::clone(&cache);
                     thread::spawn(move || {
@@ -506,22 +452,17 @@ fn with_parking_server<T: Send + 'static>(
                 }
             }
             ("GET", "/deadline") => {
-                // The worker misses its deadline and answers 503 itself --
-                // built off-thread, serialized on the server thread.
+                // The worker misses its deadline and answers 503 itself -- built off-thread, serialized on the server
+                // thread.
                 let (deferred, permit) = req.defer();
                 thread::spawn(move || {
                     thread::sleep(Duration::from_millis(10));
-                    deferred.reply(
-                        HttpResponse::new(503)
-                            .header("retry-after", "1")
-                            .body("slow down\n"),
-                    );
+                    deferred.reply(HttpResponse::new(503).header("retry-after", "1").body("slow down\n"));
                 });
                 HttpVerdict::Defer(permit)
             }
             ("GET", "/drop") => {
-                // A lost worker: the dropped handle must close the parked
-                // connection rather than leak its slot.
+                // A lost worker: the dropped handle must close the parked connection rather than leak its slot.
                 let (deferred, permit) = req.defer();
                 thread::spawn(move || {
                     thread::sleep(Duration::from_millis(10));
@@ -533,12 +474,8 @@ fn with_parking_server<T: Send + 'static>(
         }
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let proto = protocol_deferrable(
-        HttpConfig::default(),
-        |_inc: Incoming<'_>| Some(()),
-        handler,
-    )
-    .expect("codec config is valid");
+    let proto = protocol_deferrable(HttpConfig::default(), |_inc: Incoming<'_>| Some(()), handler)
+        .expect("codec config is valid");
     let mut server = match Server::bind([addr], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return None,
@@ -558,21 +495,17 @@ fn with_parking_server<T: Send + 'static>(
     Some(join.join().expect("client thread").expect("client io"))
 }
 
-/// Every reply written during a drain says `Connection: close`: the drain
-/// closes the connection once the reply is out and admits no further request
-/// on it, so the peer must not reuse it. Here the reply is a worker's, for a
-/// request parked before the drain began (the idle connection's EOF marks
-/// that moment), and a second request pipelined behind it is dropped with
-/// the close rather than answered.
+/// Every reply written during a drain says `Connection: close`: the drain closes the connection once the reply is out
+/// and admits no further request on it, so the peer must not reuse it. Here the reply is a worker's, for a request
+/// parked before the drain began (the idle connection's EOF marks that moment), and a second request pipelined behind
+/// it is dropped with the close rather than answered.
 #[test]
 fn replies_during_drain_say_connection_close() {
     use std::sync::mpsc;
     use truenas_ros::http::{HttpDeferred, HttpVerdict, protocol_deferrable};
 
     let (park_tx, park_rx) = mpsc::channel::<HttpDeferred>();
-    let handler = move |req: HttpRequest<'_>, _: &mut ()| match (
-        req.method, req.target,
-    ) {
+    let handler = move |req: HttpRequest<'_>, _: &mut ()| match (req.method, req.target) {
         ("GET", "/park") => {
             let (deferred, permit) = req.defer();
             park_tx.send(deferred).expect("the test holds the receiver");
@@ -581,12 +514,8 @@ fn replies_during_drain_say_connection_close() {
         _ => HttpVerdict::Respond(HttpResponse::new(200).body("hello")),
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let proto = protocol_deferrable(
-        HttpConfig::default(),
-        |_inc: Incoming<'_>| Some(()),
-        handler,
-    )
-    .expect("codec config is valid");
+    let proto = protocol_deferrable(HttpConfig::default(), |_inc: Incoming<'_>| Some(()), handler)
+        .expect("codec config is valid");
     let mut server = match Server::bind([addr], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
@@ -632,18 +561,15 @@ fn replies_during_drain_say_connection_close() {
     join.join().expect("client thread").expect("client io");
 }
 
-/// The handler that starts the drain still says close on its own reply:
-/// the flag is read after the handler returns, not before it runs, so an
-/// admin shutdown endpoint does not answer keep-alive and then vanish.
+/// The handler that starts the drain still says close on its own reply: the flag is read after the handler returns, not
+/// before it runs, so an admin shutdown endpoint does not answer keep-alive and then vanish.
 #[test]
 fn a_handler_that_starts_the_drain_still_says_close() {
     use std::sync::{Arc, OnceLock};
 
     let stop_cell: Arc<OnceLock<ShutdownHandle>> = Arc::new(OnceLock::new());
     let in_handler = Arc::clone(&stop_cell);
-    let handler = move |req: HttpRequest<'_>, _: &mut ()| match (
-        req.method, req.target,
-    ) {
+    let handler = move |req: HttpRequest<'_>, _: &mut ()| match (req.method, req.target) {
         ("POST", "/shutdown") => {
             in_handler
                 .get()
@@ -654,12 +580,7 @@ fn a_handler_that_starts_the_drain_still_says_close() {
         _ => HttpResponse::new(200).body("hello"),
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let proto = protocol(
-        HttpConfig::default(),
-        |_inc: Incoming<'_>| Some(()),
-        handler,
-    )
-    .expect("codec config is valid");
+    let proto = protocol(HttpConfig::default(), |_inc: Incoming<'_>| Some(()), handler).expect("codec config is valid");
     let mut server = match Server::bind([addr], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
@@ -694,9 +615,8 @@ fn a_handler_that_starts_the_drain_still_says_close() {
 
 #[test]
 fn park_redrive_completes_in_one_round_trip() {
-    // The cold-miss pattern end to end: the first request parks while the
-    // worker warms the cache, then redrives - ONE write, ONE response, no
-    // error leg. The second request takes the warm inline path.
+    // The cold-miss pattern end to end: the first request parks while the worker warms the cache, then redrives - ONE
+    // write, ONE response, no error leg. The second request takes the warm inline path.
     let Some(()) = with_parking_server(|v4| {
         let mut s = connect_tcp(v4)?;
         s.write_all(b"GET /warm HTTP/1.1\r\nHost: t\r\n\r\n")?;
@@ -715,8 +635,8 @@ fn park_redrive_completes_in_one_round_trip() {
 
 #[test]
 fn worker_reply_answers_and_keeps_alive() {
-    // A worker-built 503 serializes on the server thread with the request's
-    // head facts, and the connection keeps serving afterward.
+    // A worker-built 503 serializes on the server thread with the request's head facts, and the connection keeps
+    // serving afterward.
     let Some(()) = with_parking_server(|v4| {
         let mut s = connect_tcp(v4)?;
         s.write_all(b"GET /deadline HTTP/1.1\r\nHost: t\r\n\r\n")?;
@@ -736,8 +656,7 @@ fn worker_reply_answers_and_keeps_alive() {
 
 #[test]
 fn dropped_handle_closes_the_parked_connection() {
-    // No response bytes, just a close - the drop path cannot leak the slot
-    // and must not invent a reply.
+    // No response bytes, just a close - the drop path cannot leak the slot and must not invent a reply.
     let Some(()) = with_parking_server(|v4| {
         let mut s = connect_tcp(v4)?;
         s.write_all(b"GET /drop HTTP/1.1\r\nHost: t\r\n\r\n")?;
@@ -754,10 +673,8 @@ fn dropped_handle_closes_the_parked_connection() {
 
 #[test]
 fn pipelined_requests_answer_in_order_across_a_park() {
-    // Two pipelined requests where the FIRST parks: the parked one must
-    // answer first - the codec holds the second back for the park's
-    // duration, so a later request can never be answered around an earlier
-    // parked one.
+    // Two pipelined requests where the FIRST parks: the parked one must answer first - the codec holds the second back
+    // for the park's duration, so a later request can never be answered around an earlier parked one.
     let Some(()) = with_parking_server(|v4| {
         let mut s = connect_tcp(v4)?;
         s.write_all(
@@ -776,10 +693,9 @@ fn pipelined_requests_answer_in_order_across_a_park() {
 
 #[test]
 fn head_declared_length_reaches_the_wire_bodiless() {
-    // HeadObject's live shape: a 200 HEAD answer declares the paired GET's
-    // Content-Length while sending no body bytes - and the connection stays
-    // framed, proven by a follow-up GET answering on the same connection
-    // (any stray body byte would land inside the GET's status line).
+    // HeadObject's live shape: a 200 HEAD answer declares the paired GET's Content-Length while sending no body bytes -
+    // and the connection stays framed, proven by a follow-up GET answering on the same connection (any stray body byte
+    // would land inside the GET's status line).
     let Some(()) = with_http_server(|v4| {
         let mut s = connect_tcp(v4)?;
         s.write_all(b"HEAD /sized HTTP/1.1\r\nHost: t\r\n\r\n")?;
@@ -798,16 +714,12 @@ fn head_declared_length_reaches_the_wire_bodiless() {
 
 // ---- the codec over kernel TLS (kTLS) -----------------------------------
 //
-// The transport S3 ships on. Everything above proves the codec over plain
-// TCP; these prove the same seams over the kernel-TLS transport, whose send
-// path is structurally different: a plain send carries MSG_WAITALL (the
-// kernel flushes the whole gather, one full-length CQE), but the kernel TLS
-// sendmsg rejects that flag (`submit_send`, src/net/core/reactor/io.rs), so
-// a bodied kTLS reply is a multi-iovec SENDMSG that blocks on an io-wq
-// worker until the peer drains it - and only `send_timeout`'s linked
-// timeout interrupts it, surfacing a partial completion the reactor's
-// re-submit path must carry. Scaffolding shared with `test/net_server.rs` --
-// see `test/support/ktls.rs`.
+// The transport S3 ships on. Everything above proves the codec over plain TCP; these prove the same seams over the
+// kernel-TLS transport, whose send path is structurally different: a plain send carries MSG_WAITALL (the kernel flushes
+// the whole gather, one full-length CQE), but the kernel TLS sendmsg rejects that flag (`submit_send`,
+// src/net/core/reactor/io.rs), so a bodied kTLS reply is a multi-iovec SENDMSG that blocks on an io-wq worker until the
+// peer drains it - and only `send_timeout`'s linked timeout interrupts it, surfacing a partial completion the reactor's
+// re-submit path must carry. Scaffolding shared with `test/net_server.rs` -- see `test/support/ktls.rs`.
 
 #[path = "support/ktls.rs"]
 mod ktls;
@@ -815,18 +727,15 @@ mod ktls;
 use std::sync::Arc;
 
 use ktls::{
-    ktls_acceptor, ktls_openssl_unsupported, ktls_server_handshake,
-    ktls_unsupported, self_signed, tls_connect,
+    ktls_acceptor, ktls_openssl_unsupported, ktls_server_handshake, ktls_unsupported, self_signed, tls_connect,
 };
 use truenas_ros::http::HttpConn;
 use truenas_ros::net::server::{Listen, ServerConfig};
 
-/// [`with_http_server`] over a kTLS listener: the same [`echo_handler`]
-/// behind `Listen::tls`, with the `truenas_ktls` handshake worker minting
-/// the connection state (`AcceptDeferral::ready` is the admission - the
-/// accept handler does not run for kTLS connections). `None` means io_uring
-/// or kTLS is unavailable here (the caller returns - a skip; a hard failure
-/// under `TRUENAS_ROS_REQUIRE_KTLS`).
+/// [`with_http_server`] over a kTLS listener: the same [`echo_handler`] behind `Listen::tls`, with the `truenas_ktls`
+/// handshake worker minting the connection state (`AcceptDeferral::ready` is the admission - the accept handler does
+/// not run for kTLS connections). `None` means io_uring or kTLS is unavailable here (the caller returns - a skip; a
+/// hard failure under `TRUENAS_ROS_REQUIRE_KTLS`).
 fn with_ktls_http_server<T: Send + 'static>(
     cfg: ServerConfig,
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
@@ -834,13 +743,11 @@ fn with_ktls_http_server<T: Send + 'static>(
     with_ktls_http_server_handle(cfg, move |v4, _stop| client(v4))
 }
 
-/// [`with_ktls_http_server`] for a client that drives the server's
-/// lifecycle itself: it also receives the [`ShutdownHandle`].
+/// [`with_ktls_http_server`] for a client that drives the server's lifecycle itself: it also receives the
+/// [`ShutdownHandle`].
 fn with_ktls_http_server_handle<T: Send + 'static>(
     cfg: ServerConfig,
-    client: impl FnOnce(SocketAddrV4, ShutdownHandle) -> io::Result<T>
-    + Send
-    + 'static,
+    client: impl FnOnce(SocketAddrV4, ShutdownHandle) -> io::Result<T> + Send + 'static,
 ) -> Option<T> {
     if ktls_openssl_unsupported() {
         return None;
@@ -848,14 +755,9 @@ fn with_ktls_http_server_handle<T: Send + 'static>(
     let (cert, key) = self_signed();
     let acceptor = Arc::new(ktls_acceptor(&cert, &key));
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let proto = protocol(
-        HttpConfig::default(),
-        |_inc: Incoming<'_>| Some(()),
-        echo_handler,
-    )
-    .expect("codec config is valid");
-    let mut server = match Server::with_config([Listen::tls(addr)], cfg, proto)
-    {
+    let proto =
+        protocol(HttpConfig::default(), |_inc: Incoming<'_>| Some(()), echo_handler).expect("codec config is valid");
+    let mut server = match Server::with_config([Listen::tls(addr)], cfg, proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return None,
         Err(e) => panic!("bind: {e}"),
@@ -881,11 +783,9 @@ fn with_ktls_http_server_handle<T: Send + 'static>(
     Some(join.join().expect("client thread").expect("client io"))
 }
 
-/// One slow `/big` exchange on a fresh TLS connection: request, then crawl
-/// the first ~1.5 MiB slower than the send can flush it - the kernel
-/// absorbs ~4 MiB (`tcp_wmem[2]`) and the rest sits in the blocked send,
-/// so a 500 ms `send_timeout` cancel lands mid-body - then drain. Returns
-/// the stream (for follow-up requests) and the body read.
+/// One slow `/big` exchange on a fresh TLS connection: request, then crawl the first ~1.5 MiB slower than the send can
+/// flush it - the kernel absorbs ~4 MiB (`tcp_wmem[2]`) and the rest sits in the blocked send, so a 500 ms
+/// `send_timeout` cancel lands mid-body - then drain. Returns the stream (for follow-up requests) and the body read.
 fn fetch_big_slowly(
     v4: SocketAddrV4,
     expected_len: usize,
@@ -914,20 +814,15 @@ fn fetch_big_slowly(
 
 #[test]
 fn ktls_vectored_bodies_arrive_intact() {
-    // The S3 GET shape: head + body as two iovecs in one SENDMSG over kTLS.
-    // The client drains the 6 MiB body ([`big_body`]) slower than the
-    // 500 ms `send_timeout` flushes it, so the linked timeout cancels the
-    // io-wq-blocked send mid-flight and the reactor re-submits the tail
-    // from the partial CQE: every byte must arrive exactly once. The canned
-    // body then rides the borrowed segment, and two more requests prove
-    // each reply retired its read-ahead slot (a wrong retire count wedges
-    // them).
+    // The S3 GET shape: head + body as two iovecs in one SENDMSG over kTLS. The client drains the 6 MiB body
+    // ([`big_body`]) slower than the 500 ms `send_timeout` flushes it, so the linked timeout cancels the io-wq-blocked
+    // send mid-flight and the reactor re-submits the tail from the partial CQE: every byte must arrive exactly once.
+    // The canned body then rides the borrowed segment, and two more requests prove each reply retired its read-ahead
+    // slot (a wrong retire count wedges them).
     //
-    // A reclaim (EOF) is retried on a fresh connection: a cancel window in
-    // which the blocked send happened to write nothing closes the
-    // connection as SendTimeout even though this client drains throughout --
-    // rare, timing-dependent, and a server-policy question rather than a
-    // data-path defect. A byte mismatch is NEVER retried; corruption fails
+    // A reclaim (EOF) is retried on a fresh connection: a cancel window in which the blocked send happened to write
+    // nothing closes the connection as SendTimeout even though this client drains throughout -- rare, timing-dependent,
+    // and a server-policy question rather than a data-path defect. A byte mismatch is NEVER retried; corruption fails
     // on the spot.
     let cfg = ServerConfig {
         send_timeout: Some(Duration::from_millis(500)),
@@ -940,10 +835,7 @@ fn ktls_vectored_bodies_arrive_intact() {
             attempt += 1;
             match fetch_big_slowly(v4, expected.len()) {
                 Ok(pair) => break pair,
-                Err(e)
-                    if e.kind() == io::ErrorKind::UnexpectedEof
-                        && attempt < 3 =>
-                {
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && attempt < 3 => {
                     eprintln!(
                         "send_timeout reclaimed a draining client \
                          (attempt {attempt}); retrying"
@@ -976,8 +868,8 @@ fn ktls_vectored_bodies_arrive_intact() {
     };
 }
 
-/// Assert the peer closed: a clean EOF, or the unexpected-EOF OpenSSL
-/// reports when a kernel-TLS peer closes without a close_notify.
+/// Assert the peer closed: a clean EOF, or the unexpected-EOF OpenSSL reports when a kernel-TLS peer closes without a
+/// close_notify.
 fn assert_tls_eof<R: Read>(s: &mut R) -> io::Result<()> {
     let mut b = [0u8; 1];
     match s.read(&mut b) {
@@ -994,11 +886,9 @@ fn assert_tls_eof<R: Read>(s: &mut R) -> io::Result<()> {
     }
 }
 
-/// The drain's `Connection: close` over kTLS, on the inline reply path. A
-/// PUT parked in the 100-continue dance is in-flight work (its body read is
-/// armed, so the sweep leaves it alone): the drain begins (the idle TLS
-/// connection's close marks it), the body arrives, and the echo must say
-/// close before the connection goes away.
+/// The drain's `Connection: close` over kTLS, on the inline reply path. A PUT parked in the 100-continue dance is
+/// in-flight work (its body read is armed, so the sweep leaves it alone): the drain begins (the idle TLS connection's
+/// close marks it), the body arrives, and the echo must say close before the connection goes away.
 #[test]
 fn ktls_replies_during_drain_say_connection_close() {
     let cfg = truenas_ros::net::server::ServerConfig::default();
@@ -1038,15 +928,12 @@ fn ktls_replies_during_drain_say_connection_close() {
 
 #[test]
 fn ktls_chunked_put_and_trailers_roundtrip() {
-    // The boto3-over-TLS upload shape: a chunked PUT whose records the
-    // kernel decrypts before the framer sees them. Each write is its own
-    // TLS record, so chunk reassembly provably spans record boundaries,
-    // and the trailer still surfaces.
+    // The boto3-over-TLS upload shape: a chunked PUT whose records the kernel decrypts before the framer sees them.
+    // Each write is its own TLS record, so chunk reassembly provably spans record boundaries, and the trailer still
+    // surfaces.
     let Some(()) = with_ktls_http_server(ServerConfig::default(), |v4| {
         let mut s = tls_connect(v4)?;
-        s.write_all(
-            b"PUT /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n",
-        )?;
+        s.write_all(b"PUT /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n")?;
         s.write_all(b"3\r\nfoo\r\n")?;
         s.write_all(b"4\r\nbars\r\n")?;
         s.write_all(b"0\r\nx-amz-checksum-crc32: ok==\r\n\r\n")?;
@@ -1065,14 +952,11 @@ fn ktls_chunked_put_and_trailers_roundtrip() {
 
 #[test]
 fn ktls_expect_dance_flushes_interim_before_body() {
-    // Same ordering proof as the plain-TCP test, over kTLS: the interim
-    // must arrive (as its own TLS record) before any body byte is sent, or
-    // this read hangs into its timeout.
+    // Same ordering proof as the plain-TCP test, over kTLS: the interim must arrive (as its own TLS record) before any
+    // body byte is sent, or this read hangs into its timeout.
     let Some(()) = with_ktls_http_server(ServerConfig::default(), |v4| {
         let mut s = tls_connect(v4)?;
-        s.write_all(
-            b"PUT /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n",
-        )?;
+        s.write_all(b"PUT /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n")?;
         let mut interim = [0u8; 25];
         s.read_exact(&mut interim)?;
         assert_eq!(&interim[..], b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -1088,10 +972,9 @@ fn ktls_expect_dance_flushes_interim_before_body() {
 
 #[test]
 fn ktls_farewells_arrive_before_the_close() {
-    // A malformed request over TLS still gets the real 400 + Connection:
-    // close before the connection dies. The kernel-TLS close is a plain FIN
-    // (no close_notify), so after the full farewell the client sees either
-    // EOF or a truncation error - both prove the bytes beat the FIN.
+    // A malformed request over TLS still gets the real 400 + Connection: close before the connection dies. The
+    // kernel-TLS close is a plain FIN (no close_notify), so after the full farewell the client sees either EOF or a
+    // truncation error - both prove the bytes beat the FIN.
     let Some(()) = with_ktls_http_server(ServerConfig::default(), |v4| {
         let mut s = tls_connect(v4)?;
         s.write_all(b"NOT HTTP\r\n\r\n")?;
@@ -1113,29 +996,21 @@ fn ktls_farewells_arrive_before_the_close() {
 // ---------------------------------------------------------------------------
 // `protocol_fs`: the handler is handed the reactor's request-bound fs facade.
 
-/// The boxed three-argument handler [`with_http_fs_server`] serves - boxed
-/// so one harness takes differently-shaped tests (dyn dispatch is fine off
-/// the hot path).
+/// The boxed three-argument handler [`with_http_fs_server`] serves - boxed so one harness takes differently-shaped
+/// tests (dyn dispatch is fine off the hot path).
 #[cfg(feature = "uring-fs")]
 type FsHandler<U> = Box<
-    dyn FnMut(
-        HttpRequest<'_>,
-        &mut U,
-        Option<truenas_ros::uring_fs::FsConn<'_>>,
-    ) -> truenas_ros::http::HttpVerdict,
+    dyn FnMut(HttpRequest<'_>, &mut U, Option<truenas_ros::uring_fs::FsConn<'_>>) -> truenas_ros::http::HttpVerdict,
 >;
 
-/// [`with_http_server`]'s sibling for `protocol_fs`: an fs pool
-/// (`fs_ops: 16`) on the server ring, the caller's per-connection state
-/// and handler, and the server's own personality registered into `pers`
-/// before serving. `None` means io_uring is unavailable (a skip).
+/// [`with_http_server`]'s sibling for `protocol_fs`: an fs pool (`fs_ops: 16`) on the server ring, the caller's
+/// per-connection state and handler, and the server's own personality registered into `pers` before serving. `None`
+/// means io_uring is unavailable (a skip).
 #[cfg(feature = "uring-fs")]
 fn with_http_fs_server<U, T>(
     state: impl FnMut() -> U + 'static,
     handler: FsHandler<U>,
-    pers: std::sync::Arc<
-        std::sync::OnceLock<truenas_ros::uring_fs::Personality>,
-    >,
+    pers: std::sync::Arc<std::sync::OnceLock<truenas_ros::uring_fs::Personality>>,
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
 ) -> Option<T>
 where
@@ -1157,16 +1032,14 @@ where
     )
 }
 
-/// [`with_http_fs_server`] with the server's tuning spelled out - for the
-/// tests whose subject IS a bound (an op table small enough to run out).
+/// [`with_http_fs_server`] with the server's tuning spelled out - for the tests whose subject IS a bound (an op table
+/// small enough to run out).
 #[cfg(feature = "uring-fs")]
 fn with_http_fs_server_cfg<U, T>(
     cfg: truenas_ros::net::server::ServerConfig,
     mut state: impl FnMut() -> U + 'static,
     handler: FsHandler<U>,
-    pers: std::sync::Arc<
-        std::sync::OnceLock<truenas_ros::uring_fs::Personality>,
-    >,
+    pers: std::sync::Arc<std::sync::OnceLock<truenas_ros::uring_fs::Personality>>,
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
 ) -> Option<T>
 where
@@ -1175,20 +1048,15 @@ where
 {
     use truenas_ros::http::protocol_fs;
 
-    let proto = protocol_fs(
-        HttpConfig::default(),
-        move |_inc: Incoming<'_>| Some(state()),
-        handler,
-    )
-    .expect("codec config is valid");
+    let proto = protocol_fs(HttpConfig::default(), move |_inc: Incoming<'_>| Some(state()), handler)
+        .expect("codec config is valid");
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let mut server = match Server::with_config([addr], cfg, proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return None,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -1209,12 +1077,10 @@ mod xattr_probe;
 #[cfg(feature = "uring-fs")]
 use xattr_probe::set_user_xattr;
 
-/// The S3 GET preamble through the HTTP codec: the handler takes the
-/// facade, parks the request, opens under the server's personality on the
-/// ring, and ONE `offload_result` job runs the whole blocking metadata tail
-/// (`statx` plus two xattr reads) - the reply is served from its delivery.
-/// Mirrors `fs_conn_offload_result_batches_statx_and_xattrs_in_one_job`
-/// (`test/net_server.rs`) with the codec in the loop.
+/// The S3 GET preamble through the HTTP codec: the handler takes the facade, parks the request, opens under the
+/// server's personality on the ring, and ONE `offload_result` job runs the whole blocking metadata tail (`statx` plus
+/// two xattr reads) - the reply is served from its delivery. Mirrors
+/// `fs_conn_offload_result_batches_statx_and_xattrs_in_one_job` (`test/net_server.rs`) with the codec in the loop.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_handler_reads_a_file_through_one_batched_job() {
@@ -1227,9 +1093,7 @@ fn http_handler_reads_a_file_through_one_batched_job() {
     let dir = truenas_ros::tempdir().unwrap();
     let fp = dir.path().join("f.txt");
     std::fs::write(&fp, b"hello object").unwrap();
-    if !set_user_xattr(&fp, b"user.a", b"1")
-        || !set_user_xattr(&fp, b"user.b", b"22")
-    {
+    if !set_user_xattr(&fp, b"user.a", b"1") || !set_user_xattr(&fp, b"user.b", b"22") {
         return; // this fs refuses user xattrs
     }
     let anchor = match Anchor::open(dir.path()) {
@@ -1242,9 +1106,7 @@ fn http_handler_reads_a_file_through_one_batched_job() {
     let pc = Arc::clone(&pers);
     let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
         let Some(mut fs) = fs else {
-            return HttpVerdict::Respond(
-                HttpResponse::new(500).body("no fs pool\n"),
-            );
+            return HttpVerdict::Respond(HttpResponse::new(500).body("no fs pool\n"));
         };
         let (deferred, permit) = req.defer();
         let who = *pc.get().expect("personality set before serving");
@@ -1256,24 +1118,17 @@ fn http_handler_reads_a_file_through_one_batched_job() {
             };
             fs.offload_result(
                 move || {
-                    let st = statx(
-                        &file,
-                        c"",
-                        AtFlags::AT_EMPTY_PATH,
-                        StatxMask::BASIC_STATS,
-                    )?;
+                    let st = statx(&file, c"", AtFlags::AT_EMPTY_PATH, StatxMask::BASIC_STATS)?;
                     let a = fgetxattr(&file, "user.a")?;
                     let b = fgetxattr(&file, "user.b")?;
                     Ok((st.size(), a, b))
                 },
                 move |res, _fs| match res {
-                    Ok((size, a, b)) => {
-                        deferred.reply(HttpResponse::new(200).body(format!(
-                            "{size}:{}:{}",
-                            String::from_utf8_lossy(&a),
-                            String::from_utf8_lossy(&b),
-                        )))
-                    }
+                    Ok((size, a, b)) => deferred.reply(HttpResponse::new(200).body(format!(
+                        "{size}:{}:{}",
+                        String::from_utf8_lossy(&a),
+                        String::from_utf8_lossy(&b),
+                    ))),
                     Err(_) => deferred.close(),
                 },
             );
@@ -1291,10 +1146,7 @@ fn http_handler_reads_a_file_through_one_batched_job() {
             s.write_all(b"GET /f.txt HTTP/1.1\r\nHost: t\r\n\r\n")?;
             let (status, _head, body) = read_response(&mut s)?;
             assert_eq!(status, 200);
-            assert_eq!(
-                body, b"12:1:22",
-                "one job returned size and both xattrs"
-            );
+            assert_eq!(body, b"12:1:22", "one job returned size and both xattrs");
             Ok(())
         },
     ) else {
@@ -1302,16 +1154,13 @@ fn http_handler_reads_a_file_through_one_batched_job() {
     };
 }
 
-/// `HttpDeferred::redrive` hands a handler a fresh request-handler
-/// facade, with the request state it parked in `U`.
+/// `HttpDeferred::redrive` hands a handler a fresh request-handler facade, with the request state it parked in `U`.
 ///
-/// Every facade can `open` - the gate that once stopped a continuation
-/// from opening is gone, and `fs_continuation_may_open_and_its_slot_comes_back`
-/// pins that directly. What survives is the redelivery contract: a
-/// handler whose next step depends on an earlier result parks its
-/// progress, redrives from wherever the earlier result landed, and must
-/// get a facade back at all - a redelivery that dropped its
-/// continuation would close the connection instead of answering.
+/// Every facade can `open` - the gate that once stopped a continuation from opening is gone, and
+/// `fs_continuation_may_open_and_its_slot_comes_back` pins that directly. What survives is the redelivery contract: a
+/// handler whose next step depends on an earlier result parks its progress, redrives from wherever the earlier result
+/// landed, and must get a facade back at all - a redelivery that dropped its continuation would close the connection
+/// instead of answering.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_redrive_returns_a_facade_with_the_parked_state() {
@@ -1332,13 +1181,10 @@ fn http_redrive_returns_a_facade_with_the_parked_state() {
     let pc = Arc::clone(&pers);
     let handler: FsHandler<bool> = Box::new(move |req, redriven, fs| {
         let Some(mut fs) = fs else {
-            return HttpVerdict::Respond(
-                HttpResponse::new(500).body("no fs pool\n"),
-            );
+            return HttpVerdict::Respond(HttpResponse::new(500).body("no fs pool\n"));
         };
         if !*redriven {
-            // First pass: park, and redrive from an offload delivery -
-            // the seam furthest from the request handler.
+            // First pass: park, and redrive from an offload delivery - the seam furthest from the request handler.
             *redriven = true;
             let (deferred, permit) = req.defer();
             fs.offload_result(|| Ok(()), move |_res, _fs| deferred.redrive());
@@ -1348,13 +1194,9 @@ fn http_redrive_returns_a_facade_with_the_parked_state() {
             let (deferred, permit) = req.defer();
             let who = *pc.get().expect("personality set before serving");
             let how = OpenHow::new().flags(OFlag::O_RDONLY);
-            fs.open(who, &anchor, c"f.txt", how, move |done, _fs| {
-                match done.file() {
-                    Some(_) => {
-                        deferred.reply(HttpResponse::new(200).body("opened"))
-                    }
-                    None => deferred.close(),
-                }
+            fs.open(who, &anchor, c"f.txt", how, move |done, _fs| match done.file() {
+                Some(_) => deferred.reply(HttpResponse::new(200).body("opened")),
+                None => deferred.close(),
             });
             HttpVerdict::Defer(permit)
         }
@@ -1379,8 +1221,7 @@ fn http_redrive_returns_a_facade_with_the_parked_state() {
 }
 
 // ---------------------------------------------------------------------------
-// `HttpResponse::file_body`: fd-sourced response bodies, streamed by the
-// reactor's reply path in bounded chunks.
+// `HttpResponse::file_body`: fd-sourced response bodies, streamed by the reactor's reply path in bounded chunks.
 
 /// A deterministic pattern any hole, reorder, or overrun shows up in.
 #[cfg(feature = "uring-fs")]
@@ -1388,12 +1229,10 @@ fn patterned(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
-/// The property the whole seam exists for: a body spanning many chunks
-/// (default `fs_body_chunk` 256 KiB, plus an odd remainder for the final
-/// short chunk) served byte-exact through the codec - with a HEAD of the
-/// same resource declaring the length and sending nothing, keep-alive
-/// surviving the stream, and a `Connection: close` GET flushing the WHOLE
-/// body before the farewell (the tail-guarded flush-close).
+/// The property the whole seam exists for: a body spanning many chunks (default `fs_body_chunk` 256 KiB, plus an odd
+/// remainder for the final short chunk) served byte-exact through the codec - with a HEAD of the same resource
+/// declaring the length and sending nothing, keep-alive surviving the stream, and a `Connection: close` GET flushing
+/// the WHOLE body before the farewell (the tail-guarded flush-close).
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_file_body_streams_a_multi_chunk_file() {
@@ -1425,15 +1264,9 @@ fn http_file_body_streams_a_multi_chunk_file() {
         let who = *pc.get().expect("personality set before serving");
         let anchor = anchor.clone();
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
-        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
-            match done.file() {
-                Some(file) => deferred.reply(HttpResponse::new(200).file_body(
-                    file,
-                    0,
-                    SIZE as u64,
-                )),
-                None => deferred.close(),
-            }
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| match done.file() {
+            Some(file) => deferred.reply(HttpResponse::new(200).file_body(file, 0, SIZE as u64)),
+            None => deferred.close(),
         });
         HttpVerdict::Defer(permit)
     });
@@ -1445,15 +1278,12 @@ fn http_file_body_streams_a_multi_chunk_file() {
         move |v4| {
             let mut s = connect_tcp(v4)?;
             s.set_read_timeout(Some(Duration::from_secs(10)))?;
-            // HEAD: the length is declared, no body byte follows - the next
-            // request on this same connection parses only if that held.
+            // HEAD: the length is declared, no body byte follows - the next request on this same connection parses only
+            // if that held.
             s.write_all(b"HEAD /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
             let (status, head) = read_head(&mut s)?;
             assert_eq!(status, 200);
-            assert!(
-                head.contains(&format!("Content-Length: {SIZE}\r\n")),
-                "{head}"
-            );
+            assert!(head.contains(&format!("Content-Length: {SIZE}\r\n")), "{head}");
             // GET: the streamed body, byte-exact.
             s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
             let (status, _head, body) = read_response(&mut s)?;
@@ -1466,9 +1296,7 @@ fn http_file_body_streams_a_multi_chunk_file() {
             assert_eq!(status, 200);
             assert_eq!(body, b"after");
             // A farewell GET: the whole body must flush before the close.
-            s.write_all(
-                b"GET /obj HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
-            )?;
+            s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")?;
             let (status, head, body) = read_response(&mut s)?;
             assert_eq!(status, 200);
             assert!(head.contains("Connection: close\r\n"), "{head}");
@@ -1481,9 +1309,8 @@ fn http_file_body_streams_a_multi_chunk_file() {
     };
 }
 
-/// A range is an offset and a length - and a `File` handle stashed across
-/// requests serves one **inline** (no park): the first request opens and
-/// stashes, the second replies `file_body` straight from the handler.
+/// A range is an offset and a length - and a `File` handle stashed across requests serves one **inline** (no park): the
+/// first request opens and stashes, the second replies `file_body` straight from the handler.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_file_body_serves_a_range_from_a_stashed_handle() {
@@ -1508,13 +1335,10 @@ fn http_file_body_serves_a_range_from_a_stashed_handle() {
     let st = Arc::clone(&stash);
     let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
         if req.target == "/range" {
-            // Inline: the handle held from the previous request answers
-            // without a park - the handler-side shape of a preamble that
-            // already opened the object.
+            // Inline: the handle held from the previous request answers without a park - the handler-side shape of a
+            // preamble that already opened the object.
             let file = st.lock().unwrap().take().expect("stashed by /open");
-            return HttpVerdict::Respond(
-                HttpResponse::new(200).file_body(file, 100, 1000),
-            );
+            return HttpVerdict::Respond(HttpResponse::new(200).file_body(file, 100, 1000));
         }
         let Some(mut fs) = fs else {
             return HttpVerdict::Respond(HttpResponse::new(500));
@@ -1524,14 +1348,12 @@ fn http_file_body_serves_a_range_from_a_stashed_handle() {
         let anchor = anchor.clone();
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
         let st = Arc::clone(&st);
-        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
-            match done.file() {
-                Some(file) => {
-                    *st.lock().unwrap() = Some(file);
-                    deferred.reply(HttpResponse::new(200).body("opened"));
-                }
-                None => deferred.close(),
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| match done.file() {
+            Some(file) => {
+                *st.lock().unwrap() = Some(file);
+                deferred.reply(HttpResponse::new(200).body("opened"));
             }
+            None => deferred.close(),
         });
         HttpVerdict::Defer(permit)
     });
@@ -1558,23 +1380,18 @@ fn http_file_body_serves_a_range_from_a_stashed_handle() {
     };
 }
 
-/// A range whose start the caller's arithmetic wrapped is refused before it
-/// reaches the ring, and refusing sheds that one connection rather than the
-/// server.
+/// A range whose start the caller's arithmetic wrapped is refused before it reaches the ring, and refusing sheds that
+/// one connection rather than the server.
 ///
-/// `u64::MAX` is `-1`, io_uring's "use the file's own position" sentinel: for a
-/// regular file `io_kiocb_update_pos` (linux `io_uring/rw.c:484-490`) would
-/// read `f_pos` in place of the offset asked for and `rw.c:670-671` would write
-/// the new position back, so the read would SUCCEED from the wrong place and
-/// move a position shared with every other holder of the descriptor - behind a
-/// `Content-Length` already on the wire. A start past `i64::MAX` that is not
-/// the sentinel fails much later, in `rw_verify_area`, which is also after the
-/// head has committed. `bytes=-N` past the object size is how either arrives:
-/// computing the start as `size - N` wraps in `u64` rather than clamping.
+/// `u64::MAX` is `-1`, io_uring's "use the file's own position" sentinel: for a regular file `io_kiocb_update_pos`
+/// (linux `io_uring/rw.c:484-490`) would read `f_pos` in place of the offset asked for and `rw.c:670-671` would write
+/// the new position back, so the read would SUCCEED from the wrong place and move a position shared with every other
+/// holder of the descriptor - behind a `Content-Length` already on the wire. A start past `i64::MAX` that is not the
+/// sentinel fails much later, in `rw_verify_area`, which is also after the head has committed. `bytes=-N` past the
+/// object size is how either arrives: computing the start as `size - N` wraps in `u64` rather than clamping.
 ///
-/// The last assertion is the one that matters: a *later* connection is served.
-/// A closed connection alone cannot tell a clean shed from the reactor thread
-/// dying on the overflow, which is what an unguarded advance does in debug.
+/// The last assertion is the one that matters: a *later* connection is served. A closed connection alone cannot tell a
+/// clean shed from the reactor thread dying on the overflow, which is what an unguarded advance does in debug.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_file_body_refuses_a_wrapped_range() {
@@ -1599,9 +1416,8 @@ fn http_file_body_refuses_a_wrapped_range() {
     let pc = Arc::clone(&pers);
     let st = Arc::clone(&stash);
     let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
-        // Each target answers inline from a handle the previous `/open`
-        // stashed, so the range reaches `begin_file_reply` with nothing else
-        // in flight.
+        // Each target answers inline from a handle the previous `/open` stashed, so the range reaches
+        // `begin_file_reply` with nothing else in flight.
         let range = match req.target {
             // `size - N` for a suffix range one byte past the object.
             "/sentinel" => Some((u64::MAX, 8)),
@@ -1612,9 +1428,7 @@ fn http_file_body_refuses_a_wrapped_range() {
         };
         if let Some((offset, len)) = range {
             let file = st.lock().unwrap().pop().expect("stashed by /open");
-            return HttpVerdict::Respond(
-                HttpResponse::new(200).file_body(file, offset, len),
-            );
+            return HttpVerdict::Respond(HttpResponse::new(200).file_body(file, offset, len));
         }
         let Some(mut fs) = fs else {
             return HttpVerdict::Respond(HttpResponse::new(500));
@@ -1624,14 +1438,12 @@ fn http_file_body_refuses_a_wrapped_range() {
         let anchor = anchor.clone();
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
         let st = Arc::clone(&st);
-        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
-            match done.file() {
-                Some(file) => {
-                    st.lock().unwrap().push(file);
-                    deferred.reply(HttpResponse::new(200).body("opened"));
-                }
-                None => deferred.close(),
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| match done.file() {
+            Some(file) => {
+                st.lock().unwrap().push(file);
+                deferred.reply(HttpResponse::new(200).body("opened"));
             }
+            None => deferred.close(),
         });
         HttpVerdict::Defer(permit)
     });
@@ -1670,10 +1482,7 @@ fn http_file_body_refuses_a_wrapped_range() {
             s.write_all(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\n")?;
             let (status, head, body) = read_response(&mut s)?;
             assert_eq!(status, 200);
-            assert!(
-                head.contains(&format!("Content-Length: {SIZE}\r\n")),
-                "{head}"
-            );
+            assert!(head.contains(&format!("Content-Length: {SIZE}\r\n")), "{head}");
             assert_eq!(body, content, "a sound range still serves");
             Ok(())
         },
@@ -1682,18 +1491,15 @@ fn http_file_body_refuses_a_wrapped_range() {
     };
 }
 
-/// A body read that finds the op table full WAITS for a slot instead of
-/// severing the transfer.
+/// A body read that finds the op table full WAITS for a slot instead of severing the transfer.
 ///
-/// The table is `fs_ops + pool_size`, one free list shared by handler ops and
-/// the reply path's body reads, and nothing reserves either side's share. A
-/// missing chunk buffer waits for a flush to recycle one, so a missing op slot
-/// waits too: the same class of transient shortage must not get opposite
-/// verdicts, one of them fatal to a multi-GB download mid-stream.
+/// The table is `fs_ops + pool_size`, one free list shared by handler ops and the reply path's body reads, and nothing
+/// reserves either side's share. A missing chunk buffer waits for a flush to recycle one, so a missing op slot waits
+/// too: the same class of transient shortage must not get opposite verdicts, one of them fatal to a multi-GB download
+/// mid-stream.
 ///
-/// Both slots are pinned here by reads on a FIFO that cannot complete until
-/// the client writes to it, which is what a handler fan-out looks like from
-/// the reply path. The object must still arrive whole.
+/// Both slots are pinned here by reads on a FIFO that cannot complete until the client writes to it, which is what a
+/// handler fan-out looks like from the reply path. The object must still arrive whole.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_file_body_waits_for_an_op_slot() {
@@ -1710,8 +1516,7 @@ fn http_file_body_waits_for_an_op_slot() {
     let content = patterned(SIZE);
     std::fs::write(dir.path().join("obj"), &content).unwrap();
     let fifo = dir.path().join("fifo");
-    let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
-        .expect("path has no NUL");
+    let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("path has no NUL");
     // SAFETY: a fresh path in a private tempdir; 0o600 is the mode.
     assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
 
@@ -1721,9 +1526,8 @@ fn http_file_body_waits_for_an_op_slot() {
         Err(e) => panic!("anchor open: {e}"),
     };
     let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
-    // The handler says when the reply has been handed over, so the client
-    // releases the pinned reads only after the body has had its chance to
-    // park - not before, which would leave the wait unexercised.
+    // The handler says when the reply has been handed over, so the client releases the pinned reads only after the body
+    // has had its chance to park - not before, which would leave the wait unexercised.
     let (armed_tx, armed_rx) = mpsc::channel::<()>();
 
     let pc = Arc::clone(&pers);
@@ -1737,25 +1541,20 @@ fn http_file_body_waits_for_an_op_slot() {
         let (deferred, permit) = req.defer();
         let who = *pc.get().expect("personality set before serving");
         let armed = armed_tx.clone();
-        // Both opens are issued HERE so they overlap on the ring, which
-        // is what this test is about: whichever completes second does
-        // the work. (Not a restriction - a continuation's facade opens
-        // like any other; see
+        // Both opens are issued HERE so they overlap on the ring, which is what this test is about: whichever completes
+        // second does the work. (Not a restriction - a continuation's facade opens like any other; see
         // `fs_continuation_may_open_and_its_slot_comes_back`.)
         type Held = (
             Option<truenas_ros::uring_fs::File>,
             Option<truenas_ros::uring_fs::File>,
             Option<truenas_ros::http::HttpDeferred>,
         );
-        let held: Rc<RefCell<Held>> =
-            Rc::new(RefCell::new((None, None, Some(deferred))));
-        // O_RDWR so the open does not wait for a writer and the reads below
-        // never see EOF.
+        let held: Rc<RefCell<Held>> = Rc::new(RefCell::new((None, None, Some(deferred))));
+        // O_RDWR so the open does not wait for a writer and the reads below never see EOF.
         let fifo_how = OpenHow::new().flags(OFlag::O_RDWR);
         let obj_how = OpenHow::new().flags(OFlag::O_RDONLY);
 
-        // A free `fn`, not a closure: it is called from two `'static`
-        // continuations and captures nothing.
+        // A free `fn`, not a closure: it is called from two `'static` continuations and captures nothing.
         fn finish(
             fs: &mut truenas_ros::uring_fs::FsConn<'_>,
             who: Personality,
@@ -1767,14 +1566,12 @@ fn http_file_body_waits_for_an_op_slot() {
             let (Some(pipe), Some(obj)) = (pipe.as_ref(), obj.take()) else {
                 return; // the other open has not landed yet
             };
-            // Take every op slot the table has (`fs_ops + pool_size` = 2).
-            // `u64::MAX` because a pipe refuses a real offset (ESPIPE) and
-            // takes the file-position sentinel instead.
+            // Take every op slot the table has (`fs_ops + pool_size` = 2). `u64::MAX` because a pipe refuses a real
+            // offset (ESPIPE) and takes the file-position sentinel instead.
             //
-            // The buffer needs a LENGTH, not just capacity: `submit_rw` sets
-            // `iov_len` from `buf.len()`, so a `Vec::with_capacity(8)` asks
-            // the kernel for zero bytes, completes immediately, and pins no
-            // slot at all - which leaves the wait below unexercised.
+            // The buffer needs a LENGTH, not just capacity: `submit_rw` sets `iov_len` from `buf.len()`, so a
+            // `Vec::with_capacity(8)` asks the kernel for zero bytes, completes immediately, and pins no slot at all -
+            // which leaves the wait below unexercised.
             for _ in 0..2 {
                 fs.preadv2(
                     who,
@@ -1818,8 +1615,8 @@ fn http_file_body_waits_for_an_op_slot() {
             let mut s = connect_tcp(v4)?;
             s.set_read_timeout(Some(Duration::from_secs(20)))?;
             s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
-            // Wait for the reply to be handed over, then release the pinned
-            // reads: their completions are what re-drive the parked body.
+            // Wait for the reply to be handed over, then release the pinned reads: their completions are what re-drive
+            // the parked body.
             armed_rx.recv().expect("handler armed the table");
             let mut w = std::fs::OpenOptions::new().write(true).open(&fifo)?;
             w.write_all(b"go")?;
@@ -1827,10 +1624,7 @@ fn http_file_body_waits_for_an_op_slot() {
 
             let (status, head, body) = read_response(&mut s)?;
             assert_eq!(status, 200);
-            assert!(
-                head.contains(&format!("Content-Length: {SIZE}\r\n")),
-                "{head}"
-            );
+            assert!(head.contains(&format!("Content-Length: {SIZE}\r\n")), "{head}");
             assert_eq!(body, content, "the whole object, after waiting");
             Ok(())
         },
@@ -1839,26 +1633,20 @@ fn http_file_body_waits_for_an_op_slot() {
     };
 }
 
-/// A freed op slot reaches the **parked body** before the completion's own
-/// continuation can take it back.
+/// A freed op slot reaches the **parked body** before the completion's own continuation can take it back.
 ///
-/// `Server::on_cqe` calls `redrive_parked_tail()` between `fs.on_cqe(...)`
-/// (which returns the slot) and `match reaped` (which fires the handler
-/// continuation). That statement order is the whole anti-starvation property,
-/// and it reads like post-dispatch bookkeeping, so a refactor moving it below
-/// the dispatch is entirely plausible. `http_file_body_waits_for_an_op_slot`
-/// does not catch that: its pinned reads complete into `|_done, _fs| {}`, so
-/// nothing competes for the slot they free and the test passes with the two
-/// statements in either order.
+/// `Server::on_cqe` calls `redrive_parked_tail()` between `fs.on_cqe(...)` (which returns the slot) and `match reaped`
+/// (which fires the handler continuation). That statement order is the whole anti-starvation property, and it reads
+/// like post-dispatch bookkeeping, so a refactor moving it below the dispatch is entirely plausible.
+/// `http_file_body_waits_for_an_op_slot` does not catch that: its pinned reads complete into `|_done, _fs| {}`, so
+/// nothing competes for the slot they free and the test passes with the two statements in either order.
 ///
-/// Here the pinned reads' continuations re-submit, so the freed slot is
-/// contended by exactly the party the ordering exists to beat. Swap the two
-/// statements in `on_cqe` and the re-submitted read wins the slot, the body
-/// never gets one, and this fails on the client's read timeout.
+/// Here the pinned reads' continuations re-submit, so the freed slot is contended by exactly the party the ordering
+/// exists to beat. Swap the two statements in `on_cqe` and the re-submitted read wins the slot, the body never gets
+/// one, and this fails on the client's read timeout.
 ///
-/// The continuations capture no `HttpDeferred`, so the one that loses the race
-/// (which, with the ordering correct, is the re-submit) is dropped harmlessly
-/// rather than closing the connection.
+/// The continuations capture no `HttpDeferred`, so the one that loses the race (which, with the ordering correct, is
+/// the re-submit) is dropped harmlessly rather than closing the connection.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_a_freed_op_slot_reaches_the_parked_body_first() {
@@ -1875,8 +1663,7 @@ fn http_a_freed_op_slot_reaches_the_parked_body_first() {
     let content = patterned(SIZE);
     std::fs::write(dir.path().join("obj"), &content).unwrap();
     let fifo = dir.path().join("fifo");
-    let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
-        .expect("path has no NUL");
+    let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("path has no NUL");
     // SAFETY: a fresh path in a private tempdir; 0o600 is the mode.
     assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
 
@@ -1899,41 +1686,27 @@ fn http_a_freed_op_slot_reaches_the_parked_body_first() {
         let (deferred, permit) = req.defer();
         let who = *pc.get().expect("personality set before serving");
         let armed = armed_tx.clone();
-        type Held = (
-            Option<File>,
-            Option<File>,
-            Option<truenas_ros::http::HttpDeferred>,
-        );
-        let held: Rc<RefCell<Held>> =
-            Rc::new(RefCell::new((None, None, Some(deferred))));
+        type Held = (Option<File>, Option<File>, Option<truenas_ros::http::HttpDeferred>);
+        let held: Rc<RefCell<Held>> = Rc::new(RefCell::new((None, None, Some(deferred))));
         let fifo_how = OpenHow::new().flags(OFlag::O_RDWR);
         let obj_how = OpenHow::new().flags(OFlag::O_RDONLY);
 
-        /// Pin one op slot with a fifo read whose completion immediately
-        /// asks for the slot back. `again` bounds the chain so a lost race
-        /// does not spin; one re-submit is all the contention the ordering
-        /// has to survive.
-        fn pin(
-            fs: &mut truenas_ros::uring_fs::FsConn<'_>,
-            who: Personality,
-            pipe: File,
-            again: bool,
-        ) {
+        /// Pin one op slot with a fifo read whose completion immediately asks for the slot back. `again` bounds the
+        /// chain so a lost race does not spin; one re-submit is all the contention the ordering has to survive.
+        fn pin(fs: &mut truenas_ros::uring_fs::FsConn<'_>, who: Personality, pipe: File, again: bool) {
             let p = pipe.clone();
             fs.preadv2(
                 who,
                 pipe,
-                // Length, not capacity: `submit_rw` sets `iov_len` from
-                // `buf.len()`, so a `Vec::with_capacity(8)` asks for ZERO
-                // bytes and the read completes at once, pinning nothing.
+                // Length, not capacity: `submit_rw` sets `iov_len` from `buf.len()`, so a `Vec::with_capacity(8)` asks
+                // for ZERO bytes and the read completes at once, pinning nothing.
                 vec![vec![0u8; 8]],
                 u64::MAX, // a pipe refuses a real offset (ESPIPE)
                 RwFlags::empty(),
                 move |_done, fs| {
                     if again {
-                        // Contend for the slot this completion just freed.
-                        // Losing is fine: nothing here captures the reply,
-                        // so a dropped callback closes nothing.
+                        // Contend for the slot this completion just freed. Losing is fine: nothing here captures the
+                        // reply, so a dropped callback closes nothing.
                         pin(fs, who, p, false);
                     }
                 },
@@ -1989,23 +1762,16 @@ fn http_a_freed_op_slot_reaches_the_parked_body_first() {
             s.set_read_timeout(Some(Duration::from_secs(20)))?;
             s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
             armed_rx.recv().expect("handler armed the table");
-            // Release exactly one pinned read. Its completion frees one slot
-            // and its continuation asks for that slot back; the body must
-            // get it first.
+            // Release exactly one pinned read. Its completion frees one slot and its continuation asks for that slot
+            // back; the body must get it first.
             let mut w = std::fs::OpenOptions::new().write(true).open(&fifo)?;
             w.write_all(b"go")?;
             drop(w);
 
             let (status, head, body) = read_response(&mut s)?;
             assert_eq!(status, 200);
-            assert!(
-                head.contains(&format!("Content-Length: {SIZE}\r\n")),
-                "{head}"
-            );
-            assert_eq!(
-                body, content,
-                "the parked body won the freed slot and streamed whole"
-            );
+            assert!(head.contains(&format!("Content-Length: {SIZE}\r\n")), "{head}");
+            assert_eq!(body, content, "the parked body won the freed slot and streamed whole");
             Ok(())
         },
     ) else {
@@ -2015,17 +1781,13 @@ fn http_a_freed_op_slot_reaches_the_parked_body_first() {
 
 /// Pipelined file bodies are served, in order, all of them.
 ///
-/// One tail at a time is structural - two bodies' chunks would interleave on
-/// the wire - but shedding the connection to enforce that destroys the FIRST
-/// response, which is already committed: the client gets nothing, not even
-/// body one. Every other PDU in this position queues behind the tail, and so
-/// does a file body.
+/// One tail at a time is structural - two bodies' chunks would interleave on the wire - but shedding the connection to
+/// enforce that destroys the FIRST response, which is already committed: the client gets nothing, not even body one.
+/// Every other PDU in this position queues behind the tail, and so does a file body.
 ///
-/// Answered INLINE from handles a preamble stashed, not through `defer`:
-/// pipelining lets replies complete out of request order (`net::server`, the
-/// Pipelining section), which HTTP/1.1 forbids, so a deferred reply at
-/// `max_in_flight_requests > 1` is a consumer-protocol mismatch rather than
-/// anything to do with the tail.
+/// Answered INLINE from handles a preamble stashed, not through `defer`: pipelining lets replies complete out of
+/// request order (`net::server`, the Pipelining section), which HTTP/1.1 forbids, so a deferred reply at
+/// `max_in_flight_requests > 1` is a consumer-protocol mismatch rather than anything to do with the tail.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_pipelined_file_bodies_queue_instead_of_killing_the_connection() {
@@ -2053,11 +1815,7 @@ fn http_pipelined_file_bodies_queue_instead_of_killing_the_connection() {
     let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
         if req.target == "/obj" {
             let file = st.lock().unwrap().pop().expect("stashed by /open");
-            return HttpVerdict::Respond(HttpResponse::new(200).file_body(
-                file,
-                0,
-                SIZE as u64,
-            ));
+            return HttpVerdict::Respond(HttpResponse::new(200).file_body(file, 0, SIZE as u64));
         }
         let Some(mut fs) = fs else {
             return HttpVerdict::Respond(HttpResponse::new(500));
@@ -2067,14 +1825,12 @@ fn http_pipelined_file_bodies_queue_instead_of_killing_the_connection() {
         let anchor = anchor.clone();
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
         let st = Arc::clone(&st);
-        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
-            match done.file() {
-                Some(file) => {
-                    st.lock().unwrap().push(file);
-                    deferred.reply(HttpResponse::new(200).body("opened"));
-                }
-                None => deferred.close(),
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| match done.file() {
+            Some(file) => {
+                st.lock().unwrap().push(file);
+                deferred.reply(HttpResponse::new(200).body("opened"));
             }
+            None => deferred.close(),
         });
         HttpVerdict::Defer(permit)
     });
@@ -2083,8 +1839,8 @@ fn http_pipelined_file_bodies_queue_instead_of_killing_the_connection() {
         ServerConfig {
             pool_size: 16,
             fs_ops: 16,
-            // The whole point: read-ahead deep enough that request two is
-            // delivered while request one's body is still streaming.
+            // The whole point: read-ahead deep enough that request two is delivered while request one's body is still
+            // streaming.
             max_in_flight_requests: 2,
             ..ServerConfig::default()
         },
@@ -2122,10 +1878,9 @@ fn http_pipelined_file_bodies_queue_instead_of_killing_the_connection() {
     };
 }
 
-/// A file grown after the length was declared: reads clamp to the declared
-/// length, so exactly `len` bytes arrive and the NEXT request on the same
-/// connection still parses - unclamped, the surplus would arrive as the
-/// start of the next response (a framing desync).
+/// A file grown after the length was declared: reads clamp to the declared length, so exactly `len` bytes arrive and
+/// the NEXT request on the same connection still parses - unclamped, the surplus would arrive as the start of the next
+/// response (a framing desync).
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_file_body_clamps_a_file_grown_mid_reply() {
@@ -2163,19 +1918,14 @@ fn http_file_body_clamps_a_file_grown_mid_reply() {
         fs.open(who, &anchor, c"obj", how, move |done, _fs| {
             match done.file() {
                 Some(file) => {
-                    // Grow the file between the open and the reply: the
-                    // declared length is a snapshot; the surplus must never
-                    // reach the wire.
+                    // Grow the file between the open and the reply: the declared length is a snapshot; the surplus must
+                    // never reach the wire.
                     std::fs::OpenOptions::new()
                         .append(true)
                         .open(&fp)
                         .and_then(|mut f| f.write_all(b"SURPLUS-NEVER-SENT"))
                         .expect("append");
-                    deferred.reply(HttpResponse::new(200).file_body(
-                        file,
-                        0,
-                        SIZE as u64,
-                    ));
+                    deferred.reply(HttpResponse::new(200).file_body(file, 0, SIZE as u64));
                 }
                 None => deferred.close(),
             }
@@ -2194,8 +1944,7 @@ fn http_file_body_clamps_a_file_grown_mid_reply() {
             let (status, _head, body) = read_response(&mut s)?;
             assert_eq!(status, 200);
             assert_eq!(body, content, "exactly the declared length");
-            // Nothing leaked past the declared length: the next request on
-            // this connection frames cleanly.
+            // Nothing leaked past the declared length: the next request on this connection frames cleanly.
             s.write_all(b"GET /small HTTP/1.1\r\nHost: t\r\n\r\n")?;
             let (status, _head, body) = read_response(&mut s)?;
             assert_eq!((status, &body[..]), (200, &b"after"[..]));
@@ -2206,11 +1955,10 @@ fn http_file_body_clamps_a_file_grown_mid_reply() {
     };
 }
 
-/// A file truncated after the length was declared: the read hits EOF short
-/// of the contract, and the only honest answer is a mid-body close - the
-/// client sees a truncated transfer, never a short body framed as complete.
-/// (The first read also comes back short - the file shrank below one chunk
-/// -- so this pins short-read continuation and EOF classification at once.)
+/// A file truncated after the length was declared: the read hits EOF short of the contract, and the only honest answer
+/// is a mid-body close - the client sees a truncated transfer, never a short body framed as complete. (The first read
+/// also comes back short - the file shrank below one chunk -- so this pins short-read continuation and EOF
+/// classification at once.)
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_file_body_truncation_closes_mid_body() {
@@ -2246,18 +1994,13 @@ fn http_file_body_truncation_closes_mid_body() {
         fs.open(who, &anchor, c"obj", how, move |done, _fs| {
             match done.file() {
                 Some(file) => {
-                    // Shrink after the open: the declared length becomes a
-                    // promise the file can no longer keep.
+                    // Shrink after the open: the declared length becomes a promise the file can no longer keep.
                     std::fs::OpenOptions::new()
                         .write(true)
                         .open(&fp)
                         .and_then(|f| f.set_len(SHRUNK as u64))
                         .expect("truncate");
-                    deferred.reply(HttpResponse::new(200).file_body(
-                        file,
-                        0,
-                        SIZE as u64,
-                    ));
+                    deferred.reply(HttpResponse::new(200).file_body(file, 0, SIZE as u64));
                 }
                 None => deferred.close(),
             }
@@ -2275,21 +2018,14 @@ fn http_file_body_truncation_closes_mid_body() {
             s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
             let (status, head) = read_head(&mut s)?;
             assert_eq!(status, 200);
-            assert!(
-                head.contains(&format!("Content-Length: {SIZE}\r\n")),
-                "{head}"
-            );
+            assert!(head.contains(&format!("Content-Length: {SIZE}\r\n")), "{head}");
             let mut got = Vec::new();
             s.read_to_end(&mut got)?;
             assert!(
                 got.len() < SIZE,
                 "the transfer must be visibly truncated, got all {SIZE}"
             );
-            assert_eq!(
-                got,
-                content[..got.len()],
-                "what did arrive is the true prefix"
-            );
+            assert_eq!(got, content[..got.len()], "what did arrive is the true prefix");
             Ok(())
         },
     ) else {
@@ -2297,10 +2033,9 @@ fn http_file_body_truncation_closes_mid_body() {
     };
 }
 
-/// A file-sourced body over kernel TLS is nothing special - chunks are
-/// plaintext buffers on the ordinary send path, encrypted in the kernel --
-/// so the same multi-chunk stream arrives byte-exact and the connection
-/// serves the next request. Worth proving once, which is what this is.
+/// A file-sourced body over kernel TLS is nothing special - chunks are plaintext buffers on the ordinary send path,
+/// encrypted in the kernel -- so the same multi-chunk stream arrives byte-exact and the connection serves the next
+/// request. Worth proving once, which is what this is.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn ktls_file_body_streams_intact() {
@@ -2329,9 +2064,7 @@ fn ktls_file_body_streams_intact() {
         |_inc: Incoming<'_>| Some(()),
         move |req: HttpRequest<'_>, _state: &mut (), fs| {
             if req.target == "/small" {
-                return HttpVerdict::Respond(
-                    HttpResponse::new(200).body("after"),
-                );
+                return HttpVerdict::Respond(HttpResponse::new(200).body("after"));
             }
             let Some(mut fs) = fs else {
                 return HttpVerdict::Respond(HttpResponse::new(500));
@@ -2340,13 +2073,9 @@ fn ktls_file_body_streams_intact() {
             let who = *pc.get().expect("personality set before serving");
             let anchor = anchor.clone();
             let how = OpenHow::new().flags(OFlag::O_RDONLY);
-            fs.open(who, &anchor, c"obj", how, move |done, _fs| {
-                match done.file() {
-                    Some(file) => deferred.reply(
-                        HttpResponse::new(200).file_body(file, 0, SIZE as u64),
-                    ),
-                    None => deferred.close(),
-                }
+            fs.open(who, &anchor, c"obj", how, move |done, _fs| match done.file() {
+                Some(file) => deferred.reply(HttpResponse::new(200).file_body(file, 0, SIZE as u64)),
+                None => deferred.close(),
             });
             HttpVerdict::Defer(permit)
         },
@@ -2361,14 +2090,12 @@ fn ktls_file_body_streams_intact() {
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server = match Server::with_config([Listen::tls(addr)], cfg, proto)
-    {
+    let mut server = match Server::with_config([Listen::tls(addr)], cfg, proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
     };
-    pers.set(server.register_self().expect("register_self"))
-        .unwrap();
+    pers.set(server.register_self().expect("register_self")).unwrap();
     server.set_tls_handshake(move |fd, _inc, deferral| {
         let acceptor = Arc::clone(&acceptor);
         thread::spawn(move || match ktls_server_handshake(fd, &acceptor) {
@@ -2400,9 +2127,8 @@ fn ktls_file_body_streams_intact() {
     join.join().expect("client thread").expect("client io");
 }
 
-/// A request pipelined behind a streaming body is answered after it, in
-/// order: both requests ride one write, and the second reply follows the
-/// full first body on the wire.
+/// A request pipelined behind a streaming body is answered after it, in order: both requests ride one write, and the
+/// second reply follows the full first body on the wire.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_file_body_holds_a_pipelined_request_until_the_body_completes() {
@@ -2434,15 +2160,9 @@ fn http_file_body_holds_a_pipelined_request_until_the_body_completes() {
         let who = *pc.get().expect("personality set before serving");
         let anchor = anchor.clone();
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
-        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
-            match done.file() {
-                Some(file) => deferred.reply(HttpResponse::new(200).file_body(
-                    file,
-                    0,
-                    SIZE as u64,
-                )),
-                None => deferred.close(),
-            }
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| match done.file() {
+            Some(file) => deferred.reply(HttpResponse::new(200).file_body(file, 0, SIZE as u64)),
+            None => deferred.close(),
         });
         HttpVerdict::Defer(permit)
     });
@@ -2454,8 +2174,7 @@ fn http_file_body_holds_a_pipelined_request_until_the_body_completes() {
         move |v4| {
             let mut s = connect_tcp(v4)?;
             s.set_read_timeout(Some(Duration::from_secs(10)))?;
-            // Both requests in one write: the second is buffered behind the
-            // streaming reply and answered after it.
+            // Both requests in one write: the second is buffered behind the streaming reply and answered after it.
             s.write_all(
                 b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n\
                   GET /small HTTP/1.1\r\nHost: t\r\n\r\n",
@@ -2472,9 +2191,8 @@ fn http_file_body_holds_a_pipelined_request_until_the_body_completes() {
     };
 }
 
-/// Bind a **streaming** http server that reassembles what it is given and
-/// echoes it back, so the assertion is that a body delivered in pieces is
-/// the body that was sent. `None` means io_uring is unavailable (a skip).
+/// Bind a **streaming** http server that reassembles what it is given and echoes it back, so the assertion is that a
+/// body delivered in pieces is the body that was sent. `None` means io_uring is unavailable (a skip).
 fn with_streaming_server<T: Send + 'static>(
     max_body: u64,
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
@@ -2482,9 +2200,8 @@ fn with_streaming_server<T: Send + 'static>(
     use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
 
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    // Per-connection state: what the windows have added up to, and how many
-    // of them there were - the count is what proves it streamed rather than
-    // arrived whole.
+    // Per-connection state: what the windows have added up to, and how many of them there were - the count is what
+    // proves it streamed rather than arrived whole.
     let proto = protocol_streaming(
         HttpConfig::default(),
         max_body,
@@ -2531,23 +2248,18 @@ fn with_streaming_server<T: Send + 'static>(
     Some(join.join().expect("client thread").expect("client io"))
 }
 
-/// A known-length streamed PUT whose exhausting window is resolved with
-/// `HttpDeferred::redrive` must not eat the next pipelined request.
+/// A known-length streamed PUT whose exhausting window is resolved with `HttpDeferred::redrive` must not eat the next
+/// pipelined request.
 ///
-/// `Phase::StreamDone` is the marker for "the length is spent; the End
-/// stage is owed and there is no wire left to frame it from". The resume
-/// route dispatches End off the park for exactly that reason. A redrive
-/// that restores the phase instead leaves the connection in `StreamDone`
-/// with bytes buffered, and the framer's degrade arm then declares those
-/// bytes - the next request's head - as this message's header, which the
-/// End dispatch parses as a trailer section. The PUT is answered while the
-/// request behind it is consumed: a desync, and the reply the peer gets
-/// next belongs to a request it never had answered.
+/// `Phase::StreamDone` is the marker for "the length is spent; the End stage is owed and there is no wire left to frame
+/// it from". The resume route dispatches End off the park for exactly that reason. A redrive that restores the phase
+/// instead leaves the connection in `StreamDone` with bytes buffered, and the framer's degrade arm then declares those
+/// bytes - the next request's head - as this message's header, which the End dispatch parses as a trailer section. The
+/// PUT is answered while the request behind it is consumed: a desync, and the reply the peer gets next belongs to a
+/// request it never had answered.
 #[test]
 fn a_redriven_known_length_stream_does_not_eat_the_next_request() {
-    use truenas_ros::http::{
-        HttpDeferred, HttpVerdict, Stage, protocol_streaming,
-    };
+    use truenas_ros::http::{HttpDeferred, HttpVerdict, Stage, protocol_streaming};
 
     const PUT_LEN: usize = 200 * 1024;
 
@@ -2562,9 +2274,8 @@ fn a_redriven_known_length_stream_does_not_eat_the_next_request() {
                 *st = (0, false);
                 HttpVerdict::Continue
             }
-            // Defer on the window that *exhausts* the declared length -
-            // the only one whose park carries the `StreamDone` marker,
-            // because after it there is no wire left to frame End from.
+            // Defer on the window that *exhausts* the declared length - the only one whose park carries the
+            // `StreamDone` marker, because after it there is no wire left to frame End from.
             Stage::Window => {
                 st.0 += req.body.len();
                 if st.0 == PUT_LEN && !st.1 {
@@ -2598,14 +2309,10 @@ fn a_redriven_known_length_stream_does_not_eat_the_next_request() {
         let r = (|| -> io::Result<(u16, u16)> {
             let mut s = connect_tcp(v4)?;
             s.set_read_timeout(Some(Duration::from_secs(5)))?;
-            // The PUT and a plain GET behind it, in one write, so the head
-            // read over-reads into the second request.
+            // The PUT and a plain GET behind it, in one write, so the head read over-reads into the second request.
             let body = vec![b'x'; PUT_LEN];
-            let mut wire = format!(
-                "PUT /up HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            )
-            .into_bytes();
+            let mut wire =
+                format!("PUT /up HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
             wire.extend_from_slice(&body);
             wire.extend_from_slice(b"GET /after HTTP/1.1\r\nHost: t\r\n\r\n");
             s.write_all(&wire)?;
@@ -2617,8 +2324,7 @@ fn a_redriven_known_length_stream_does_not_eat_the_next_request() {
         r
     });
     server.serve_forever().expect("serve_forever");
-    let (first, second) =
-        join.join().expect("client thread").expect("client io");
+    let (first, second) = join.join().expect("client thread").expect("client io");
     assert_eq!(first, 200, "the PUT is answered");
     assert_eq!(
         second, 204,
@@ -2629,12 +2335,10 @@ fn a_redriven_known_length_stream_does_not_eat_the_next_request() {
 
 /// A streamed terminal chunk carries its trailers to `Stage::End`.
 ///
-/// The trailer section is the whole point of the streaming path for an S3
-/// front: `X-Amz-Trailer` promises a checksum that only arrives after the
-/// last byte of payload, and a handler that never sees it cannot verify
-/// what it just wrote. The buffered path is pinned by
-/// `chunked_put_and_trailers`; this is the streamed twin, and it asserts on
-/// the trailer *reaching the handler* rather than on any framing detail.
+/// The trailer section is the whole point of the streaming path for an S3 front: `X-Amz-Trailer` promises a checksum
+/// that only arrives after the last byte of payload, and a handler that never sees it cannot verify what it just wrote.
+/// The buffered path is pinned by `chunked_put_and_trailers`; this is the streamed twin, and it asserts on the trailer
+/// *reaching the handler* rather than on any framing detail.
 #[test]
 fn a_streamed_terminal_chunk_carries_its_trailers() {
     use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
@@ -2647,22 +2351,13 @@ fn a_streamed_terminal_chunk_carries_its_trailers() {
         |req: HttpRequest<'_>, _s: &mut ()| match req.stage {
             Stage::Open | Stage::Window => HttpVerdict::Continue,
             Stage::End => {
-                // Name and value both, so a trailer that arrives empty is
-                // distinguishable from one that never arrived.
+                // Name and value both, so a trailer that arrives empty is distinguishable from one that never arrived.
                 let seen: Vec<String> = req
                     .trailers
                     .iter()
-                    .map(|t| {
-                        format!(
-                            "{}={}",
-                            t.name,
-                            String::from_utf8_lossy(t.value)
-                        )
-                    })
+                    .map(|t| format!("{}={}", t.name, String::from_utf8_lossy(t.value)))
                     .collect();
-                HttpVerdict::Respond(
-                    HttpResponse::new(200).header("x-trailers", seen.join(",")),
-                )
+                HttpVerdict::Respond(HttpResponse::new(200).header("x-trailers", seen.join(",")))
             }
             Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
         },
@@ -2704,10 +2399,9 @@ fn a_streamed_terminal_chunk_carries_its_trailers() {
     );
 }
 
-/// A multi-chunk PUT, streamed. The body is larger than any single window
-/// and arrives in pieces the handler never sees together; what comes back
-/// has to be exactly what went out, and the window count has to show it was
-/// never assembled by the codec.
+/// A multi-chunk PUT, streamed. The body is larger than any single window and arrives in pieces the handler never sees
+/// together; what comes back has to be exactly what went out, and the window count has to show it was never assembled
+/// by the codec.
 #[test]
 fn a_streamed_body_arrives_in_windows_and_survives_them() {
     let Some(()) = with_streaming_server(1 << 20, |v4| {
@@ -2739,10 +2433,9 @@ fn a_streamed_body_arrives_in_windows_and_survives_them() {
     };
 }
 
-/// A chunk larger than the window arrives in several windows. The bound on
-/// what this server buffers has to be one it picked: otherwise a peer that
-/// sends a single large chunk decides it, and `max_request_bytes` is the
-/// only thing standing between that and a megabyte per connection.
+/// A chunk larger than the window arrives in several windows. The bound on what this server buffers has to be one it
+/// picked: otherwise a peer that sends a single large chunk decides it, and `max_request_bytes` is the only thing
+/// standing between that and a megabyte per connection.
 #[test]
 fn one_oversized_chunk_is_delivered_in_several_windows() {
     let Some(()) = with_streaming_server(4 << 20, |v4| {
@@ -2769,9 +2462,8 @@ fn one_oversized_chunk_is_delivered_in_several_windows() {
     };
 }
 
-/// The decoded cap is measured as chunks are declared, so a body that
-/// exceeds it is refused partway through rather than after being buffered --
-/// which is the point, since it is never buffered.
+/// The decoded cap is measured as chunks are declared, so a body that exceeds it is refused partway through rather than
+/// after being buffered -- which is the point, since it is never buffered.
 #[test]
 fn a_streamed_body_over_the_cap_is_refused_mid_stream() {
     let Some(()) = with_streaming_server(8192, |v4| {
@@ -2785,8 +2477,8 @@ fn a_streamed_body_over_the_cap_is_refused_mid_stream() {
             wire.extend_from_slice(b"\r\n");
         }
         wire.extend_from_slice(b"0\r\n\r\n");
-        // The peer may be cut off mid-write once the server answers 413 and
-        // closes; that is the refusal working, not a test failure.
+        // The peer may be cut off mid-write once the server answers 413 and closes; that is the refusal working, not a
+        // test failure.
         let _ = s.write_all(&wire);
         let (status, _) = read_head(&mut s)?;
         assert_eq!(status, 413, "refused as the cap was crossed");
@@ -2796,10 +2488,10 @@ fn a_streamed_body_over_the_cap_is_refused_mid_stream() {
     };
 }
 
-/// A handler that refuses partway through a body. The peer is still
-/// sending, and nothing will read the rest, so the reply has to be final:
-/// a keep-alive answer would leave the remaining chunks to be framed as the
-/// next request. The client must see the status and then EOF.
+/// A handler that refuses partway through a body. The peer is still sending, and nothing will read the rest, so the
+/// reply has to be final:
+/// a keep-alive answer would leave the remaining chunks to be framed as the next request. The client must see the
+/// status and then EOF.
 #[test]
 fn a_handler_refusing_mid_body_ends_the_connection() {
     use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
@@ -2811,15 +2503,12 @@ fn a_handler_refusing_mid_body_ends_the_connection() {
         |_inc: Incoming<'_>| Some(0usize),
         |req: HttpRequest<'_>, seen: &mut usize| match req.stage {
             Stage::Open => HttpVerdict::Continue,
-            // Accept one window, then refuse - the shape a quota or a
-            // checksum failure has.
+            // Accept one window, then refuse - the shape a quota or a checksum failure has.
             Stage::Window if *seen == 0 => {
                 *seen += 1;
                 HttpVerdict::Continue
             }
-            Stage::Window => {
-                HttpVerdict::Respond(HttpResponse::new(413).body("too much"))
-            }
+            Stage::Window => HttpVerdict::Respond(HttpResponse::new(413).body("too much")),
             _ => HttpVerdict::Respond(HttpResponse::new(200)),
         },
     )
@@ -2846,8 +2535,7 @@ fn a_handler_refusing_mid_body_ends_the_connection() {
                 wire.extend_from_slice(b"\r\n");
             }
             wire.extend_from_slice(b"0\r\n\r\n");
-            // The refusal closes under us; a partial write is the mechanism
-            // working, not a failure.
+            // The refusal closes under us; a partial write is the mechanism working, not a failure.
             let _ = s.write_all(&wire);
             let (status, head1) = read_head(&mut s)?;
             assert_eq!(status, 413, "the handler's refusal reached the peer");
@@ -2857,8 +2545,8 @@ fn a_handler_refusing_mid_body_ends_the_connection() {
                  a peer told keep-alive and then given EOF cannot tell \
                  whether it was answered or cut off: {head1}"
             );
-            // And then nothing: the connection is finished, so a read past
-            // the body sees EOF rather than another response.
+            // And then nothing: the connection is finished, so a read past the body sees EOF rather than another
+            // response.
             let mut rest = Vec::new();
             s.read_to_end(&mut rest)?;
             assert!(
@@ -2874,12 +2562,10 @@ fn a_handler_refusing_mid_body_ends_the_connection() {
     join.join().expect("client thread").expect("client io");
 }
 
-/// The redrive twin of the resume test above: a deferred `Open` resolved
-/// by `HttpDeferred::redrive` - the handler re-runs and answers
-/// `Continue` - owes the withheld interim exactly as a `resume()` does.
+/// The redrive twin of the resume test above: a deferred `Open` resolved by `HttpDeferred::redrive` - the handler
+/// re-runs and answers `Continue` - owes the withheld interim exactly as a `resume()` does.
 /// The two routes emit independently, so each carries its own pin;
-/// without this one an expecting client holds its body back for its own
-/// timeout.
+/// without this one an expecting client holds its body back for its own timeout.
 #[test]
 fn a_redriven_stream_open_still_sends_the_interim() {
     use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
@@ -2894,8 +2580,7 @@ fn a_redriven_stream_open_still_sends_the_interim() {
                 *opened = 1;
                 let (d, permit) = req.defer();
                 thread::spawn(move || {
-                    // The off-thread decision, resolved by re-running the
-                    // handler rather than by resuming the stream.
+                    // The off-thread decision, resolved by re-running the handler rather than by resuming the stream.
                     thread::sleep(Duration::from_millis(20));
                     d.redrive();
                 });
@@ -2948,11 +2633,9 @@ fn a_redriven_stream_open_still_sends_the_interim() {
 
 /// A deferred stream open must still release the withheld `100 Continue`.
 ///
-/// The interim is withheld pending the open decision, and an expecting
-/// client sends no body byte until it arrives - so a handler that defers
-/// that decision (an authorization check is the canonical case) and then
-/// resumes must emit it from the resume path, or every expecting PUT
-/// stalls for the client's own timeout against a server that thinks it is
+/// The interim is withheld pending the open decision, and an expecting client sends no body byte until it arrives - so
+/// a handler that defers that decision (an authorization check is the canonical case) and then resumes must emit it
+/// from the resume path, or every expecting PUT stalls for the client's own timeout against a server that thinks it is
 /// waiting for a body.
 #[test]
 fn a_deferred_stream_open_still_sends_the_interim() {
@@ -2981,15 +2664,14 @@ fn a_deferred_stream_open_still_sends_the_interim() {
         return; // io_uring unavailable
     };
 
-    /// A streaming server whose `Open` handler defers off-thread and
-    /// resumes a moment later - the review's reproducer shape.
+    /// A streaming server whose `Open` handler defers off-thread and resumes a moment later - the review's reproducer
+    /// shape.
     fn with_streaming_deferring_server<T: Send + 'static>(
         client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
     ) -> Option<T> {
         use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
 
-        let addr =
-            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
         let proto = protocol_streaming(
             HttpConfig::default(),
             1 << 20,
@@ -3009,9 +2691,7 @@ fn a_deferred_stream_open_still_sends_the_interim() {
                     *seen += req.body.len();
                     HttpVerdict::Continue
                 }
-                Stage::End => HttpVerdict::Respond(
-                    HttpResponse::new(200).header("x-bytes", seen.to_string()),
-                ),
+                Stage::End => HttpVerdict::Respond(HttpResponse::new(200).header("x-bytes", seen.to_string())),
                 Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
             },
         )
@@ -3036,16 +2716,13 @@ fn a_deferred_stream_open_still_sends_the_interim() {
     }
 }
 
-/// A peer pacing an exact read below `want / request_timeout` used to die
-/// mid-transfer: the linked request clock cancelled the `MSG_WAITALL` recv
-/// with partial progress and the short-positive completion always closed.
-/// The clock-cancelled continuation (`resubmit_exact_recv`) resumes the
-/// read instead, so the clock bounds progress-per-period rather than
-/// imposing a throughput floor on the whole window.
+/// A peer pacing an exact read below `want / request_timeout` used to die mid-transfer: the linked request clock
+/// cancelled the `MSG_WAITALL` recv with partial progress and the short-positive completion always closed. The
+/// clock-cancelled continuation (`resubmit_exact_recv`) resumes the read instead, so the clock bounds
+/// progress-per-period rather than imposing a throughput floor on the whole window.
 ///
-/// 128 KiB `Content-Length` body written 16 KiB per ~150 ms against a
-/// 500 ms request clock: the transfer spans ~2 clock periods, every period
-/// sees progress, and the upload must complete and echo back intact.
+/// 128 KiB `Content-Length` body written 16 KiB per ~150 ms against a 500 ms request clock: the transfer spans ~2 clock
+/// periods, every period sees progress, and the upload must complete and echo back intact.
 #[test]
 fn a_put_pacing_a_window_below_the_clock_floor_completes() {
     use truenas_ros::net::server::ServerConfig;
@@ -3056,10 +2733,9 @@ fn a_put_pacing_a_window_below_the_clock_floor_completes() {
     };
     let Some(()) = with_http_server_cfg(cfg, |v4| {
         let body: Vec<u8> = (0..128 * 1024).map(|i| (i % 249) as u8).collect();
-        // A loaded runner can stall the pacing loop past a whole clock
-        // period, which is a legitimate zero-progress close - retry those.
-        // The regression this pins is deterministic (the first mid-window
-        // expiry kills the upload), so every attempt fails under it.
+        // A loaded runner can stall the pacing loop past a whole clock period, which is a legitimate zero-progress
+        // close - retry those. The regression this pins is deterministic (the first mid-window expiry kills the
+        // upload), so every attempt fails under it.
         let mut last = None;
         for _ in 0..3 {
             let r = (|| -> io::Result<Vec<u8>> {
@@ -3079,10 +2755,7 @@ fn a_put_pacing_a_window_below_the_clock_floor_completes() {
             })();
             match r {
                 Ok(echoed) => {
-                    assert_eq!(
-                        echoed, body,
-                        "echoed body differs from what was sent"
-                    );
+                    assert_eq!(echoed, body, "echoed body differs from what was sent");
                     return Ok(());
                 }
                 Err(e) => last = Some(e),
@@ -3094,13 +2767,10 @@ fn a_put_pacing_a_window_below_the_clock_floor_completes() {
     };
 }
 
-/// The same pace through a STREAMED chunked upload - the default-client
-/// shape (botocore frames 128 KiB HTTP chunks, and a streaming handler
-/// consumes them as stream windows). A plain accumulating handler dodges the floor by
-/// accident (chunked bodies arrive through non-exact `More` scans, each
-/// arrival re-arming a fresh clock); a streamed window is one exact
-/// `MSG_WAITALL` read under one clock, so this is where the chunked
-/// framing hit it.
+/// The same pace through a STREAMED chunked upload - the default-client shape (botocore frames 128 KiB HTTP chunks, and
+/// a streaming handler consumes them as stream windows). A plain accumulating handler dodges the floor by accident
+/// (chunked bodies arrive through non-exact `More` scans, each arrival re-arming a fresh clock); a streamed window is
+/// one exact `MSG_WAITALL` read under one clock, so this is where the chunked framing hit it.
 #[test]
 fn a_streamed_chunked_put_pacing_below_the_clock_floor_completes() {
     use std::sync::{Arc, Mutex};
@@ -3116,9 +2786,7 @@ fn a_streamed_chunked_put_pacing_below_the_clock_floor_completes() {
         HttpConfig::default(),
         1 << 20,
         move |_inc: Incoming<'_>| Some(sink.clone()),
-        |mut req: HttpRequest<'_>, sink: &mut Arc<Mutex<Vec<u8>>>| match req
-            .stage
-        {
+        |mut req: HttpRequest<'_>, sink: &mut Arc<Mutex<Vec<u8>>>| match req.stage {
             Stage::Open => HttpVerdict::Continue,
             Stage::Window => {
                 sink.lock().unwrap().extend_from_slice(&req.body.take());
@@ -3145,9 +2813,8 @@ fn a_streamed_chunked_put_pacing_below_the_clock_floor_completes() {
     let sent = body.clone();
     let join = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
-        // Same retry policy as the Content-Length twin above: a loaded
-        // runner stalling a full period is a legitimate close, while the
-        // pinned regression fails every attempt.
+        // Same retry policy as the Content-Length twin above: a loaded runner stalling a full period is a legitimate
+        // close, while the pinned regression fails every attempt.
         let mut last = None;
         for _ in 0..3 {
             got.lock().unwrap().clear();
@@ -3171,10 +2838,7 @@ fn a_streamed_chunked_put_pacing_below_the_clock_floor_completes() {
             match r {
                 Ok(()) => {
                     let delivered = got.lock().unwrap();
-                    assert_eq!(
-                        *delivered, sent,
-                        "windows delivered differ from what was sent"
-                    );
+                    assert_eq!(*delivered, sent, "windows delivered differ from what was sent");
                     stop.shutdown();
                     return Ok(());
                 }
@@ -3188,10 +2852,9 @@ fn a_streamed_chunked_put_pacing_below_the_clock_floor_completes() {
     join.join().expect("client thread").expect("client io");
 }
 
-/// The continuation must not have unseated the slow-loris guard: a transfer
-/// that makes NO progress for a full request-clock period still closes. The
-/// peer sends a quarter of the declared body and then stalls; the server
-/// must FIN within a few periods, never answer 200.
+/// The continuation must not have unseated the slow-loris guard: a transfer that makes NO progress for a full
+/// request-clock period still closes. The peer sends a quarter of the declared body and then stalls; the server must
+/// FIN within a few periods, never answer 200.
 #[test]
 fn a_stalled_transfer_still_dies_by_the_request_clock() {
     use truenas_ros::net::server::ServerConfig;
@@ -3202,14 +2865,10 @@ fn a_stalled_transfer_still_dies_by_the_request_clock() {
     };
     let Some(()) = with_http_server_cfg(cfg, |v4| {
         let mut s = connect_tcp(v4)?;
-        write!(
-            s,
-            "PUT /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 131072\r\n\r\n"
-        )?;
+        write!(s, "PUT /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 131072\r\n\r\n")?;
         s.write_all(&[7u8; 32 * 1024])?;
-        // Stall. The read outlasts several clock periods, so anything but
-        // the server closing the connection is a failure; a 200 here means
-        // a quarter of a body was delivered as whole.
+        // Stall. The read outlasts several clock periods, so anything but the server closing the connection is a
+        // failure; a 200 here means a quarter of a body was delivered as whole.
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut b = [0u8; 512];
         match s.read(&mut b) {
@@ -3228,21 +2887,17 @@ fn a_stalled_transfer_still_dies_by_the_request_clock() {
     };
 }
 
-/// A streamed body between windows is a message in progress, not an idle
-/// connection - so it carries `request_timeout` and arms `max_receipt_time`.
+/// A streamed body between windows is a message in progress, not an idle connection - so it carries `request_timeout`
+/// and arms `max_receipt_time`.
 ///
-/// The reactor cannot tell the two apart on its own: a streaming codec
-/// consumes each window as its own message, so at a chunk boundary (and
-/// after the head has gone out as `Stage::Open`) the accumulate buffer is
-/// empty, which is exactly what "parked for the next request" looks like.
-/// `Framing::MoreInMessage` is the framer saying otherwise.
+/// The reactor cannot tell the two apart on its own: a streaming codec consumes each window as its own message, so at a
+/// chunk boundary (and after the head has gone out as `Stage::Open`) the accumulate buffer is empty, which is exactly
+/// what "parked for the next request" looks like. `Framing::MoreInMessage` is the framer saying otherwise.
 ///
-/// The negative control is the configuration: `idle_timeout` is deliberately
-/// unset here, so if the read is misclassified as idle it carries **no
-/// clock at all** and the peer holds its pool slot - taken at accept, before
-/// any authentication - forever. Reverting `known_step`/`stream_step`/
-/// `scan_step` to plain `More` hangs this test rather than failing it fast,
-/// which is the shape of the denial it guards.
+/// The negative control is the configuration: `idle_timeout` is deliberately unset here, so if the read is
+/// misclassified as idle it carries **no clock at all** and the peer holds its pool slot - taken at accept, before any
+/// authentication - forever. Reverting `known_step`/`stream_step`/ `scan_step` to plain `More` hangs this test rather
+/// than failing it fast, which is the shape of the denial it guards.
 #[test]
 fn a_stalled_streamed_upload_is_reaped_mid_body() {
     use std::sync::{Arc, Mutex};
@@ -3251,11 +2906,10 @@ fn a_stalled_streamed_upload_is_reaped_mid_body() {
     use truenas_ros::net::server::ServerConfig;
 
     for (what, trailer) in [
-        // Stall the moment the head has been delivered: the framer is in
-        // `StreamOpen` -> `StreamBody` with nothing buffered.
+        // Stall the moment the head has been delivered: the framer is in `StreamOpen` -> `StreamBody` with nothing
+        // buffered.
         ("after the head", None),
-        // Stall at a chunk boundary, the CRLF after the payload withheld so
-        // the buffer is empty there too.
+        // Stall at a chunk boundary, the CRLF after the payload withheld so the buffer is empty there too.
         ("after one full window", Some(128 * 1024usize)),
     ] {
         let reasons = Arc::new(Mutex::new(Vec::new()));
@@ -3265,8 +2919,7 @@ fn a_stalled_streamed_upload_is_reaped_mid_body() {
             idle_timeout: None, // the control: nothing else can reap this
             ..ServerConfig::default()
         };
-        let addr =
-            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
         let proto = protocol_streaming(
             HttpConfig::default(),
             1 << 30,
@@ -3316,12 +2969,8 @@ fn a_stalled_streamed_upload_is_reaped_mid_body() {
                         "answered {n} bytes to a stalled upload: {:?}",
                         String::from_utf8_lossy(&b[..n.min(64)])
                     ),
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
-                        Ok(())
-                    }
-                    Err(e) => panic!(
-                        "{what}: the server never reclaimed the slot: {e}"
-                    ),
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Ok(()),
+                    Err(e) => panic!("{what}: the server never reclaimed the slot: {e}"),
                 }
             })();
             stop.shutdown();
@@ -3340,17 +2989,14 @@ fn a_stalled_streamed_upload_is_reaped_mid_body() {
     }
 }
 
-/// The receipt budget reaches a streamed window: a peer pacing one window
-/// slower than `max_receipt_time` is reclaimed even though it satisfies
-/// `request_timeout` throughout.
+/// The receipt budget reaches a streamed window: a peer pacing one window slower than `max_receipt_time` is reclaimed
+/// even though it satisfies `request_timeout` throughout.
 ///
-/// This is the property that separates the two clocks
-/// (`ServerConfig::max_receipt_time`), on the framing where the floor the
-/// config documents - one window over the budget - actually has to hold.
+/// This is the property that separates the two clocks (`ServerConfig::max_receipt_time`), on the framing where the
+/// floor the config documents - one window over the budget - actually has to hold.
 ///
-/// Not a control for `Framing::MoreInMessage`: the chunk-size line leaves
-/// bytes buffered, so this arm would find the budget armed either way. The
-/// stall above is the case that needs the framer's verdict.
+/// Not a control for `Framing::MoreInMessage`: the chunk-size line leaves bytes buffered, so this arm would find the
+/// budget armed either way. The stall above is the case that needs the framer's verdict.
 #[test]
 fn a_streamed_window_paced_under_the_floor_is_reclaimed() {
     use std::sync::{Arc, Mutex};
@@ -3400,9 +3046,8 @@ fn a_streamed_window_paced_under_the_floor_is_reclaimed() {
                 b"PUT /o HTTP/1.1\r\nHost: t\r\n\
                   Transfer-Encoding: chunked\r\n\r\n",
             )?;
-            // A chunk far larger than one window, then one byte per 150 ms --
-            // half `request_timeout`, so that clock is satisfied throughout
-            // while the window needs hours.
+            // A chunk far larger than one window, then one byte per 150 ms -- half `request_timeout`, so that clock is
+            // satisfied throughout while the window needs hours.
             s.write_all(b"40000\r\n")?;
             s.flush()?;
             for _ in 0..40 {

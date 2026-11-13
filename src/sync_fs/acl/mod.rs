@@ -1,23 +1,17 @@
 //! NFS4 and POSIX1E access-control lists.
 //!
-//! [`fgetacl`] probes an open file to decide whether it carries an NFS4 ACL
-//! (`system.nfs4_acl_xdr`, as used by ZFS) or a POSIX1E ACL
-//! (`system.posix_acl_*`) and returns the decoded [`Acl`]. [`fsetacl`] writes
-//! one back (or removes it). The wire formats and validation exactly mirror
-//! the `truenas_os` C extension.
+//! [`fgetacl`] probes an open file to decide whether it carries an NFS4 ACL (`system.nfs4_acl_xdr`, as used by ZFS) or
+//! a POSIX1E ACL (`system.posix_acl_*`) and returns the decoded [`Acl`]. [`fsetacl`] writes one back (or removes it).
+//! The wire formats and validation exactly mirror the `truenas_os` C extension.
 //!
-//! [`PosixAcl::to_nfs4_lossy`] and [`Nfs4Acl::to_posix_lossy`] translate
-//! between the two models for a caller that needs one shape whatever the
-//! filesystem hands back. Neither is a bijection, and each documents what it
-//! drops.
+//! [`PosixAcl::to_nfs4_lossy`] and [`Nfs4Acl::to_posix_lossy`] translate between the two models for a caller that needs
+//! one shape whatever the filesystem hands back. Neither is a bijection, and each documents what it drops.
 
 mod lossy;
 mod nfs4;
 mod posix;
 
-pub use nfs4::{
-    Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm, Nfs4Who,
-};
+pub use nfs4::{Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm, Nfs4Who};
 pub use posix::{PosixAce, PosixAcl, PosixPerm, PosixTag};
 
 use crate::errno::Errno;
@@ -35,12 +29,11 @@ pub enum Acl {
     Posix(PosixAcl),
 }
 
-/// The target of an ACL validation: a real file descriptor (whose type is
-/// checked with `fstat`), or the sentinel meaning "validate as if a directory".
+/// The target of an ACL validation: a real file descriptor (whose type is checked with `fstat`), or the sentinel
+/// meaning "validate as if a directory".
 #[derive(Clone, Copy, Debug)]
 pub enum AclTarget<'fd> {
-    /// Validate against this open file (directory-only rules apply if it is a
-    /// directory).
+    /// Validate against this open file (directory-only rules apply if it is a directory).
     Fd(BorrowedFd<'fd>),
     /// Validate as though the target were a directory.
     AssumeDir,
@@ -63,18 +56,15 @@ fn fstat_mode(fd: BorrowedFd<'_>) -> Result<u32> {
 fn target_is_dir(target: AclTarget<'_>) -> Result<bool> {
     match target {
         AclTarget::AssumeDir => Ok(true),
-        AclTarget::Fd(fd) => {
-            Ok(fstat_mode(fd)? & libc::S_IFMT == libc::S_IFDIR)
-        }
+        AclTarget::Fd(fd) => Ok(fstat_mode(fd)? & libc::S_IFMT == libc::S_IFDIR),
     }
 }
 
 /// Read the ACL from an open file descriptor.
 ///
-/// Returns an [`Acl::Nfs4`] on ZFS/NFS4 filesystems and an [`Acl::Posix`] on
-/// POSIX1E filesystems. When the access ACL xattr is absent on a POSIX
-/// filesystem, a trivial ACL is synthesised from the file's mode bits. Fails
-/// with `Errno::EOPNOTSUPP` if ACLs are disabled on the filesystem entirely.
+/// Returns an [`Acl::Nfs4`] on ZFS/NFS4 filesystems and an [`Acl::Posix`] on POSIX1E filesystems. When the access ACL
+/// xattr is absent on a POSIX filesystem, a trivial ACL is synthesised from the file's mode bits. Fails with
+/// `Errno::EOPNOTSUPP` if ACLs are disabled on the filesystem entirely.
 pub fn fgetacl<Fd: AsFd>(fd: Fd) -> Result<Acl> {
     let fd = fd.as_fd();
     match fgetxattr(fd, nfs4::NFS4_ACL_XATTR) {
@@ -113,12 +103,7 @@ pub fn fsetacl<Fd: AsFd>(fd: Fd, acl: Option<&Acl>) -> Result<()> {
         None => fremoveacl(fd),
         Some(Acl::Nfs4(a)) => {
             a.validate(target_is_dir(AclTarget::Fd(fd))?)?;
-            fsetxattr(
-                fd,
-                nfs4::NFS4_ACL_XATTR,
-                &a.to_xattr()?,
-                XattrFlags::empty(),
-            )?;
+            fsetxattr(fd, nfs4::NFS4_ACL_XATTR, &a.to_xattr()?, XattrFlags::empty())?;
             Ok(())
         }
         Some(Acl::Posix(a)) => {
@@ -139,13 +124,11 @@ pub fn validate_acl(target: AclTarget<'_>, acl: &Acl) -> Result<()> {
 
 /// Low-level: validate and write raw NFS4 XDR bytes to `system.nfs4_acl_xdr`.
 ///
-/// An **empty** `data` is refused `EINVAL`. It does not write an ACL that
-/// grants nobody anything, which is what a caller that filtered an ACL down
-/// to nothing would mean by it: the kernel leaves `kvalue` NULL for a
-/// zero-length `setxattr` (`setxattr_copy`, `fs/xattr.c:655-669`), and ZFS
-/// reads `(NULL, 0)` as the signal to strip the ACL. So the object would
-/// silently revert to mode-only permissions - the opposite of denying
-/// everyone. Removal has its own spelling, [`fsetacl`] with `None`.
+/// An **empty** `data` is refused `EINVAL`. It does not write an ACL that grants nobody anything, which is what a
+/// caller that filtered an ACL down to nothing would mean by it: the kernel leaves `kvalue` NULL for a zero-length
+/// `setxattr` (`setxattr_copy`, `fs/xattr.c:655-669`), and ZFS reads `(NULL, 0)` as the signal to strip the ACL. So the
+/// object would silently revert to mode-only permissions - the opposite of denying everyone. Removal has its own
+/// spelling, [`fsetacl`] with `None`.
 pub fn fsetacl_nfs4<Fd: AsFd>(fd: Fd, data: &[u8]) -> Result<()> {
     if data.is_empty() {
         return Err(Errno::EINVAL.into());
@@ -156,62 +139,44 @@ pub fn fsetacl_nfs4<Fd: AsFd>(fd: Fd, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Low-level: validate and write raw POSIX ACL xattr bytes. A `None` default
-/// removes the default ACL xattr.
+/// Low-level: validate and write raw POSIX ACL xattr bytes. A `None` default removes the default ACL xattr.
 ///
-/// An **empty** `access` is refused `EINVAL`, for the reason
-/// [`fsetacl_nfs4`] gives: a zero-length `setxattr` reaches the filesystem
-/// as `(NULL, 0)` and removes the ACL rather than writing an empty one.
-/// Removal has its own spelling, [`fsetacl`] with `None`.
-pub fn fsetacl_posix<Fd: AsFd>(
-    fd: Fd,
-    access: &[u8],
-    default: Option<&[u8]>,
-) -> Result<()> {
+/// An **empty** `access` is refused `EINVAL`, for the reason [`fsetacl_nfs4`] gives: a zero-length `setxattr` reaches
+/// the filesystem as `(NULL, 0)` and removes the ACL rather than writing an empty one. Removal has its own spelling,
+/// [`fsetacl`] with `None`.
+pub fn fsetacl_posix<Fd: AsFd>(fd: Fd, access: &[u8], default: Option<&[u8]>) -> Result<()> {
     if access.is_empty() {
         return Err(Errno::EINVAL.into());
     }
     let fd = fd.as_fd();
-    PosixAcl::from_xattr(access, default)?
-        .validate(target_is_dir(AclTarget::Fd(fd))?)?;
+    PosixAcl::from_xattr(access, default)?.validate(target_is_dir(AclTarget::Fd(fd))?)?;
     write_posix(fd, access, default)
 }
 
 /// Write both halves of a POSIX ACL, default half first.
 ///
-/// **On any error the access ACL is unchanged.** That is the whole reason for
-/// the ordering. There is no transactional xattr write, so one of the two
-/// writes has to be the one that can be left behind, and it must not be the
-/// access half: that is what the kernel consults on every open, so a
-/// get-modify-set widening access and growing the default would otherwise
-/// leave the wider rights live while returning `Err` - the caller believing
-/// nothing changed, and the directory granting what the new access ACL names.
+/// **On any error the access ACL is unchanged.** That is the whole reason for the ordering. There is no transactional
+/// xattr write, so one of the two writes has to be the one that can be left behind, and it must not be the access half:
+/// that is what the kernel consults on every open, so a get-modify-set widening access and growing the default would
+/// otherwise leave the wider rights live while returning `Err` - the caller believing nothing changed, and the
+/// directory granting what the new access ACL names.
 ///
-/// `validate` is not a defence here. It checks tag counts, canonical order,
-/// `rwx` bits and id representability, never *size*, and there is no bound on
-/// entry count - so a multi-megabyte default encodes happily and the kernel
-/// answers `E2BIG`. `ENOSPC` and `EDQUOT` reach the same place.
+/// `validate` is not a defence here. It checks tag counts, canonical order, `rwx` bits and id representability, never
+/// *size*, and there is no bound on entry count - so a multi-megabyte default encodes happily and the kernel answers
+/// `E2BIG`. `ENOSPC` and `EDQUOT` reach the same place.
 ///
-/// A default ACL grants nothing by itself; it is inherited by children created
-/// later. So when the access write is the one that fails, the default is put
-/// back. If that restore fails too its errno is what surfaces, and only then
-/// can the default half be left holding the new value.
-fn write_posix(
-    fd: BorrowedFd<'_>,
-    access: &[u8],
-    default: Option<&[u8]>,
-) -> Result<()> {
-    // Read before writing: once the write lands the old value is gone and
-    // the restore below has nothing to put back.
+/// A default ACL grants nothing by itself; it is inherited by children created later. So when the access write is the
+/// one that fails, the default is put back. If that restore fails too its errno is what surfaces, and only then can the
+/// default half be left holding the new value.
+fn write_posix(fd: BorrowedFd<'_>, access: &[u8], default: Option<&[u8]>) -> Result<()> {
+    // Read before writing: once the write lands the old value is gone and the restore below has nothing to put back.
     let prior = match fgetxattr(fd, posix::POSIX_DEFAULT_XATTR) {
         Ok(bytes) => Some(bytes),
-        // Nothing there to preserve - a regular file answers this too - so
-        // restoring means removing. `EOPNOTSUPP` is the filesystem having no
-        // default ACL at all, which the write below reports for itself.
+        // Nothing there to preserve - a regular file answers this too - so restoring means removing. `EOPNOTSUPP` is
+        // the filesystem having no default ACL at all, which the write below reports for itself.
         Err(Errno::ENODATA | Errno::EOPNOTSUPP) => None,
-        // Something is there and could not be read. Writing over it would
-        // destroy a value the restore could not put back, so touch neither
-        // half: an unreadable default is not a licence to replace it.
+        // Something is there and could not be read. Writing over it would destroy a value the restore could not put
+        // back, so touch neither half: an unreadable default is not a licence to replace it.
         Err(e) => return Err(e.into()),
     };
 
@@ -222,15 +187,11 @@ fn write_posix(
         None => ignore_enodata(fremovexattr(fd, posix::POSIX_DEFAULT_XATTR))?,
     }
 
-    let Err(e) =
-        fsetxattr(fd, posix::POSIX_ACCESS_XATTR, access, XattrFlags::empty())
-    else {
+    let Err(e) = fsetxattr(fd, posix::POSIX_ACCESS_XATTR, access, XattrFlags::empty()) else {
         return Ok(());
     };
     match &prior {
-        Some(p) => {
-            fsetxattr(fd, posix::POSIX_DEFAULT_XATTR, p, XattrFlags::empty())?
-        }
+        Some(p) => fsetxattr(fd, posix::POSIX_DEFAULT_XATTR, p, XattrFlags::empty())?,
         None => ignore_enodata(fremovexattr(fd, posix::POSIX_DEFAULT_XATTR))?,
     }
     Err(e.into())

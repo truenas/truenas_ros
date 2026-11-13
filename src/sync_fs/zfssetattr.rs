@@ -1,33 +1,25 @@
-//! One call that sets the mode, owner, group, times and ZFS attributes of a
-//! file, through the xattr `system.truenas_setattr` of the TrueNAS ZFS fork.
+//! One call that sets the mode, owner, group, times and ZFS attributes of a file, through the xattr
+//! `system.truenas_setattr` of the TrueNAS ZFS fork.
 //!
-//! io_uring has no chmod, chown, utimensat or ioctl, but it has
-//! `IORING_OP_FSETXATTR`, so this lets a ring set what those calls set under
-//! a request's personality. ZFS writes everything one value asks for in one
-//! `zfs_setattr` transaction, so all of it applies or none of it does.
+//! io_uring has no chmod, chown, utimensat or ioctl, but it has `IORING_OP_FSETXATTR`, so this lets a ring set what
+//! those calls set under a request's personality. ZFS writes everything one value asks for in one `zfs_setattr`
+//! transaction, so all of it applies or none of it does.
 //!
-//! The handler (`zpl_xattr_setattr_set`, `module/os/linux/zfs/zpl_xattr.c`)
-//! builds the iattr as `chmod_common`, `chown_common` and `vfs_utimes` build
-//! it and calls `notify_change`, so the checks are those of chmod, chown and
-//! utimensat, run as the caller. A birth time needs the owner, as any time
-//! other than now does. `READONLY`, `HIDDEN`, `SYSTEM`, `ARCHIVE`, `OFFLINE`
-//! and `SPARSE` need the owner or write attributes granted by an NFSv4 ACL
-//! that is not trivial. The other [`ZfsAttr`] bits need the owner, and
-//! `IMMUTABLE` and `APPENDONLY` need `CAP_LINUX_IMMUTABLE` as well, whether
-//! or not they would change. A new owner or group of what is not a directory
-//! clears set-user-ID, and set-group-ID when group execute is set, as
-//! `nfsd_sanitize_attrs` (`fs/nfsd/vfs.c`) does.
+//! The handler (`zpl_xattr_setattr_set`, `module/os/linux/zfs/zpl_xattr.c`) builds the iattr as `chmod_common`,
+//! `chown_common` and `vfs_utimes` build it and calls `notify_change`, so the checks are those of chmod, chown and
+//! utimensat, run as the caller. A birth time needs the owner, as any time other than now does. `READONLY`, `HIDDEN`,
+//! `SYSTEM`, `ARCHIVE`, `OFFLINE` and `SPARSE` need the owner or write attributes granted by an NFSv4 ACL that is not
+//! trivial. The other [`ZfsAttr`] bits need the owner, and `IMMUTABLE` and `APPENDONLY` need `CAP_LINUX_IMMUTABLE` as
+//! well, whether or not they would change. A new owner or group of what is not a directory clears set-user-ID, and
+//! set-group-ID when group execute is set, as `nfsd_sanitize_attrs` (`fs/nfsd/vfs.c`) does.
 //!
-//! The VFS refuses every xattr write to an immutable or append only file
-//! (`may_write_xattr`, `fs/xattr.c`), so clearing those two takes
-//! [`fset_zfs_attrs`](super::fset_zfs_attrs). A ZFS without the handler
-//! answers `EOPNOTSUPP`.
+//! The VFS refuses every xattr write to an immutable or append only file (`may_write_xattr`, `fs/xattr.c`), so clearing
+//! those two takes [`fset_zfs_attrs`](super::fset_zfs_attrs). A ZFS without the handler answers `EOPNOTSUPP`.
 
 use super::{Mode, StatxTimestamp, ZfsAttr};
 use std::ffi::CStr;
 
-/// The name the handler answers to, `TRUENAS_XATTR_SETATTR` in
-/// `include/sys/fs/zfs.h`.
+/// The name the handler answers to, `TRUENAS_XATTR_SETATTR` in `include/sys/fs/zfs.h`.
 pub const ZFS_SETATTR: &CStr = c"system.truenas_setattr";
 
 /// `TRUENAS_XATTR_SETATTR_VERSION`.
@@ -51,8 +43,7 @@ const VALID_DOS: u64 = 1 << 6;
 pub enum SetTime {
     /// The time of the call, as `UTIME_NOW` gives it.
     Now,
-    /// This time. A nanosecond count of a second or more is refused with
-    /// `EINVAL`.
+    /// This time. A nanosecond count of a second or more is refused with `EINVAL`.
     At(StatxTimestamp),
 }
 
@@ -67,9 +58,8 @@ impl SetTime {
 
 /// What one call of the setter sets. Whatever is left out stays as it is.
 ///
-/// The kernel refuses with `EINVAL` a value that sets nothing, a mask of no
-/// bits, a uid or gid of `u32::MAX`, and a [`ZfsAttr`] bit both to set and
-/// to clear.
+/// The kernel refuses with `EINVAL` a value that sets nothing, a mask of no bits, a uid or gid of `u32::MAX`, and a
+/// [`ZfsAttr`] bit both to set and to clear.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ZfsSetattr {
     valid: u64,
@@ -95,9 +85,8 @@ impl ZfsSetattr {
         self.mode_masked(mode, Mode::all())
     }
 
-    /// Set the bits of `mask` to what `mode` holds and leave the others, as
-    /// NFS's `mode_set_masked` does. Bits of `mode` outside `mask` are
-    /// ignored.
+    /// Set the bits of `mask` to what `mode` holds and leave the others, as NFS's `mode_set_masked` does. Bits of
+    /// `mode` outside `mask` are ignored.
     pub fn mode_masked(mut self, mode: Mode, mask: Mode) -> ZfsSetattr {
         self.valid |= VALID_MODE;
         self.mode = mode.bits();
@@ -119,17 +108,16 @@ impl ZfsSetattr {
         self
     }
 
-    /// Set the access time. With [`mtime`](Self::mtime) both
-    /// [`SetTime::Now`] and no birth time, it is a touch, which write
-    /// permission allows.
+    /// Set the access time. With [`mtime`](Self::mtime) both [`SetTime::Now`] and no birth time, it is a touch, which
+    /// write permission allows.
     pub fn atime(mut self, t: SetTime) -> ZfsSetattr {
         self.valid |= VALID_ATIME;
         self.atime = t.pair();
         self
     }
 
-    /// Set the modification time. One older than the birth time lowers the
-    /// birth time too, unless this value sets the birth time.
+    /// Set the modification time. One older than the birth time lowers the birth time too, unless this value sets the
+    /// birth time.
     pub fn mtime(mut self, t: SetTime) -> ZfsSetattr {
         self.valid |= VALID_MTIME;
         self.mtime = t.pair();
@@ -143,8 +131,8 @@ impl ZfsSetattr {
         self
     }
 
-    /// Set the bits of `set` and clear those of `clear`, leaving every other
-    /// [`ZfsAttr`] bit as it is, so none is read and written back.
+    /// Set the bits of `set` and clear those of `clear`, leaving every other [`ZfsAttr`] bit as it is, so none is read
+    /// and written back.
     pub fn dos(mut self, set: ZfsAttr, clear: ZfsAttr) -> ZfsSetattr {
         self.valid |= VALID_DOS;
         self.dos_set = set.bits();
@@ -152,17 +140,15 @@ impl ZfsSetattr {
         self
     }
 
-    /// The value the handler reads, `truenas_xattr_setattr_t` in the byte
-    /// order of this machine, with no ACL after it.
+    /// The value the handler reads, `truenas_xattr_setattr_t` in the byte order of this machine, with no ACL after it.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(SIZE);
         self.write_into(&mut v);
         v
     }
 
-    /// Write the value [`to_bytes`](Self::to_bytes) gives into `v`, in
-    /// place of whatever `v` held, so a caller that keeps one buffer for
-    /// its sets allocates nothing once that buffer has held a value.
+    /// Write the value [`to_bytes`](Self::to_bytes) gives into `v`, in place of whatever `v` held, so a caller that
+    /// keeps one buffer for its sets allocates nothing once that buffer has held a value.
     pub fn write_into(&self, v: &mut Vec<u8>) {
         v.clear();
         v.reserve(SIZE);
@@ -187,8 +173,7 @@ impl ZfsSetattr {
 mod tests {
     use super::*;
 
-    /// Every field lands at the offset `truenas_xattr_setattr_t` gives it,
-    /// checked against bytes written out by hand.
+    /// Every field lands at the offset `truenas_xattr_setattr_t` gives it, checked against bytes written out by hand.
     #[test]
     fn the_value_is_laid_out_as_the_handler_reads_it() {
         let set = ZfsSetattr::new()
@@ -197,10 +182,7 @@ mod tests {
             .gid(0x0102_0304)
             .atime(SetTime::Now)
             .mtime(SetTime::At(StatxTimestamp { sec: -2, nsec: 7 }))
-            .btime(SetTime::At(StatxTimestamp {
-                sec: 0x1234,
-                nsec: 0,
-            }))
+            .btime(SetTime::At(StatxTimestamp { sec: 0x1234, nsec: 0 }))
             .dos(ZfsAttr::HIDDEN, ZfsAttr::ARCHIVE);
         #[rustfmt::skip]
         let want: [u8; 144] = [
@@ -237,8 +219,8 @@ mod tests {
         assert_eq!(set.to_bytes(), want);
     }
 
-    /// A field left out sends no bit of `zsa_valid` and no value, and
-    /// [`ZfsSetattr::mode`] replaces every bit `Mode` has.
+    /// A field left out sends no bit of `zsa_valid` and no value, and [`ZfsSetattr::mode`] replaces every bit `Mode`
+    /// has.
     #[test]
     fn a_field_left_out_sends_nothing() {
         let bytes = ZfsSetattr::new().to_bytes();
@@ -253,8 +235,8 @@ mod tests {
         assert!(bytes[0x18..].iter().all(|&b| b == 0), "{bytes:02x?}");
     }
 
-    /// [`ZfsSetattr::write_into`] writes the bytes `to_bytes` gives over a
-    /// buffer that held more, and keeps that buffer's storage.
+    /// [`ZfsSetattr::write_into`] writes the bytes `to_bytes` gives over a buffer that held more, and keeps that
+    /// buffer's storage.
     #[test]
     fn write_into_reuses_the_buffer_it_is_given() {
         let set = ZfsSetattr::new()

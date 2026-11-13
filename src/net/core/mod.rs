@@ -1,12 +1,9 @@
-//! `net::core` - the role-agnostic io_uring engine and primitives shared by the
-//! server and client roles.
+//! `net::core` - the role-agnostic io_uring engine and primitives shared by the server and client roles.
 //!
-//! The engine is a superset of both roles' needs - the server exercises accept,
-//! peer-identity, kTLS-handshake and detach machinery a client never touches,
-//! and vice versa. A single-role build therefore leaves some shared primitives
-//! unused. The `not(net-server)` allow below relaxes dead-code exactly for the
-//! server-support surface when the server role is absent; `net-server` and
-//! `full` builds stay strict, so genuinely dead core code is still caught.
+//! The engine is a superset of both roles' needs - the server exercises accept, peer-identity, kTLS-handshake and
+//! detach machinery a client never touches, and vice versa. A single-role build therefore leaves some shared primitives
+//! unused. The `not(net-server)` allow below relaxes dead-code exactly for the server-support surface when the server
+//! role is absent; `net-server` and `full` builds stay strict, so genuinely dead core code is still caught.
 #[cfg(feature = "net-server")]
 pub(crate) mod bodypool;
 pub(crate) mod config;
@@ -27,6 +24,5 @@ pub(crate) mod table;
 #[cfg(feature = "net-server")]
 pub use bodypool::BodyRecycler;
 pub use protocol::{
-    Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth,
-    SendBuf, ServerAddr, length_prefix_header,
+    Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth, SendBuf, ServerAddr, length_prefix_header,
 };

@@ -1,14 +1,10 @@
-//! Kernel-TLS (kTLS) scaffolding shared by the live test targets
-//! (`test/net_server.rs`, `test/http_live.rs`): a real end-to-end TLS
-//! handshake around the server's kernel-TLS transport. The library brings no
-//! TLS crate; the handshake worker drives `truenas_ktls` - the packaged
-//! accept side: a blocking handshake that installs kernel TLS and refuses
-//! the connection unless the readback shows it engaged both directions - and
-//! the client is OpenSSL, exactly the split a real consumer implements.
-//! Tests skip when the kernel lacks the `tls` ULP ([`ktls_unsupported`]) or
-//! when libssl cannot engage kTLS at all ([`ktls_openssl_unsupported`] --
-//! Ubuntu ships OpenSSL 3.0 without `enable-ktls`); either skip turns into a
-//! hard failure under `TRUENAS_ROS_REQUIRE_KTLS`.
+//! Kernel-TLS (kTLS) scaffolding shared by the live test targets (`test/net_server.rs`, `test/http_live.rs`): a real
+//! end-to-end TLS handshake around the server's kernel-TLS transport. The library brings no TLS crate; the handshake
+//! worker drives `truenas_ktls` - the packaged accept side: a blocking handshake that installs kernel TLS and refuses
+//! the connection unless the readback shows it engaged both directions - and the client is OpenSSL, exactly the split a
+//! real consumer implements. Tests skip when the kernel lacks the `tls` ULP ([`ktls_unsupported`]) or when libssl
+//! cannot engage kTLS at all ([`ktls_openssl_unsupported`] -- Ubuntu ships OpenSSL 3.0 without `enable-ktls`); either
+//! skip turns into a hard failure under `TRUENAS_ROS_REQUIRE_KTLS`.
 
 use std::io;
 use std::net::{SocketAddrV4, TcpListener, TcpStream};
@@ -20,12 +16,10 @@ use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use truenas_ktls::Acceptor;
 use truenas_ros::Error;
 
-/// True when the `kTLS listener requires ... TLS ULP` validation fires - the
-/// dev kernel lacks `CONFIG_TLS`. Force the test on known-good hosts with
-/// `TRUENAS_ROS_REQUIRE_KTLS`.
+/// True when the `kTLS listener requires ... TLS ULP` validation fires - the dev kernel lacks `CONFIG_TLS`. Force the
+/// test on known-good hosts with `TRUENAS_ROS_REQUIRE_KTLS`.
 pub fn ktls_unsupported(e: &Error) -> bool {
-    let unsupported =
-        matches!(e, Error::Validation(m) if m.contains("kernel TLS ULP"));
+    let unsupported = matches!(e, Error::Validation(m) if m.contains("kernel TLS ULP"));
     if unsupported {
         assert!(
             std::env::var_os("TRUENAS_ROS_REQUIRE_KTLS").is_none(),
@@ -51,15 +45,10 @@ pub fn self_signed() -> (Vec<u8>, Vec<u8>) {
     b.set_subject_name(&name).unwrap();
     b.set_issuer_name(&name).unwrap();
     b.set_pubkey(&key).unwrap();
-    b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
-        .unwrap();
-    b.set_not_after(&Asn1Time::days_from_now(1).unwrap())
-        .unwrap();
+    b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+    b.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
     b.sign(&key, MessageDigest::sha256()).unwrap();
-    (
-        b.build().to_pem().unwrap(),
-        key.private_key_to_pem_pkcs8().unwrap(),
-    )
+    (b.build().to_pem().unwrap(), key.private_key_to_pem_pkcs8().unwrap())
 }
 
 /// Build a [`truenas_ktls::Acceptor`] over a throwaway cert. The acceptor is
@@ -74,20 +63,13 @@ pub fn ktls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Acceptor {
     Acceptor::from_pem_files(&cert, &key).unwrap()
 }
 
-/// The consumer's handshake worker: run the blocking server TLS handshake on
-/// the furnished fd through `truenas_ktls` - which installs kernel TLS on the
-/// socket and refuses the connection unless the readback shows it engaged
-/// both directions - then close the furnished fd (the pool descriptor keeps
-/// the kTLS socket).
-pub fn ktls_server_handshake(
-    fd: RawFd,
-    acceptor: &Acceptor,
-) -> Result<(), truenas_ktls::Error> {
-    // This helper owns the furnished fd: EVERY return path must close it (the
-    // set_tls_handshake contract), or each failed handshake leaks a process
-    // fd that pins the socket past the server's teardown. The acceptor only
-    // borrows the descriptor; this guard closes it, and the pool descriptor
-    // keeps the kTLS socket alive for serving.
+/// The consumer's handshake worker: run the blocking server TLS handshake on the furnished fd through `truenas_ktls` -
+/// which installs kernel TLS on the socket and refuses the connection unless the readback shows it engaged both
+/// directions - then close the furnished fd (the pool descriptor keeps the kTLS socket).
+pub fn ktls_server_handshake(fd: RawFd, acceptor: &Acceptor) -> Result<(), truenas_ktls::Error> {
+    // This helper owns the furnished fd: EVERY return path must close it (the set_tls_handshake contract), or each
+    // failed handshake leaks a process fd that pins the socket past the server's teardown. The acceptor only borrows
+    // the descriptor; this guard closes it, and the pool descriptor keeps the kTLS socket alive for serving.
     struct FdCloser(RawFd);
     impl Drop for FdCloser {
         fn drop(&mut self) {
@@ -96,25 +78,21 @@ pub fn ktls_server_handshake(
         }
     }
     let _fd_owner = FdCloser(fd);
-    // The handshake wants a blocking socket. The furnished fd aliases the pool
-    // descriptor's file, but io_uring recv/send are unaffected by O_NONBLOCK.
+    // The handshake wants a blocking socket. The furnished fd aliases the pool descriptor's file, but io_uring
+    // recv/send are unaffected by O_NONBLOCK.
     // SAFETY: fcntl on a live fd.
     unsafe {
         let fl = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
     }
-    // SAFETY: `fd` stays open for the borrow - `_fd_owner` closes it only on
-    // return.
+    // SAFETY: `fd` stays open for the borrow - `_fd_owner` closes it only on return.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     acceptor.accept(borrowed).map(|_| ())
 }
 
-/// A TLS client that connects (retrying while the server thread starts up),
-/// handshakes (no cert verification - the server cert is self-signed), and
-/// returns the `SslStream` for framed I/O.
-pub fn tls_connect(
-    v4: SocketAddrV4,
-) -> io::Result<openssl::ssl::SslStream<TcpStream>> {
+/// A TLS client that connects (retrying while the server thread starts up), handshakes (no cert verification - the
+/// server cert is self-signed), and returns the `SslStream` for framed I/O.
+pub fn tls_connect(v4: SocketAddrV4) -> io::Result<openssl::ssl::SslStream<TcpStream>> {
     let mut cb = SslConnector::builder(SslMethod::tls()).unwrap();
     cb.set_verify(SslVerifyMode::NONE);
     let connector = cb.build();
@@ -131,8 +109,8 @@ pub fn tls_connect(
     Ok(stream)
 }
 
-/// Connect with a ~1s retry (the server thread may still be binding) and a
-/// read timeout so a wedged test goes red instead of hanging the binary.
+/// Connect with a ~1s retry (the server thread may still be binding) and a read timeout so a wedged test goes red
+/// instead of hanging the binary.
 fn connect_tcp(addr: SocketAddrV4) -> io::Result<TcpStream> {
     let mut last = None;
     for _ in 0..50 {
@@ -150,24 +128,18 @@ fn connect_tcp(addr: SocketAddrV4) -> io::Result<TcpStream> {
     Err(last.expect("at least one attempt"))
 }
 
-/// kTLS installation is best-effort in libssl: a build without `enable-ktls`
-/// (Debian/Ubuntu only enable it from 3.2), a TLS 1.3 RX gap (OpenSSL < 3.2),
-/// or a kernel missing the `tls` module all fall back to userspace records.
-/// The handshake then completes, the acceptor's readback refuses the
-/// connection, the worker rejects, and the kTLS data-path tests would fail
-/// rather than skip. Probe once with a loopback handshake - the same
-/// acceptor, client, and refusal the tests use - so those tests can skip
-/// when this host cannot engage kTLS.
+/// kTLS installation is best-effort in libssl: a build without `enable-ktls` (Debian/Ubuntu only enable it from 3.2), a
+/// TLS 1.3 RX gap (OpenSSL < 3.2), or a kernel missing the `tls` module all fall back to userspace records. The
+/// handshake then completes, the acceptor's readback refuses the connection, the worker rejects, and the kTLS data-path
+/// tests would fail rather than skip. Probe once with a loopback handshake - the same acceptor, client, and refusal the
+/// tests use - so those tests can skip when this host cannot engage kTLS.
 fn ktls_engages() -> &'static Result<(), truenas_ktls::Error> {
-    static PROBE: std::sync::OnceLock<Result<(), truenas_ktls::Error>> =
-        std::sync::OnceLock::new();
+    static PROBE: std::sync::OnceLock<Result<(), truenas_ktls::Error>> = std::sync::OnceLock::new();
     PROBE.get_or_init(|| {
         let (cert, key) = self_signed();
         let acceptor = ktls_acceptor(&cert, &key);
         let listener = TcpListener::bind("127.0.0.1:0").expect("probe bind");
-        let std::net::SocketAddr::V4(v4) =
-            listener.local_addr().expect("probe local_addr")
-        else {
+        let std::net::SocketAddr::V4(v4) = listener.local_addr().expect("probe local_addr") else {
             panic!("bound v4");
         };
         let server = thread::spawn(move || {
@@ -179,9 +151,8 @@ fn ktls_engages() -> &'static Result<(), truenas_ktls::Error> {
             assert!(fd >= 0, "dup");
             ktls_server_handshake(fd, &acceptor)
         });
-        // The handshake completes even where engagement cannot (the fallback
-        // is userspace records; the refusal is the acceptor's, on readback),
-        // so a client-side failure is the probe's own fault and panics.
+        // The handshake completes even where engagement cannot (the fallback is userspace records; the refusal is the
+        // acceptor's, on readback), so a client-side failure is the probe's own fault and panics.
         let stream = tls_connect(v4).expect("probe client handshake");
         let served = server.join().expect("probe server thread");
         drop(stream); // keep the session open until the server confirmed
@@ -189,11 +160,9 @@ fn ktls_engages() -> &'static Result<(), truenas_ktls::Error> {
     })
 }
 
-/// The engagement skip for the kTLS data-path tests: `false` when this host
-/// engages kTLS end to end, `true` (with a visible note) when the acceptor
-/// refused an unengaged connection - or a hard failure when
-/// `TRUENAS_ROS_REQUIRE_KTLS` says skipping is forbidden. Any probe failure
-/// other than that refusal is the suite's own and panics.
+/// The engagement skip for the kTLS data-path tests: `false` when this host engages kTLS end to end, `true` (with a
+/// visible note) when the acceptor refused an unengaged connection - or a hard failure when `TRUENAS_ROS_REQUIRE_KTLS`
+/// says skipping is forbidden. Any probe failure other than that refusal is the suite's own and panics.
 pub fn ktls_openssl_unsupported() -> bool {
     match ktls_engages() {
         Ok(()) => false,

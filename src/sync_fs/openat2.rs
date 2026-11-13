@@ -10,8 +10,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 tn_bitflags! {
     /// Path-resolution flags for [`openat2`] (`RESOLVE_*`).
     pub struct ResolveFlag: libc::c_ulonglong {
-        /// Fail if resolution would cross a mount point / leave `dirfd`'s
-        /// filesystem.
+        /// Fail if resolution would cross a mount point / leave `dirfd`'s filesystem.
         RESOLVE_NO_XDEV = 0x01;
         /// Disallow magic-link (e.g. `/proc/*/fd/*`) resolution.
         RESOLVE_NO_MAGICLINKS = 0x02;
@@ -26,9 +25,8 @@ tn_bitflags! {
     }
 }
 
-/// Kernel `struct open_how`. Must be zero-initialised; unknown fields are
-/// zeroed so future kernels reject unsupported bits. Shared with the io_uring
-/// fs reactor, whose `OPENAT2` SQE points at one of these (`sqe.addr2`).
+/// Kernel `struct open_how`. Must be zero-initialised; unknown fields are zeroed so future kernels reject unsupported
+/// bits. Shared with the io_uring fs reactor, whose `OPENAT2` SQE points at one of these (`sqe.addr2`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RawOpenHow {
@@ -53,8 +51,7 @@ impl OpenHow {
         self
     }
 
-    /// Set the creation mode (used only when `O_CREAT`/`O_TMPFILE` is set),
-    /// overwriting any previously set.
+    /// Set the creation mode (used only when `O_CREAT`/`O_TMPFILE` is set), overwriting any previously set.
     pub fn mode(mut self, mode: Mode) -> Self {
         self.0.mode = mode.bits() as u64;
         self
@@ -73,15 +70,10 @@ impl OpenHow {
     }
 }
 
-/// Open or create a file relative to `dirfd`, controlling path resolution via
-/// [`OpenHow`].
+/// Open or create a file relative to `dirfd`, controlling path resolution via [`OpenHow`].
 ///
 /// See [`openat2(2)`](https://man7.org/linux/man-pages/man2/openat2.2.html).
-pub fn openat2<P, Fd>(
-    dirfd: Fd,
-    path: &P,
-    how: OpenHow,
-) -> errno::Result<OwnedFd>
+pub fn openat2<P, Fd>(dirfd: Fd, path: &P, how: OpenHow) -> errno::Result<OwnedFd>
 where
     P: ?Sized + TnPath,
     Fd: AsFd,

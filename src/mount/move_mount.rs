@@ -26,8 +26,7 @@ tn_bitflags! {
     }
 }
 
-/// Move (or attach) the mount at (`from_dirfd`, `from_path`) to
-/// (`to_dirfd`, `to_path`).
+/// Move (or attach) the mount at (`from_dirfd`, `from_path`) to (`to_dirfd`, `to_path`).
 ///
 /// See [`move_mount(2)`](https://man7.org/linux/man-pages/man2/move_mount.2.html).
 pub fn move_mount<P1, P2, Fd1, Fd2>(

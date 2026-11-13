@@ -1,27 +1,22 @@
-//! Describing an event and rendering its record text - pure string work, no
-//! syscalls, so every rule below is unit tested directly.
+//! Describing an event and rendering its record text - pure string work, no syscalls, so every rule below is unit
+//! tested directly.
 //!
-//! The field layout mirrors linux-PAM's (`op=<service>:<verb>`, `acct=`,
-//! `addr=`, ... `res=success|failed`), so a record built here sits beside PAM's
-//! in `/var/log/audit/audit.log` and answers the same `ausearch`/`aureport`
-//! queries. Values are libaudit-encoded: a clean value is `key="value"`, a
-//! value needing encoding becomes `key=HEX` (uppercase, unquoted) - the shape
-//! `auparse` decodes transparently.
+//! The field layout mirrors linux-PAM's (`op=<service>:<verb>`, `acct=`, `addr=`, ... `res=success|failed`), so a
+//! record built here sits beside PAM's in `/var/log/audit/audit.log` and answers the same `ausearch`/`aureport`
+//! queries. Values are libaudit-encoded: a clean value is `key="value"`, a value needing encoding becomes `key=HEX`
+//! (uppercase, unquoted) - the shape `auparse` decodes transparently.
 
 use std::fmt::Write;
 
-/// The `AUDIT_*` type of a record: its event class, and what `ausearch -m`
-/// selects on.
+/// The `AUDIT_*` type of a record: its event class, and what `ausearch -m` selects on.
 ///
-/// The values are the userspace message range, `AUDIT_FIRST_USER_MSG` ..=
-/// `AUDIT_LAST_USER_MSG` (`linux/audit.h`) - the types a process holding
-/// `CAP_AUDIT_WRITE` may originate. The kernel uapi header names only the few
-/// it treats specially, so the constants below carry the audit-userspace names
-/// from `audit-records.h`; the numbers are what matters on the wire.
+/// The values are the userspace message range, `AUDIT_FIRST_USER_MSG` ..= `AUDIT_LAST_USER_MSG` (`linux/audit.h`) - the
+/// types a process holding `CAP_AUDIT_WRITE` may originate. The kernel uapi header names only the few it treats
+/// specially, so the constants below carry the audit-userspace names from `audit-records.h`; the numbers are what
+/// matters on the wire.
 ///
-/// [`AuditType::new`] admits any value in the two userspace ranges, so a type
-/// this crate predates is still reachable; anything else (a kernel-originated
-/// or `CAP_AUDIT_CONTROL` type) is rejected rather than sent for the kernel to
+/// [`AuditType::new`] admits any value in the two userspace ranges, so a type this crate predates is still reachable;
+/// anything else (a kernel-originated or `CAP_AUDIT_CONTROL` type) is rejected rather than sent for the kernel to
 /// refuse with `EINVAL`/`EPERM`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AuditType(u16);
@@ -42,8 +37,8 @@ impl AuditType {
     pub const USER_START: AuditType = AuditType(1105);
     /// `AUDIT_USER_END` - a user session ended.
     pub const USER_END: AuditType = AuditType(1106);
-    /// `AUDIT_USER_AVC` - a user-space AVC (MAC) message. The one user type
-    /// the kernel still records while auditing is otherwise disabled.
+    /// `AUDIT_USER_AVC` - a user-space AVC (MAC) message. The one user type the kernel still records while auditing is
+    /// otherwise disabled.
     pub const USER_AVC: AuditType = AuditType(1107);
     /// `AUDIT_USER_CHAUTHTOK` - an account password or PIN changed.
     pub const USER_CHAUTHTOK: AuditType = AuditType(1108);
@@ -71,17 +66,15 @@ impl AuditType {
     pub const CHGRP_ID: AuditType = AuditType(1119);
     /// `AUDIT_TEST` - reserved for testing that the audit path works.
     pub const TEST: AuditType = AuditType(1120);
-    /// `AUDIT_TRUSTED_APP` - a trusted application's own event, free-form
-    /// text. The catch-all for a service auditing its own operations, and the
-    /// [`Default`].
+    /// `AUDIT_TRUSTED_APP` - a trusted application's own event, free-form text. The catch-all for a service auditing
+    /// its own operations, and the [`Default`].
     pub const TRUSTED_APP: AuditType = AuditType(1121);
     /// `AUDIT_USER_SELINUX_ERR` - a user-space SELinux error.
     pub const USER_SELINUX_ERR: AuditType = AuditType(1122);
     /// `AUDIT_USER_CMD` - a shell command and its arguments.
     pub const USER_CMD: AuditType = AuditType(1123);
-    /// `AUDIT_USER_TTY` - non-ICANON TTY input. Framed differently by the
-    /// kernel (raw data, not `key=value` text), so it is not what this module
-    /// builds - listed for completeness.
+    /// `AUDIT_USER_TTY` - non-ICANON TTY input. Framed differently by the kernel (raw data, not `key=value` text), so
+    /// it is not what this module builds - listed for completeness.
     pub const USER_TTY: AuditType = AuditType(1124);
     /// `AUDIT_CHUSER_ID` - supplemental data for a changed user ID.
     pub const CHUSER_ID: AuditType = AuditType(1125);
@@ -112,23 +105,21 @@ impl AuditType {
     /// `AUDIT_SOFTWARE_UPDATE` - a software update event.
     pub const SOFTWARE_UPDATE: AuditType = AuditType(1138);
 
-    /// First/last of the two userspace message ranges (`linux/audit.h`:
-    /// `AUDIT_FIRST_USER_MSG`/`AUDIT_LAST_USER_MSG` and their `...MSG2` twins).
+    /// First/last of the two userspace message ranges (`linux/audit.h`: `AUDIT_FIRST_USER_MSG`/`AUDIT_LAST_USER_MSG`
+    /// and their `...MSG2` twins).
     const FIRST_USER_MSG: u16 = 1100;
     const LAST_USER_MSG: u16 = 1199;
     const FIRST_USER_MSG2: u16 = 2100;
     const LAST_USER_MSG2: u16 = 2999;
 
-    /// Wrap a raw `AUDIT_*` number, rejecting anything outside the userspace
-    /// ranges with [`Errno::EINVAL`] - those types are the kernel's own or
-    /// need `CAP_AUDIT_CONTROL`, and sending one only earns an `EINVAL`/`EPERM`
-    /// ack (or, worse, a control message we never meant to send).
+    /// Wrap a raw `AUDIT_*` number, rejecting anything outside the userspace ranges with [`Errno::EINVAL`] - those
+    /// types are the kernel's own or need `CAP_AUDIT_CONTROL`, and sending one only earns an `EINVAL`/`EPERM` ack (or,
+    /// worse, a control message we never meant to send).
     ///
     /// [`Errno::EINVAL`]: crate::errno::Errno::EINVAL
     pub const fn new(raw: u16) -> crate::errno::Result<AuditType> {
         match raw {
-            Self::FIRST_USER_MSG..=Self::LAST_USER_MSG
-            | Self::FIRST_USER_MSG2..=Self::LAST_USER_MSG2 => {
+            Self::FIRST_USER_MSG..=Self::LAST_USER_MSG | Self::FIRST_USER_MSG2..=Self::LAST_USER_MSG2 => {
                 Ok(AuditType(raw))
             }
             _ => Err(crate::errno::Errno::EINVAL),
@@ -150,21 +141,18 @@ impl Default for AuditType {
 
 /// The principal an event describes, in linux-PAM's vocabulary.
 ///
-/// Every field is optional: an unauthenticated or anonymous event still
-/// audits, just with fewer fields. Anything outside this vocabulary --
-/// credential ids, object names, operation arguments - goes on the event as a
-/// plain [`AuditEvent::fields`] entry.
+/// Every field is optional: an unauthenticated or anonymous event still audits, just with fewer fields. Anything
+/// outside this vocabulary -- credential ids, object names, operation arguments - goes on the event as a plain
+/// [`AuditEvent::fields`] entry.
 ///
-/// The kernel prefixes every user-space record with the *sending* process's
-/// `pid`/`uid`/`auid`/`ses`, so these fields describe the principal the
-/// service acted **for**, never the service's own process identity.
+/// The kernel prefixes every user-space record with the *sending* process's `pid`/`uid`/`auid`/`ses`, so these fields
+/// describe the principal the service acted **for**, never the service's own process identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AuditPrincipal<'a> {
     /// Account name, emitted as `acct=` - the field `ausearch -ua` matches.
     pub user: Option<&'a str>,
-    /// The account's Unix uid, emitted as `acct_uid=`. Deliberately *not*
-    /// `uid=`: the kernel already stamps that with the sending process's uid,
-    /// and a second `uid=` inside the message would collide with it.
+    /// The account's Unix uid, emitted as `acct_uid=`. Deliberately *not* `uid=`: the kernel already stamps that with
+    /// the sending process's uid, and a second `uid=` inside the message would collide with it.
     pub uid: Option<u32>,
     /// Client origin, emitted as `addr=` - e.g. `10.0.0.5:5234`, `unix:uid=0`.
     pub addr: Option<&'a str>,
@@ -174,9 +162,8 @@ pub struct AuditPrincipal<'a> {
 
 /// One audit event: what happened, to whom, and whether it worked.
 ///
-/// Borrowed throughout, so describing an event allocates nothing - the record
-/// text is rendered straight into a caller-owned buffer by
-/// [`write_message`](Self::write_message), or into its own by
+/// Borrowed throughout, so describing an event allocates nothing - the record text is rendered straight into a
+/// caller-owned buffer by [`write_message`](Self::write_message), or into its own by
 /// [`AuditSocket::send`](super::AuditSocket::send).
 ///
 /// ```
@@ -210,30 +197,26 @@ pub struct AuditEvent<'a> {
     pub verb: &'a str,
     /// Who the service acted for.
     pub principal: AuditPrincipal<'a>,
-    /// Extra fields, emitted in order after the principal and before `res=`.
-    /// Keys are sanitized and values encoded, so neither can split the record.
+    /// Extra fields, emitted in order after the principal and before `res=`. Keys are sanitized and values encoded, so
+    /// neither can split the record.
     pub fields: &'a [(&'a str, &'a str)],
-    /// Emitted as `res=success` or `res=failed` - what `ausearch --success`
-    /// filters on. PAM writes it last; so does this.
+    /// Emitted as `res=success` or `res=failed` - what `ausearch --success` filters on. PAM writes it last; so does
+    /// this.
     pub success: bool,
 }
 
 impl AuditEvent<'_> {
     /// Append this event's `key=value` record text to `out`.
     ///
-    /// Appends rather than replaces, so a caller can reuse one buffer across
-    /// records by clearing it; [`AuditSocket`](super::AuditSocket) does
-    /// exactly that.
+    /// Appends rather than replaces, so a caller can reuse one buffer across records by clearing it;
+    /// [`AuditSocket`](super::AuditSocket) does exactly that.
     pub fn write_message(&self, out: &mut String) {
-        // PAM writes `op=` as a bare token and readers take it verbatim, so
-        // keep that shape when both halves are clean. The value always
-        // contains the `:`, so a bare `op=` can never be mistaken for a
-        // hex-encoded value (those are hex digits only). A caller-supplied
-        // verb carrying a space or a quote would break the record, so that
-        // case falls back to the encoded form.
+        // PAM writes `op=` as a bare token and readers take it verbatim, so keep that shape when both halves are clean.
+        // The value always contains the `:`, so a bare `op=` can never be mistaken for a hex-encoded value (those are
+        // hex digits only). A caller-supplied verb carrying a space or a quote would break the record, so that case
+        // falls back to the encoded form.
         if needs_encoding(self.service) || needs_encoding(self.verb) {
-            let mut op =
-                String::with_capacity(self.service.len() + self.verb.len() + 1);
+            let mut op = String::with_capacity(self.service.len() + self.verb.len() + 1);
             op.push_str(self.service);
             op.push(':');
             op.push_str(self.verb);
@@ -248,8 +231,8 @@ impl AuditEvent<'_> {
 
         push_opt(out, "acct", self.principal.user);
         if let Some(uid) = self.principal.uid {
-            // Digits never need encoding, so write them straight into the
-            // quoted value rather than through a formatted temporary.
+            // Digits never need encoding, so write them straight into the quoted value rather than through a formatted
+            // temporary.
             separate(out);
             out.push_str("acct_uid=\"");
             let _ = write!(out, "{uid}");
@@ -263,17 +246,12 @@ impl AuditEvent<'_> {
         }
 
         separate(out);
-        out.push_str(if self.success {
-            "res=success"
-        } else {
-            "res=failed"
-        });
+        out.push_str(if self.success { "res=success" } else { "res=failed" });
     }
 }
 
-/// Append one `key=value` field, sanitizing the key. The common case - a key
-/// already made of `[A-Za-z0-9_]` - borrows it as-is; only a key needing
-/// repair allocates.
+/// Append one `key=value` field, sanitizing the key. The common case - a key already made of `[A-Za-z0-9_]` - borrows
+/// it as-is; only a key needing repair allocates.
 fn push_field(out: &mut String, key: &str, value: &str) {
     if key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         encode_nv(out, key, value);
@@ -316,26 +294,22 @@ fn encode_nv(out: &mut String, key: &str, value: &str) {
     }
 }
 
-/// The kernel's rule, from `audit_string_contains_control` (`kernel/audit.c`):
-/// a `"`, or any byte outside `0x21..=0x7e`. The kernel walks the value as
-/// `unsigned char`, so that range excludes `0x7f` and `0x80..=0xff` alike.
+/// The kernel's rule, from `audit_string_contains_control` (`kernel/audit.c`): a `"`, or any byte outside
+/// `0x21..=0x7e`. The kernel walks the value as `unsigned char`, so that range excludes `0x7f` and `0x80..=0xff` alike.
 ///
-/// An empty value contains no such byte, so - like the kernel's loop, which
-/// simply does not run - it is *not* encoded, and [`encode_nv`] renders it as
-/// `key=""`. Encoding it instead would hex-encode zero bytes and emit a bare
-/// `key=`, which is the ambiguous unquoted form, not the safe one.
+/// An empty value contains no such byte, so - like the kernel's loop, which simply does not run - it is *not* encoded,
+/// and [`encode_nv`] renders it as `key=""`. Encoding it instead would hex-encode zero bytes and emit a bare `key=`,
+/// which is the ambiguous unquoted form, not the safe one.
 ///
-/// One addition: `'` also forces encoding. The kernel wraps a user-space
-/// record's text in `msg='...'` (`kernel/audit.c`) and does not encode an
-/// apostrophe itself, so one inside a value closes that quote early.
+/// One addition: `'` also forces encoding. The kernel wraps a user-space record's text in `msg='...'`
+/// (`kernel/audit.c`) and does not encode an apostrophe itself, so one inside a value closes that quote early.
 fn needs_encoding(value: &str) -> bool {
     value
         .bytes()
         .any(|b| b == b'"' || b == b'\'' || !(0x21..=0x7e).contains(&b))
 }
 
-/// Keep a field name usable as an audit key (no spaces, `=`, or quotes): map
-/// anything outside `[A-Za-z0-9_]` to `_`.
+/// Keep a field name usable as an audit key (no spaces, `=`, or quotes): map anything outside `[A-Za-z0-9_]` to `_`.
 fn sanitize_key(key: &str) -> String {
     key.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -365,10 +339,9 @@ mod tests {
         assert!(!needs_encoding("admin") && !needs_encoding("API_KEY"));
     }
 
-    /// The kernel's `audit_string_contains_control` loop does not run for a
-    /// zero-length value, so an empty string is *clean* and takes the quoted
-    /// form. Encoding it instead would hex-encode nothing and emit a bare
-    /// `key=` - the ambiguous unquoted shape, not the safe one.
+    /// The kernel's `audit_string_contains_control` loop does not run for a zero-length value, so an empty string is
+    /// *clean* and takes the quoted form. Encoding it instead would hex-encode nothing and emit a bare `key=` - the
+    /// ambiguous unquoted shape, not the safe one.
     #[test]
     fn an_empty_value_is_the_quoted_empty_string() {
         assert!(!needs_encoding(""));
@@ -376,8 +349,8 @@ mod tests {
         encode_nv(&mut b, "acct", "");
         assert_eq!(b, "acct=\"\"");
 
-        // Through a whole event: an empty `addr` must not collapse the field
-        // into a bare token that a reader would take as an unquoted value.
+        // Through a whole event: an empty `addr` must not collapse the field into a bare token that a reader would take
+        // as an unquoted value.
         let event = AuditEvent {
             service: "svc",
             verb: "op",
@@ -408,8 +381,8 @@ mod tests {
 
     #[test]
     fn apostrophe_is_encoded_so_the_kernel_msg_quote_survives() {
-        // The kernel logs our text as msg='<text>'; a bare `'` would end that
-        // quote mid-record. libaudit lets it through, we do not.
+        // The kernel logs our text as msg='<text>'; a bare `'` would end that quote mid-record. libaudit lets it
+        // through, we do not.
         assert!(needs_encoding("o'brien"));
         let mut b = String::new();
         encode_nv(&mut b, "acct", "o'brien");
@@ -457,8 +430,7 @@ mod tests {
 
     #[test]
     fn dirty_op_falls_back_to_the_encoded_form() {
-        // A verb with a space cannot be a bare token without splitting the
-        // record into two fields.
+        // A verb with a space cannot be a bare token without splitting the record into two fields.
         let dirty = AuditEvent {
             service: "svc",
             verb: "a verb",
@@ -485,10 +457,7 @@ mod tests {
             success: true,
             ..Default::default()
         };
-        assert_eq!(
-            msg(&event),
-            "op=svc:op event_data_x=\"1\" plain_key9=\"2\" res=success"
-        );
+        assert_eq!(msg(&event), "op=svc:op event_data_x=\"1\" plain_key9=\"2\" res=success");
     }
 
     #[test]

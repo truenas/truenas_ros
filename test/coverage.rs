@@ -1,11 +1,9 @@
-//! Coverage-oriented integration tests (companion to `test.rs`), exercising the
-//! error/errno/path plumbing and the many exposed paths the primary suite does
-//! not reach across each subsystem.
+//! Coverage-oriented integration tests (companion to `test.rs`), exercising the error/errno/path plumbing and the many
+//! exposed paths the primary suite does not reach across each subsystem.
 #![cfg(target_os = "linux")]
 
-// The `TRUENAS_ROS_REQUIRE_XATTRS` gate, shared with the live suites: a
-// filesystem that refuses xattrs must fail this suite loudly where CI arms
-// it, not skip the assertions behind the probe.
+// The `TRUENAS_ROS_REQUIRE_XATTRS` gate, shared with the live suites: a filesystem that refuses xattrs must fail this
+// suite loudly where CI arms it, not skip the assertions behind the probe.
 #[path = "support/xattr.rs"]
 mod xattr_probe;
 #[cfg(feature = "xattr")]
@@ -70,8 +68,7 @@ mod errno_error {
 
     #[test]
     fn from_raw_covers_every_known_value() {
-        // Drive every arm of the `from_raw` match, plus Display, across the
-        // whole Linux errno range.
+        // Drive every arm of the `from_raw` match, plus Display, across the whole Linux errno range.
         for e in 1..=133 {
             let errno = Errno::from_raw(e);
             let _ = format!("{errno}");
@@ -84,10 +81,7 @@ mod errno_error {
     #[test]
     fn error_display_all_variants() {
         use std::path::PathBuf;
-        assert_eq!(
-            format!("{}", Error::Errno(Errno::EIO)),
-            format!("{}", Errno::EIO)
-        );
+        assert_eq!(format!("{}", Error::Errno(Errno::EIO)), format!("{}", Errno::EIO));
         assert!(format!("{}", Error::Validation("bad".into())).contains("bad"));
         assert!(format!("{}", Error::Parse("boom".into())).contains("boom"));
         assert!(
@@ -178,15 +172,13 @@ mod path_tests {
         assert_eq!(n, 2000);
     }
 
-    /// The `[u8]` conversion writes into a `MaybeUninit<[u8; 1024]>` with a
-    /// manual NUL and falls back to the heap when the name does not fit, so
-    /// the interesting lengths are the ones either side of that boundary --
-    /// where an off-by-one writes past the array. Every length must yield a
-    /// `CStr` carrying exactly the input bytes, whichever arm ran.
+    /// The `[u8]` conversion writes into a `MaybeUninit<[u8; 1024]>` with a manual NUL and falls back to the heap when
+    /// the name does not fit, so the interesting lengths are the ones either side of that boundary -- where an
+    /// off-by-one writes past the array. Every length must yield a `CStr` carrying exactly the input bytes, whichever
+    /// arm ran.
     ///
-    /// The `tn_path` fuzz target sweeps this under AddressSanitizer, where an
-    /// overrun is a crash rather than a wrong length; pinned here too because
-    /// a short fuzz run starts from small inputs and does not reach 1 KiB.
+    /// The `tn_path` fuzz target sweeps this under AddressSanitizer, where an overrun is a crash rather than a wrong
+    /// length; pinned here too because a short fuzz run starts from small inputs and does not reach 1 KiB.
     #[test]
     fn stack_to_heap_boundary_carries_the_bytes_exactly() {
         for len in [0, 1, 1022, 1023, 1024, 1025, 1026, 4096] {
@@ -219,8 +211,7 @@ mod fs {
     use truenas_ros::AT_FDCWD;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::{
-        AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxMask,
-        makedev, openat2, renameat2, statx,
+        AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxMask, makedev, openat2, renameat2, statx,
     };
 
     #[test]
@@ -229,17 +220,13 @@ mod fs {
         let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("f");
         std::fs::write(&path, b"1234567").unwrap();
-        // Give atime, mtime and ctime three distinct values first. A file
-        // written a moment ago carries all three at the same instant, so a
-        // swap between the accessors would be invisible - this test read
-        // `atime()` and `ctime()` only for their arithmetic, and
-        // `atime() -> stx_ctime` survived the whole suite. `utimensat` sets
-        // the first two; ctime follows as "now", because changing them is
-        // itself a status change.
+        // Give atime, mtime and ctime three distinct values first. A file written a moment ago carries all three at the
+        // same instant, so a swap between the accessors would be invisible - this test read `atime()` and `ctime()`
+        // only for their arithmetic, and `atime() -> stx_ctime` survived the whole suite. `utimensat` sets the first
+        // two; ctime follows as "now", because changing them is itself a status change.
         {
             use std::os::unix::ffi::OsStrExt as _;
-            let c =
-                std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
             let times = [
                 libc::timespec {
                     tv_sec: 1_000_000,
@@ -251,9 +238,7 @@ mod fs {
                 },
             ];
             // SAFETY: a valid NUL-terminated path and a two-element array.
-            let rc = unsafe {
-                libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0)
-            };
+            let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
             assert_eq!(rc, 0, "utimensat: {}", std::io::Error::last_os_error());
         }
         let md = std::fs::metadata(&path).unwrap();
@@ -275,38 +260,29 @@ mod fs {
         assert!(st.blksize() > 0);
         assert_eq!(st.mtime().sec, md.mtime());
         assert_eq!(makedev(st.dev_major(), st.dev_minor()), st.dev());
-        // The remaining field accessors, against an oracle rather than
-        // discarded. Each is one raw read off the buffer the kernel
-        // filled, so the failure they have to catch is a field named
-        // wrongly, and driving them under `let _ =` cannot see it:
-        // swapping the bodies of `blocks` and `subvol` and pointing
-        // `attributes_mask` at `stx_attributes` left every target in this
-        // suite green, because nothing anywhere compared their values to
-        // anything. `blocks`, `subvol` and `attributes_mask` are read
-        // here and nowhere else in the tree.
+        // The remaining field accessors, against an oracle rather than discarded. Each is one raw read off the buffer
+        // the kernel filled, so the failure they have to catch is a field named wrongly, and driving them under `let _
+        // =` cannot see it: swapping the bodies of `blocks` and `subvol` and pointing `attributes_mask` at
+        // `stx_attributes` left every target in this suite green, because nothing anywhere compared their values to
+        // anything. `blocks`, `subvol` and `attributes_mask` are read here and nowhere else in the tree.
         //
         // `st_blocks` is the same 512-byte count `stx_blocks` carries.
         {
             use std::os::linux::fs::MetadataExt as _;
             assert_eq!(st.blocks(), md.st_blocks(), "stx_blocks");
         }
-        // The fields this test read values out of must be reported filled.
-        // Not `BASIC_STATS`: `ATIME` is in that set and ZFS does not
-        // return it here (measured), so demanding the whole set reddens
-        // for a filesystem answering correctly.
+        // The fields this test read values out of must be reported filled. Not `BASIC_STATS`: `ATIME` is in that set
+        // and ZFS does not return it here (measured), so demanding the whole set reddens for a filesystem answering
+        // correctly.
         assert!(
-            st.mask()
-                .contains(StatxMask::INO | StatxMask::SIZE | StatxMask::BLOCKS),
+            st.mask().contains(StatxMask::INO | StatxMask::SIZE | StatxMask::BLOCKS),
             "the kernel did not report the fields this test read: {:?}",
             st.mask()
         );
-        // `attributes_mask` is what the filesystem SUPPORTS, a different
-        // word from `attributes`. The VFS sets the automount/mount-root
-        // bits in it for every stat, so it is never empty - while
-        // `attributes` on an ordinary file is zero (measured: attrs 0x0,
-        // mask IMMUTABLE|APPEND|NODUMP|AUTOMOUNT|MOUNT_ROOT|DAX on ZFS).
-        // An `attributes_mask` reading the attributes word is therefore
-        // empty here, which is what this catches.
+        // `attributes_mask` is what the filesystem SUPPORTS, a different word from `attributes`. The VFS sets the
+        // automount/mount-root bits in it for every stat, so it is never empty - while `attributes` on an ordinary file
+        // is zero (measured: attrs 0x0, mask IMMUTABLE|APPEND|NODUMP|AUTOMOUNT|MOUNT_ROOT|DAX on ZFS). An
+        // `attributes_mask` reading the attributes word is therefore empty here, which is what this catches.
         let attrs = st.attributes();
         let supported = st.attributes_mask();
         assert!(
@@ -318,21 +294,15 @@ mod fs {
             attrs,
             "attributes carries bits the filesystem does not support"
         );
-        // `SUBVOL` was not requested, so the kernel leaves it zero; the
-        // file has bytes, so its block count does not. That asymmetry is
-        // what distinguishes the two fields without pinning a value.
+        // `SUBVOL` was not requested, so the kernel leaves it zero; the file has bytes, so its block count does not.
+        // That asymmetry is what distinguishes the two fields without pinning a value.
         assert!(st.blocks() > 0, "a 7-byte file occupies blocks");
         assert_eq!(st.subvol(), 0, "SUBVOL was not requested");
         // `raw` is the buffer the accessors read, not a copy of it.
         assert_eq!(st.raw().stx_ino, st.ino(), "raw() is not the read buffer");
-        assert_eq!(
-            st.btime().sec,
-            st.raw().stx_btime.tv_sec,
-            "btime() is not stx_btime"
-        );
-        // Each timestamp against std's own `stat`, and against the value
-        // set above - the cross-check alone would pass a swap that moved
-        // both readers together.
+        assert_eq!(st.btime().sec, st.raw().stx_btime.tv_sec, "btime() is not stx_btime");
+        // Each timestamp against std's own `stat`, and against the value set above - the cross-check alone would pass a
+        // swap that moved both readers together.
         assert_eq!(st.atime().sec, md.atime(), "stx_atime vs std");
         assert_eq!(st.ctime().sec, md.ctime(), "stx_ctime vs std");
         assert_eq!(st.atime().sec, 1_000_000, "atime() is not stx_atime");
@@ -362,25 +332,15 @@ mod fs {
                 .is_regular()
         );
         assert!(
-            statx(
-                AT_FDCWD,
-                &link,
-                AtFlags::AT_SYMLINK_NOFOLLOW,
-                StatxMask::TYPE
-            )
-            .unwrap()
-            .is_symlink()
+            statx(AT_FDCWD, &link, AtFlags::AT_SYMLINK_NOFOLLOW, StatxMask::TYPE)
+                .unwrap()
+                .is_symlink()
         );
     }
 
     #[test]
     fn statx_device_file_rdev() {
-        let st = match statx(
-            AT_FDCWD,
-            "/dev/null",
-            AtFlags::empty(),
-            StatxMask::BASIC_STATS,
-        ) {
+        let st = match statx(AT_FDCWD, "/dev/null", AtFlags::empty(), StatxMask::BASIC_STATS) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -395,10 +355,7 @@ mod fs {
         let (ma, mi) = (0x1234u64, 0x5678u64);
         assert_eq!(
             makedev(ma as u32, mi as u32),
-            ((ma & 0xffff_f000) << 32)
-                | ((ma & 0x0000_0fff) << 8)
-                | ((mi & 0xffff_ff00) << 12)
-                | (mi & 0x0000_00ff)
+            ((ma & 0xffff_f000) << 32) | ((ma & 0x0000_0fff) << 8) | ((mi & 0xffff_ff00) << 12) | (mi & 0x0000_00ff)
         );
     }
 
@@ -438,8 +395,7 @@ mod fs {
 
         // EXCHANGE with a missing partner -> ENOENT.
         assert_eq!(
-            renameat2(at, "b", at, "c", RenameFlags::RENAME_EXCHANGE)
-                .unwrap_err(),
+            renameat2(at, "b", at, "c", RenameFlags::RENAME_EXCHANGE).unwrap_err(),
             Errno::ENOENT
         );
         // NOREPLACE | EXCHANGE is contradictory -> EINVAL.
@@ -462,20 +418,13 @@ mod fs {
 mod xattr {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
-    use truenas_ros::sync_fs::xattr::{
-        XATTR_SIZE_MAX, XattrFlags, fgetxattr, flistxattr, fremovexattr,
-        fsetxattr,
-    };
+    use truenas_ros::sync_fs::xattr::{XATTR_SIZE_MAX, XattrFlags, fgetxattr, flistxattr, fremovexattr, fsetxattr};
 
     fn tmp() -> (truenas_ros::TempDir, std::fs::File) {
         let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("f");
         std::fs::write(&path, b"d").unwrap();
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
         (dir, f)
     }
 
@@ -487,10 +436,7 @@ mod xattr {
             }
             Err(Errno::EOPNOTSUPP) => {
                 // Everything behind this probe is about to be skipped.
-                super::xattr_probe::refusal_is_allowed(
-                    "fsetxattr(user.probe)",
-                    Errno::EOPNOTSUPP,
-                );
+                super::xattr_probe::refusal_is_allowed("fsetxattr(user.probe)", Errno::EOPNOTSUPP);
                 false
             }
             Err(e) => panic!("probe: {e}"),
@@ -512,8 +458,7 @@ mod xattr {
         fsetxattr(f.as_fd(), n, b"v1", XattrFlags::XATTR_CREATE).unwrap();
         // CREATE again -> EEXIST, value unchanged.
         assert_eq!(
-            fsetxattr(f.as_fd(), n, b"v2", XattrFlags::XATTR_CREATE)
-                .unwrap_err(),
+            fsetxattr(f.as_fd(), n, b"v2", XattrFlags::XATTR_CREATE).unwrap_err(),
             Errno::EEXIST
         );
         assert_eq!(fgetxattr(f.as_fd(), n).unwrap(), b"v1");
@@ -521,13 +466,7 @@ mod xattr {
         fsetxattr(f.as_fd(), n, b"v3", XattrFlags::XATTR_REPLACE).unwrap();
         assert_eq!(fgetxattr(f.as_fd(), n).unwrap(), b"v3");
         assert_eq!(
-            fsetxattr(
-                f.as_fd(),
-                "user.absent",
-                b"x",
-                XattrFlags::XATTR_REPLACE
-            )
-            .unwrap_err(),
+            fsetxattr(f.as_fd(), "user.absent", b"x", XattrFlags::XATTR_REPLACE).unwrap_err(),
             Errno::ENODATA
         );
         // Remove, then get / re-remove both -> ENODATA.
@@ -542,8 +481,7 @@ mod xattr {
         // Rejected before any syscall, so filesystem support is irrelevant.
         let big = vec![0u8; XATTR_SIZE_MAX + 1];
         assert_eq!(
-            fsetxattr(f.as_fd(), "user.big", &big, XattrFlags::empty())
-                .unwrap_err(),
+            fsetxattr(f.as_fd(), "user.big", &big, XattrFlags::empty()).unwrap_err(),
             Errno::E2BIG
         );
     }
@@ -578,11 +516,9 @@ mod mount {
     use std::os::fd::AsFd;
     use std::path::Path;
     use truenas_ros::mount::{
-        Atime, FsConfig, LSMT_ROOT, MntFlags, MntPropagation, MountAttr,
-        MountSetattr, MoveMountFlags, OpenTreeFlags, StatmountMask,
-        UmountOptions, fsconfig, is_zfs_snapshot, listmount, mount_setattr,
-        move_mount, open_mount_by_id, open_tree, statmount, statmount_path,
-        umount, umount2,
+        Atime, FsConfig, LSMT_ROOT, MntFlags, MntPropagation, MountAttr, MountSetattr, MoveMountFlags, OpenTreeFlags,
+        StatmountMask, UmountOptions, fsconfig, is_zfs_snapshot, listmount, mount_setattr, move_mount,
+        open_mount_by_id, open_tree, statmount, statmount_path, umount, umount2,
     };
     use truenas_ros::sync_fs::{AtFlags, OFlag, StatxMask, statx};
     use truenas_ros::{AT_FDCWD, Error};
@@ -595,11 +531,8 @@ mod mount {
 
     #[test]
     fn open_mount_by_id_opens_root() {
-        let fd =
-            open_mount_by_id(root_id(), OFlag::O_DIRECTORY | OFlag::O_RDONLY)
-                .unwrap();
-        let st = statx(fd.as_fd(), "", AtFlags::AT_EMPTY_PATH, StatxMask::TYPE)
-            .unwrap();
+        let fd = open_mount_by_id(root_id(), OFlag::O_DIRECTORY | OFlag::O_RDONLY).unwrap();
+        let st = statx(fd.as_fd(), "", AtFlags::AT_EMPTY_PATH, StatxMask::TYPE).unwrap();
         assert!(st.is_dir());
     }
 
@@ -655,17 +588,13 @@ mod mount {
         assert!(umount(dir.path(), UmountOptions::default()).is_err());
     }
 
-    /// The mountpoint of a mount with no children of its own, so a recursive
-    /// umount of it has nothing to tear down. `None` if the namespace has no
-    /// such mount or its mountpoint is unreadable.
+    /// The mountpoint of a mount with no children of its own, so a recursive umount of it has nothing to tear down.
+    /// `None` if the namespace has no such mount or its mountpoint is unreadable.
     fn leaf_mountpoint() -> Option<std::path::PathBuf> {
-        listmount(LSMT_ROOT, false)
-            .unwrap()
-            .into_iter()
-            .find_map(|id| {
-                listmount(id, false).ok().filter(|kids| kids.is_empty())?;
-                statmount(id, StatmountMask::MNT_POINT).ok()?.mnt_point
-            })
+        listmount(LSMT_ROOT, false).unwrap().into_iter().find_map(|id| {
+            listmount(id, false).ok().filter(|kids| kids.is_empty())?;
+            statmount(id, StatmountMask::MNT_POINT).ok()?.mnt_point
+        })
     }
 
     #[test]
@@ -676,8 +605,8 @@ mod mount {
         let dir = truenas_ros::tempdir().unwrap();
         let link = dir.path().join("l");
         std::os::unix::fs::symlink(&point, &link).unwrap();
-        // The symlink is not itself a mountpoint, so validation fails before
-        // any umount2 - a syscall error here would mean it got that far.
+        // The symlink is not itself a mountpoint, so validation fails before any umount2 - a syscall error here would
+        // mean it got that far.
         assert!(matches!(
             umount(
                 &link,
@@ -696,29 +625,15 @@ mod mount {
         // Each wrapper builds its argument struct and issues its syscall;
         // what is under test is that path, not the kernel's answer.
         //
-        // **Every target is a name that cannot exist.** This test runs as
-        // root in the QEMU lane, where the earlier form asked the kernel to
-        // remount `/` read-only and to `move_mount` onto `/tmp` - stopped
-        // only incidentally, by the `MOUNT_ATTR_IDMAP` on a directory fd
-        // and by the source not being a mount point. Neither is a
-        // guarantee, and an edit that removed the idmap would take the
-        // runner's root filesystem read-only. Against an absent path the
+        // **Every target is a name that cannot exist.** This test runs as root in the QEMU lane, where the earlier form
+        // asked the kernel to remount `/` read-only and to `move_mount` onto `/tmp` - stopped only incidentally, by the
+        // `MOUNT_ATTR_IDMAP` on a directory fd and by the source not being a mount point. Neither is a guarantee, and
+        // an edit that removed the idmap would take the runner's root filesystem read-only. Against an absent path the
         // syscall can only fail, so the outcome is assertable too.
         let dir = truenas_ros::tempdir().unwrap();
         let gone = dir.path().join("no-such-mount");
-        assert!(
-            open_tree(AT_FDCWD, &gone, OpenTreeFlags::OPEN_TREE_CLONE).is_err()
-        );
-        assert!(
-            move_mount(
-                AT_FDCWD,
-                &gone,
-                AT_FDCWD,
-                &gone,
-                MoveMountFlags::empty()
-            )
-            .is_err()
-        );
+        assert!(open_tree(AT_FDCWD, &gone, OpenTreeFlags::OPEN_TREE_CLONE).is_err());
+        assert!(move_mount(AT_FDCWD, &gone, AT_FDCWD, &gone, MoveMountFlags::empty()).is_err());
         let anchor = std::fs::File::open("/").unwrap();
         let attr = MountSetattr::new()
             .set(MountAttr::RDONLY)
@@ -726,52 +641,27 @@ mod mount {
             .atime(Atime::Noatime)
             .propagation(MntPropagation::MS_SLAVE)
             .idmap(anchor.as_fd());
-        assert!(
-            mount_setattr(AT_FDCWD, &gone, AtFlags::empty(), &attr).is_err()
-        );
+        assert!(mount_setattr(AT_FDCWD, &gone, AtFlags::empty(), &attr).is_err());
     }
 
     #[test]
     fn fsconfig_variants_reach_the_syscall() {
         use truenas_ros::errno::Errno;
-        // fsopen needs CAP_SYS_ADMIN; drive fsconfig against a plain fd
-        // instead -- every match arm is exercised and each one must reach
-        // the syscall, which refuses a descriptor that is not a filesystem
-        // context with `EINVAL` (measured on 6.18.42-production+truenas:
-        // all seven commands answer EINVAL against an `O_DIRECTORY` fd on
+        // fsopen needs CAP_SYS_ADMIN; drive fsconfig against a plain fd instead -- every match arm is exercised and
+        // each one must reach the syscall, which refuses a descriptor that is not a filesystem context with `EINVAL`
+        // (measured on 6.18.42-production+truenas: all seven commands answer EINVAL against an `O_DIRECTORY` fd on
         // `/`).
         //
-        // The errno is the assertion and not a decoration. `Create` is the
-        // only variant `test/test.rs`'s end-to-end
-        // `fsopen_fsconfig_fsmount_detached_tmpfs` drives, and that test
-        // is root-only; discarding these results left the other six arms
-        // with no assertion anywhere in the tree, so each could stop
-        // issuing its syscall and answer `Ok(())` with every target green.
-        // A short-circuit answers `Ok`, which is what this refuses.
+        // The errno is the assertion and not a decoration. `Create` is the only variant `test/test.rs`'s end-to-end
+        // `fsopen_fsconfig_fsmount_detached_tmpfs` drives, and that test is root-only; discarding these results left
+        // the other six arms with no assertion anywhere in the tree, so each could stop issuing its syscall and answer
+        // `Ok(())` with every target green. A short-circuit answers `Ok`, which is what this refuses.
         let f = std::fs::File::open("/").unwrap();
         let fd = f.as_fd();
         for (what, got) in [
             ("Flag", fsconfig(fd, FsConfig::Flag { key: "ro" })),
-            (
-                "String",
-                fsconfig(
-                    fd,
-                    FsConfig::String {
-                        key: "src",
-                        value: "x",
-                    },
-                ),
-            ),
-            (
-                "Binary",
-                fsconfig(
-                    fd,
-                    FsConfig::Binary {
-                        key: "k",
-                        value: b"v",
-                    },
-                ),
-            ),
+            ("String", fsconfig(fd, FsConfig::String { key: "src", value: "x" })),
+            ("Binary", fsconfig(fd, FsConfig::Binary { key: "k", value: b"v" })),
             ("Fd", fsconfig(fd, FsConfig::Fd { key: "fd", fd })),
             ("Create", fsconfig(fd, FsConfig::Create)),
             ("Reconfigure", fsconfig(fd, FsConfig::Reconfigure)),
@@ -793,16 +683,12 @@ mod acl {
     use std::os::fd::AsFd;
     use truenas_ros::Error;
     use truenas_ros::sync_fs::acl::{
-        Acl, AclTarget, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag,
-        Nfs4Perm, Nfs4Who, PosixAce, PosixAcl, PosixPerm, PosixTag, fgetacl,
-        fsetacl, validate_acl,
+        Acl, AclTarget, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm, Nfs4Who, PosixAce, PosixAcl,
+        PosixPerm, PosixTag, fgetacl, fsetacl, validate_acl,
     };
 
     fn nfs4(aces: Vec<Nfs4Ace>, flags: Nfs4AclFlag) -> Acl {
-        Acl::Nfs4(Nfs4Acl {
-            acl_flags: flags,
-            aces,
-        })
+        Acl::Nfs4(Nfs4Acl { acl_flags: flags, aces })
     }
     fn n_ace(t: Nfs4AceType, f: Nfs4Flag, who: Nfs4Who, id: i64) -> Nfs4Ace {
         Nfs4Ace::new(t, f, Nfs4Perm::READ_DATA, who, id)
@@ -812,12 +698,7 @@ mod acl {
     fn nfs4_named_user_and_flags_roundtrip() {
         let acl = Nfs4Acl {
             acl_flags: Nfs4AclFlag::PROTECTED | Nfs4AclFlag::AUTO_INHERIT,
-            aces: vec![n_ace(
-                Nfs4AceType::Allow,
-                Nfs4Flag::empty(),
-                Nfs4Who::Named,
-                1000,
-            )],
+            aces: vec![n_ace(Nfs4AceType::Allow, Nfs4Flag::empty(), Nfs4Who::Named, 1000)],
         };
         let back = Nfs4Acl::from_xattr(&acl.to_xattr().unwrap()).unwrap();
         assert_eq!(back.aces[0].who_type, Nfs4Who::Named);
@@ -828,13 +709,11 @@ mod acl {
     #[test]
     fn nfs4_ace_new_forces_special_who_id() {
         assert_eq!(
-            n_ace(Nfs4AceType::Allow, Nfs4Flag::empty(), Nfs4Who::Owner, 999)
-                .who_id,
+            n_ace(Nfs4AceType::Allow, Nfs4Flag::empty(), Nfs4Who::Owner, 999).who_id,
             -1
         );
         assert_eq!(
-            n_ace(Nfs4AceType::Allow, Nfs4Flag::empty(), Nfs4Who::Named, 42)
-                .who_id,
+            n_ace(Nfs4AceType::Allow, Nfs4Flag::empty(), Nfs4Who::Named, 42).who_id,
             42
         );
     }
@@ -870,12 +749,7 @@ mod acl {
         // A non-inheritable parent ACE -> error.
         let plain = Nfs4Acl {
             acl_flags: Nfs4AclFlag::empty(),
-            aces: vec![n_ace(
-                Nfs4AceType::Allow,
-                Nfs4Flag::empty(),
-                Nfs4Who::Owner,
-                -1,
-            )],
+            aces: vec![n_ace(Nfs4AceType::Allow, Nfs4Flag::empty(), Nfs4Who::Owner, -1)],
         };
         assert!(plain.generate_inherited_acl(true).is_err());
     }
@@ -887,12 +761,7 @@ mod acl {
             validate_acl(
                 AclTarget::AssumeDir,
                 &nfs4(
-                    vec![n_ace(
-                        Nfs4AceType::Deny,
-                        Nfs4Flag::empty(),
-                        Nfs4Who::Everyone,
-                        -1
-                    )],
+                    vec![n_ace(Nfs4AceType::Deny, Nfs4Flag::empty(), Nfs4Who::Everyone, -1)],
                     Nfs4AclFlag::empty()
                 )
             )
@@ -903,12 +772,7 @@ mod acl {
             validate_acl(
                 AclTarget::AssumeDir,
                 &nfs4(
-                    vec![n_ace(
-                        Nfs4AceType::Allow,
-                        Nfs4Flag::INHERIT_ONLY,
-                        Nfs4Who::Owner,
-                        -1
-                    )],
+                    vec![n_ace(Nfs4AceType::Allow, Nfs4Flag::INHERIT_ONLY, Nfs4Who::Owner, -1)],
                     Nfs4AclFlag::empty()
                 )
             )
@@ -919,19 +783,14 @@ mod acl {
             validate_acl(
                 AclTarget::AssumeDir,
                 &nfs4(
-                    vec![n_ace(
-                        Nfs4AceType::Allow,
-                        Nfs4Flag::empty(),
-                        Nfs4Who::Owner,
-                        -1
-                    )],
+                    vec![n_ace(Nfs4AceType::Allow, Nfs4Flag::empty(), Nfs4Who::Owner, -1)],
                     Nfs4AclFlag::empty()
                 )
             )
             .is_err()
         );
-        // A valid, inheritable directory ACL -> ok; an empty ACL on a
-        // directory -> err (no inheritable ACE, matching the C).
+        // A valid, inheritable directory ACL -> ok; an empty ACL on a directory -> err (no inheritable ACE, matching
+        // the C).
         assert!(
             validate_acl(
                 AclTarget::AssumeDir,
@@ -947,13 +806,7 @@ mod acl {
             )
             .is_ok()
         );
-        assert!(
-            validate_acl(
-                AclTarget::AssumeDir,
-                &nfs4(vec![], Nfs4AclFlag::empty())
-            )
-            .is_err()
-        );
+        assert!(validate_acl(AclTarget::AssumeDir, &nfs4(vec![], Nfs4AclFlag::empty())).is_err());
     }
 
     #[test]
@@ -963,12 +816,7 @@ mod acl {
         std::fs::write(&p, b"x").unwrap();
         let f = std::fs::File::open(&p).unwrap();
         let acl = nfs4(
-            vec![n_ace(
-                Nfs4AceType::Allow,
-                Nfs4Flag::FILE_INHERIT,
-                Nfs4Who::Owner,
-                -1,
-            )],
+            vec![n_ace(Nfs4AceType::Allow, Nfs4Flag::FILE_INHERIT, Nfs4Who::Owner, -1)],
             Nfs4AclFlag::empty(),
         );
         assert!(validate_acl(AclTarget::Fd(f.as_fd()), &acl).is_err());
@@ -998,15 +846,10 @@ mod acl {
 
     #[test]
     fn posix_validate_structural_rules() {
-        assert!(
-            validate_acl(AclTarget::AssumeDir, &posix(valid_access())).is_ok()
-        );
+        assert!(validate_acl(AclTarget::AssumeDir, &posix(valid_access())).is_ok());
         // Missing each required tag -> rejected.
         for skip in [PosixTag::UserObj, PosixTag::GroupObj, PosixTag::Other] {
-            let aces: Vec<_> = valid_access()
-                .into_iter()
-                .filter(|a| a.tag != skip)
-                .collect();
+            let aces: Vec<_> = valid_access().into_iter().filter(|a| a.tag != skip).collect();
             assert!(
                 validate_acl(AclTarget::AssumeDir, &posix(aces)).is_err(),
                 "missing {skip:?} should be rejected"
@@ -1015,17 +858,13 @@ mod acl {
         // Named USER without MASK -> rejected; with MASK -> ok.
         let mut aces = valid_access();
         aces.push(p_ace(PosixTag::User, 1000, false));
-        assert!(
-            validate_acl(AclTarget::AssumeDir, &posix(aces.clone())).is_err()
-        );
+        assert!(validate_acl(AclTarget::AssumeDir, &posix(aces.clone())).is_err());
         aces.push(p_ace(PosixTag::Mask, -1, false));
         assert!(validate_acl(AclTarget::AssumeDir, &posix(aces)).is_ok());
         // Entries out of canonical tag order -> rejected, as the kernel would.
         let mut unsorted = PosixAcl::from_aces(valid_access());
         unsorted.access.reverse();
-        assert!(
-            validate_acl(AclTarget::AssumeDir, &Acl::Posix(unsorted)).is_err()
-        );
+        assert!(validate_acl(AclTarget::AssumeDir, &Acl::Posix(unsorted)).is_err());
     }
 
     #[test]
@@ -1056,43 +895,22 @@ mod acl {
         assert!(acl.default_bytes().unwrap().is_some());
         assert!(!acl.trivial());
         // Round-trip through the wire codec.
-        let round = PosixAcl::from_xattr(
-            &acl.access_bytes().unwrap(),
-            acl.default_bytes().unwrap().as_deref(),
-        )
-        .unwrap();
+        let round =
+            PosixAcl::from_xattr(&acl.access_bytes().unwrap(), acl.default_bytes().unwrap().as_deref()).unwrap();
         assert_eq!(round.access.len(), 3);
         assert_eq!(round.default.as_ref().unwrap().len(), 3);
         // Inheriting keeps a default for a dir, drops it for a file.
-        assert!(
-            acl.generate_inherited_acl(true, 0o755)
-                .unwrap()
-                .0
-                .default
-                .is_some()
-        );
-        assert!(
-            acl.generate_inherited_acl(false, 0o755)
-                .unwrap()
-                .0
-                .default
-                .is_none()
-        );
+        assert!(acl.generate_inherited_acl(true, 0o755).unwrap().0.default.is_some());
+        assert!(acl.generate_inherited_acl(false, 0o755).unwrap().0.default.is_none());
     }
 
     #[test]
     fn posix_from_xattr_rejects_bad_input() {
-        assert!(matches!(
-            PosixAcl::from_xattr(&[0u8], None),
-            Err(Error::Parse(_))
-        ));
+        assert!(matches!(PosixAcl::from_xattr(&[0u8], None), Err(Error::Parse(_))));
         // version=2 header + one entry with an unknown tag (0x99).
         let mut buf = vec![2u8, 0, 0, 0];
         buf.extend_from_slice(&[0x99, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
-        assert!(matches!(
-            PosixAcl::from_xattr(&buf, None),
-            Err(Error::Parse(_))
-        ));
+        assert!(matches!(PosixAcl::from_xattr(&buf, None), Err(Error::Parse(_))));
     }
 
     #[test]
@@ -1114,28 +932,21 @@ mod acl {
         let dir = truenas_ros::tempdir().unwrap();
         let p = dir.path().join("f");
         std::fs::write(&p, b"x").unwrap();
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&p)
-            .unwrap();
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
         let acl = Acl::Posix(PosixAcl::from_aces(vec![
             p_ace(PosixTag::UserObj, -1, false),
             p_ace(PosixTag::GroupObj, -1, false),
             p_ace(PosixTag::Other, -1, false),
         ]));
-        // A POSIX ACL is the `system.posix_acl_access` xattr, refused
-        // `EOPNOTSUPP` off a dataset whose `acltype` is not `posixacl`
-        // (`zpl_xattr_acl_set_access`, module/os/linux/zfs/zpl_xattr.c), so
-        // the refusal answers to the gate rather than skipping in silence.
+        // A POSIX ACL is the `system.posix_acl_access` xattr, refused `EOPNOTSUPP` off a dataset whose `acltype` is not
+        // `posixacl` (`zpl_xattr_acl_set_access`, module/os/linux/zfs/zpl_xattr.c), so the refusal answers to the gate
+        // rather than skipping in silence.
         match fsetacl(f.as_fd(), Some(&acl)) {
             Ok(()) => {
                 let _ = fgetacl(f.as_fd()).unwrap(); // read back
                 fsetacl(f.as_fd(), None).unwrap(); // remove
             }
-            Err(e) => {
-                crate::xattr_probe::posix_acl_refusal_is_allowed("fsetacl", e)
-            }
+            Err(e) => crate::xattr_probe::posix_acl_refusal_is_allowed("fsetacl", e),
         }
     }
 
@@ -1158,14 +969,10 @@ mod acl {
             p_ace(PosixTag::Other, -1, true),
         ]);
         // POSIX low-level, with a default ACL then without one.
-        let _ = fsetacl_posix(
-            d.as_fd(),
-            &access,
-            default.default_bytes().unwrap().as_deref(),
-        );
+        let _ = fsetacl_posix(d.as_fd(), &access, default.default_bytes().unwrap().as_deref());
         let _ = fsetacl_posix(d.as_fd(), &access, None);
-        // NFS4 low-level (empty, trivially valid): fails on a non-NFS4 fs but
-        // exercises parse + validate + the fsetxattr call.
+        // NFS4 low-level (empty, trivially valid): fails on a non-NFS4 fs but exercises parse + validate + the
+        // fsetxattr call.
         let nfs4 = Nfs4Acl {
             acl_flags: Nfs4AclFlag::empty(),
             aces: vec![],
@@ -1175,13 +982,11 @@ mod acl {
         let _ = fsetacl_nfs4(d.as_fd(), &nfs4);
         assert!(!nfs4.is_empty(), "an empty ACL still serialises to bytes");
 
-        // An *empty* slice is refused, on both raw paths, before it can
-        // reach the filesystem. The kernel leaves `kvalue` NULL for a
-        // zero-length `setxattr` (`setxattr_copy`, `fs/xattr.c:655-669`)
-        // and ZFS reads `(NULL, 0)` as the strip signal, so writing one
-        // would silently revert the object to mode-only permissions - the
-        // opposite of the "deny everyone" a caller that filtered an ACL
-        // down to nothing means by it. Removal is `fsetacl(fd, None)`.
+        // An *empty* slice is refused, on both raw paths, before it can reach the filesystem. The kernel leaves
+        // `kvalue` NULL for a zero-length `setxattr` (`setxattr_copy`, `fs/xattr.c:655-669`) and ZFS reads `(NULL, 0)`
+        // as the strip signal, so writing one would silently revert the object to mode-only permissions - the opposite
+        // of the "deny everyone" a caller that filtered an ACL down to nothing means by it. Removal is `fsetacl(fd,
+        // None)`.
         assert!(matches!(
             fsetacl_nfs4(d.as_fd(), &[]),
             Err(truenas_ros::Error::Errno(Errno::EINVAL))
@@ -1199,9 +1004,7 @@ mod fhandle {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::OFlag;
-    use truenas_ros::sync_fs::fhandle::{
-        FhFlags, FileHandle, name_to_handle_at,
-    };
+    use truenas_ros::sync_fs::fhandle::{FhFlags, FileHandle, name_to_handle_at};
     use truenas_ros::{AT_FDCWD, Error};
 
     #[test]
@@ -1229,11 +1032,7 @@ mod fhandle {
         assert_eq!(h.mount_id(), 42);
         assert!(h.unique_mount_id());
         assert_eq!(h.to_bytes(), vec![0u8; 8]);
-        assert!(
-            !FileHandle::from_bytes(&[0u8; 8], 42, false)
-                .unwrap()
-                .unique_mount_id()
-        );
+        assert!(!FileHandle::from_bytes(&[0u8; 8], 42, false).unwrap().unique_mount_id());
     }
 
     #[test]
@@ -1252,8 +1051,8 @@ mod fhandle {
         let h = FileHandle::from_bytes(&[0u8; 8], 1, true).unwrap();
         let root = std::fs::File::open("/").unwrap();
         match h.open(root.as_fd(), OFlag::O_RDONLY) {
-            // Mount-id mismatch (expected), or a fluke match then a syscall
-            // errno (e.g. seccomp ENOSYS) - never success.
+            // Mount-id mismatch (expected), or a fluke match then a syscall errno (e.g. seccomp ENOSYS) - never
+            // success.
             Err(Error::Validation(_)) | Err(Error::Errno(_)) => {}
             other => panic!("unexpected: {other:?}"),
         }
@@ -1262,12 +1061,7 @@ mod fhandle {
     #[test]
     fn name_to_handle_nonexistent_path() {
         assert!(matches!(
-            name_to_handle_at(
-                AT_FDCWD,
-                "/no/such/path/xyz",
-                FhFlags::AT_HANDLE_MNT_ID_UNIQUE
-            )
-            .unwrap_err(),
+            name_to_handle_at(AT_FDCWD, "/no/such/path/xyz", FhFlags::AT_HANDLE_MNT_ID_UNIQUE).unwrap_err(),
             Error::Errno(Errno::ENOENT)
         ));
     }
@@ -1279,15 +1073,11 @@ mod fhandle {
         let b = dir.path().join("b");
         std::fs::write(&a, b"a").unwrap();
         std::fs::write(&b, b"b").unwrap();
-        let ha = match name_to_handle_at(
-            AT_FDCWD,
-            &a,
-            FhFlags::AT_HANDLE_MNT_ID_UNIQUE,
-        ) {
+        let ha = match name_to_handle_at(AT_FDCWD, &a, FhFlags::AT_HANDLE_MNT_ID_UNIQUE) {
             Ok(h) => h,
             Err(Error::Errno(Errno::EOPNOTSUPP)) => {
-                // The fs cannot encode handles; the codec assertions below
-                // are about to be skipped, so answer to the gate.
+                // The fs cannot encode handles; the codec assertions below are about to be skipped, so answer to the
+                // gate.
                 assert!(
                     std::env::var_os("TRUENAS_ROS_REQUIRE_FHANDLE").is_none(),
                     "TRUENAS_ROS_REQUIRE_FHANDLE is set but \
@@ -1297,9 +1087,7 @@ mod fhandle {
             }
             Err(e) => panic!("{e}"),
         };
-        let hb =
-            name_to_handle_at(AT_FDCWD, &b, FhFlags::AT_HANDLE_MNT_ID_UNIQUE)
-                .unwrap();
+        let hb = name_to_handle_at(AT_FDCWD, &b, FhFlags::AT_HANDLE_MNT_ID_UNIQUE).unwrap();
         assert_ne!(ha.to_bytes(), hb.to_bytes());
         assert_eq!(ha.mount_id(), hb.mount_id());
     }
@@ -1309,15 +1097,12 @@ mod fhandle {
 #[cfg(feature = "fsiter")]
 mod fsiter {
     use truenas_ros::errno::Errno;
-    use truenas_ros::sync_fs::iter::{
-        Cookie, DirStackEntry, EntryType, FsIterBuilder,
-    };
+    use truenas_ros::sync_fs::iter::{Cookie, DirStackEntry, EntryType, FsIterBuilder};
     use truenas_ros::sync_fs::{AtFlags, OFlag, StatxMask, statx};
     use truenas_ros::{AT_FDCWD, Error};
 
-    /// The mount source of `p`, so the fsiter source-check matches on kernels
-    /// that report `sb_source`. Where it is not reported (e.g. the TrueNAS 6.12
-    /// kernel) this returns a placeholder and the check is skipped anyway.
+    /// The mount source of `p`, so the fsiter source-check matches on kernels that report `sb_source`. Where it is not
+    /// reported (e.g. the TrueNAS 6.12 kernel) this returns a placeholder and the check is skipped anyway.
     fn fs_source(p: &std::path::Path) -> String {
         truenas_ros::mount::statmount_path(p)
             .ok()
@@ -1335,18 +1120,14 @@ mod fsiter {
             .relative_path("sub")
             .build()
             .unwrap();
-        let names: Vec<_> = it
-            .map(|e| e.unwrap().name().to_string_lossy().into_owned())
-            .collect();
+        let names: Vec<_> = it.map(|e| e.unwrap().name().to_string_lossy().into_owned()).collect();
         assert!(names.contains(&"inner".to_string()));
         assert!(!names.contains(&"outside".to_string()));
     }
 
-    /// The screen `relative_path` documents: a shape that would walk out
-    /// of the mountpoint is refused at build, not resolved. The
-    /// mount-source check cannot stand in for this - it catches crossing
-    /// to a different filesystem, and `../outside` here stays on the same
-    /// one.
+    /// The screen `relative_path` documents: a shape that would walk out of the mountpoint is refused at build, not
+    /// resolved. The mount-source check cannot stand in for this - it catches crossing to a different filesystem, and
+    /// `../outside` here stays on the same one.
     #[test]
     fn a_relative_path_cannot_escape_the_mountpoint() {
         let dir = truenas_ros::tempdir().unwrap();
@@ -1360,10 +1141,7 @@ mod fsiter {
                 .build()
                 .map(|_| ())
                 .unwrap_err();
-            assert!(
-                matches!(err, Error::Errno(Errno::EINVAL)),
-                "{rel:?} built: {err:?}"
-            );
+            assert!(matches!(err, Error::Errno(Errno::EINVAL)), "{rel:?} built: {err:?}");
         }
         // The screen does not over-reach: an honest subdirectory builds.
         assert!(
@@ -1408,13 +1186,7 @@ mod fsiter {
                 assert_eq!(e.parent(), dir.path().join("d"));
                 let fd = e.into_fd();
                 use std::os::fd::AsFd;
-                let st = statx(
-                    fd.as_fd(),
-                    "",
-                    AtFlags::AT_EMPTY_PATH,
-                    StatxMask::SIZE,
-                )
-                .unwrap();
+                let st = statx(fd.as_fd(), "", AtFlags::AT_EMPTY_PATH, StatxMask::SIZE).unwrap();
                 assert_eq!(st.size(), 5);
             }
         }
@@ -1427,13 +1199,11 @@ mod fsiter {
         let dir = truenas_ros::tempdir().unwrap();
         let p = dir.path().join("f");
         std::fs::write(&p, b"x").unwrap();
-        let st =
-            statx(AT_FDCWD, &p, AtFlags::empty(), StatxMask::BTIME).unwrap();
-        // A filesystem with no birth time is a real case the builder
-        // handles (`a_cutoff_refuses_a_filesystem_with_no_birth_time` pins
-        // the refusal), so the skip is legitimate - but it takes the whole
-        // cutoff assertion with it, so a runner whose scratch filesystem
-        // reports no btime must say so rather than pass green.
+        let st = statx(AT_FDCWD, &p, AtFlags::empty(), StatxMask::BTIME).unwrap();
+        // A filesystem with no birth time is a real case the builder handles
+        // (`a_cutoff_refuses_a_filesystem_with_no_birth_time` pins the refusal), so the skip is legitimate - but it
+        // takes the whole cutoff assertion with it, so a runner whose scratch filesystem reports no btime must say so
+        // rather than pass green.
         if !st.mask().contains(StatxMask::BTIME) || st.btime().sec <= 0 {
             assert!(
                 std::env::var_os("TRUENAS_ROS_REQUIRE_BTIME").is_none(),
@@ -1447,18 +1217,14 @@ mod fsiter {
             .btime_cutoff(st.btime().sec - 1)
             .build()
             .unwrap();
-        let names: Vec<_> = it
-            .map(|e| e.unwrap().name().to_string_lossy().into_owned())
-            .collect();
+        let names: Vec<_> = it.map(|e| e.unwrap().name().to_string_lossy().into_owned()).collect();
         assert!(!names.contains(&"f".to_string()));
     }
 
     #[test]
     fn empty_directory_yields_nothing() {
         let dir = truenas_ros::tempdir().unwrap();
-        let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
-            .build()
-            .unwrap();
+        let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path())).build().unwrap();
         assert!(it.next().is_none());
         assert_eq!(it.stats().count, 0);
     }
@@ -1491,12 +1257,9 @@ mod fsiter {
         std::fs::write(dir.path().join("ok"), b"x").unwrap();
         let bad = dir.path().join("bad");
         std::fs::write(&bad, b"y").unwrap();
-        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000))
-            .unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
         // "bad" hits the EACCES branch (retry O_RDONLY, still denied).
-        let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
-            .build()
-            .unwrap();
+        let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path())).build().unwrap();
         let mut names = Vec::new();
         let mut err = None;
         for res in it.by_ref() {
@@ -1527,9 +1290,7 @@ mod fsiter {
                 ino: 2,
             },
             DirStackEntry {
-                path: std::path::PathBuf::from(OsStr::from_bytes(
-                    b"/mnt/tank/we\xffird",
-                )),
+                path: std::path::PathBuf::from(OsStr::from_bytes(b"/mnt/tank/we\xffird")),
                 ino: 42,
             },
         ]);
@@ -1557,16 +1318,10 @@ mod fsiter {
         // A byte lopped off => truncated; a byte added => trailing garbage.
         let mut truncated = good.clone();
         truncated.pop();
-        assert!(matches!(
-            Cookie::from_bytes(&truncated),
-            Err(Error::Validation(_))
-        ));
+        assert!(matches!(Cookie::from_bytes(&truncated), Err(Error::Validation(_))));
         let mut trailing = good.clone();
         trailing.push(0);
-        assert!(matches!(
-            Cookie::from_bytes(&trailing),
-            Err(Error::Validation(_))
-        ));
+        assert!(matches!(Cookie::from_bytes(&trailing), Err(Error::Validation(_))));
     }
 
     #[test]
@@ -1587,10 +1342,7 @@ mod fsiter {
         let full = walk(FsIterBuilder::new(root, fs_source(root)));
 
         // Empty cookie => no resume => full walk.
-        let empty = walk(
-            FsIterBuilder::new(root, fs_source(root))
-                .resume_from(Cookie::default()),
-        );
+        let empty = walk(FsIterBuilder::new(root, fs_source(root)).resume_from(Cookie::default()));
         assert_eq!(empty, full);
 
         // A single-level (root-only) cookie re-reads root from the start =>
@@ -1599,8 +1351,7 @@ mod fsiter {
             path: root.to_path_buf(),
             ino: std::fs::metadata(root).unwrap().ino(),
         }]);
-        let one =
-            walk(FsIterBuilder::new(root, fs_source(root)).resume_from(ck));
+        let one = walk(FsIterBuilder::new(root, fs_source(root)).resume_from(ck));
         assert_eq!(one, full);
     }
 
@@ -1664,18 +1415,14 @@ mod io {
     use std::io::{Read, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use truenas_ros::errno::Errno;
-    use truenas_ros::sync_fs::{
-        AtomicWriteOptions, Mode, OFlag, atomic_replace, atomic_write,
-        safe_open,
-    };
+    use truenas_ros::sync_fs::{AtomicWriteOptions, Mode, OFlag, atomic_replace, atomic_write, safe_open};
     use truenas_ros::{AT_FDCWD, Error};
 
     #[test]
     fn atomic_write_sets_mode_and_preserves_owner() {
         let dir = truenas_ros::tempdir().unwrap();
         let target = dir.path().join("cfg");
-        let (uid, gid) =
-            unsafe { (libc::getuid() as u32, libc::getgid() as u32) };
+        let (uid, gid) = unsafe { (libc::getuid() as u32, libc::getgid() as u32) };
         let opts = AtomicWriteOptions {
             uid: Some(uid),
             gid: Some(gid),
@@ -1694,8 +1441,7 @@ mod io {
     fn failed_write_leaves_target_and_no_temp() {
         let dir = truenas_ros::tempdir().unwrap();
         let target = dir.path().join("cfg");
-        atomic_replace(&target, b"original", AtomicWriteOptions::default())
-            .unwrap();
+        atomic_replace(&target, b"original", AtomicWriteOptions::default()).unwrap();
         let err = atomic_write(&target, AtomicWriteOptions::default(), |f| {
             f.write_all(b"partial")?;
             Err(std::io::Error::other("boom"))
@@ -1731,11 +1477,7 @@ mod io {
     #[test]
     fn rejects_target_without_file_name() {
         assert!(matches!(
-            atomic_replace(
-                std::path::Path::new("/"),
-                b"x",
-                AtomicWriteOptions::default()
-            ),
+            atomic_replace(std::path::Path::new("/"), b"x", AtomicWriteOptions::default()),
             Err(Error::Validation(_))
         ));
     }
@@ -1745,8 +1487,7 @@ mod io {
         let dir = truenas_ros::tempdir().unwrap();
         let p = dir.path().join("f");
         std::fs::write(&p, b"hello world").unwrap();
-        let mut f =
-            safe_open(AT_FDCWD, &p, OFlag::O_RDONLY, Mode::empty()).unwrap();
+        let mut f = safe_open(AT_FDCWD, &p, OFlag::O_RDONLY, Mode::empty()).unwrap();
         let mut s = String::new();
         f.read_to_string(&mut s).unwrap();
         assert_eq!(s, "hello world");
@@ -1772,10 +1513,7 @@ mod io {
     fn safe_open_propagates_other_errors() {
         let dir = truenas_ros::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        assert!(
-            safe_open(AT_FDCWD, &missing, OFlag::O_RDONLY, Mode::empty())
-                .is_err()
-        );
+        assert!(safe_open(AT_FDCWD, &missing, OFlag::O_RDONLY, Mode::empty()).is_err());
     }
 }
 
@@ -1786,21 +1524,17 @@ mod shutil {
     use std::os::unix::fs::PermissionsExt;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::shutil::{
-        CopyFlags, CopyTreeConfig, CopyTreeOp, MAX_RW_SZ, clonefile,
-        copy_permissions, copy_setid, copy_xattrs, copyfile, copysendfile,
-        copytree, copyuserspace,
+        CopyFlags, CopyTreeConfig, CopyTreeOp, MAX_RW_SZ, clonefile, copy_permissions, copy_setid, copy_xattrs,
+        copyfile, copysendfile, copytree, copyuserspace,
     };
 
     /// A source/destination pair on a **ZFS dataset**, or `None` to skip.
     ///
-    /// For the clone path only: tmpfs serves `copy_file_range` as a plain
-    /// copy, so a tempdir fixture passes without ever reaching the block
-    /// clone (`zfs_clone_range`) that ships. The other copy helpers here are
+    /// For the clone path only: tmpfs serves `copy_file_range` as a plain copy, so a tempdir fixture passes without
+    /// ever reaching the block clone (`zfs_clone_range`) that ships. The other copy helpers here are
     /// filesystem-agnostic and keep the tempdir `pair`.
     #[allow(clippy::type_complexity)]
-    fn zfs_pair(
-        src: &[u8],
-    ) -> Option<(std::path::PathBuf, std::fs::File, std::fs::File)> {
+    fn zfs_pair(src: &[u8]) -> Option<(std::path::PathBuf, std::fs::File, std::fs::File)> {
         let ds = super::zfs_dir::zfs_dir_or_skip()?;
         let s = ds.join("clone_src");
         let d = ds.join("clone_dst");
@@ -1810,9 +1544,7 @@ mod shutil {
         Some((ds, sf, df))
     }
 
-    fn pair(
-        src: &[u8],
-    ) -> (truenas_ros::TempDir, std::fs::File, std::fs::File) {
+    fn pair(src: &[u8]) -> (truenas_ros::TempDir, std::fs::File, std::fs::File) {
         let dir = truenas_ros::tempdir().unwrap();
         std::fs::write(dir.path().join("s"), src).unwrap();
         let s = std::fs::File::open(dir.path().join("s")).unwrap();
@@ -1830,10 +1562,7 @@ mod shutil {
         let (dir, s, d) = pair(b"hello world");
         assert_eq!(copyuserspace(s.as_fd(), d.as_fd()).unwrap(), 11);
         drop(d);
-        assert_eq!(
-            std::fs::read(dir.path().join("d")).unwrap(),
-            b"hello world"
-        );
+        assert_eq!(std::fs::read(dir.path().join("d")).unwrap(), b"hello world");
         let (_d2, s2, d2) = pair(b"");
         assert_eq!(copyuserspace(s2.as_fd(), d2.as_fd()).unwrap(), 0);
     }
@@ -1849,12 +1578,10 @@ mod shutil {
         assert_eq!(copysendfile(s2.as_fd(), d2.as_fd()).unwrap(), 0);
     }
 
-    /// The clone half runs on a ZFS dataset, because that is the only place
-    /// it is the code under test: tmpfs serves `copy_file_range` as a plain
-    /// copy, so a tempdir fixture takes the `Ok` arm without ever reaching
-    /// `zfs_clone_range`. `EXDEV` stays tolerated - two files on different
-    /// filesystems genuinely cannot clone - but on a dataset an unsupported
-    /// answer is a regression, not an environment.
+    /// The clone half runs on a ZFS dataset, because that is the only place it is the code under test: tmpfs serves
+    /// `copy_file_range` as a plain copy, so a tempdir fixture takes the `Ok` arm without ever reaching
+    /// `zfs_clone_range`. `EXDEV` stays tolerated - two files on different filesystems genuinely cannot clone - but on
+    /// a dataset an unsupported answer is a regression, not an environment.
     #[test]
     fn clonefile_clones_on_a_dataset() {
         let Some((ds, s, d)) = zfs_pair(b"clone me") else {
@@ -1864,10 +1591,7 @@ mod shutil {
             Ok(n) => {
                 assert_eq!(n, 8);
                 drop(d);
-                assert_eq!(
-                    std::fs::read(ds.join("clone_dst")).unwrap(),
-                    b"clone me"
-                );
+                assert_eq!(std::fs::read(ds.join("clone_dst")).unwrap(), b"clone me");
             }
             Err(Errno::EXDEV) => {}
             Err(e) => panic!("clonefile on a ZFS dataset: {e}"),
@@ -1876,8 +1600,8 @@ mod shutil {
         let _ = std::fs::remove_file(ds.join("clone_dst"));
     }
 
-    /// `copyfile` lands the content whichever path it takes, so this half is
-    /// filesystem-agnostic and keeps the tempdir fixture.
+    /// `copyfile` lands the content whichever path it takes, so this half is filesystem-agnostic and keeps the tempdir
+    /// fixture.
     #[test]
     fn copyfile_lands_the_content() {
         let (dir2, s2, d2) = pair(b"copy me");
@@ -1895,8 +1619,7 @@ mod shutil {
 
     #[test]
     fn copy_permissions_withholds_setid_for_copy_setid() {
-        let mode =
-            |f: &std::fs::File| f.metadata().unwrap().permissions().mode();
+        let mode = |f: &std::fs::File| f.metadata().unwrap().permissions().mode();
         let (_dir, s, d) = pair(b"x");
         // copy_permissions applies the rwx bits but withholds setid.
         copy_permissions(s.as_fd(), d.as_fd(), &[], 0o104755).unwrap();
@@ -1924,20 +1647,14 @@ mod shutil {
             .open(dir.path().join("s"))
             .unwrap();
         let d = std::fs::File::create(dir.path().join("d")).unwrap();
-        if let Err(e) =
-            fsetxattr(s.as_fd(), "user.keep", b"v", XattrFlags::empty())
-        {
-            // Every assertion below is behind this probe, so the refusal is
-            // held to the same gate as its sibling in `xattr::` rather than
-            // returning silently.
+        if let Err(e) = fsetxattr(s.as_fd(), "user.keep", b"v", XattrFlags::empty()) {
+            // Every assertion below is behind this probe, so the refusal is held to the same gate as its sibling in
+            // `xattr::` rather than returning silently.
             super::xattr_probe::refusal_is_allowed("fsetxattr(user.keep)", e);
             return; // user xattrs unsupported here
         }
         // A system/ACL name in the list must be skipped without error.
-        let names = vec![
-            c"user.keep".to_owned(),
-            c"system.posix_acl_access".to_owned(),
-        ];
+        let names = vec![c"user.keep".to_owned(), c"system.posix_acl_access".to_owned()];
         copy_xattrs(s.as_fd(), d.as_fd(), &names).unwrap();
         assert_eq!(fgetxattr(d.as_fd(), "user.keep").unwrap(), b"v");
         assert!(fgetxattr(d.as_fd(), "system.posix_acl_access").is_err());
@@ -1945,11 +1662,7 @@ mod shutil {
 
     #[test]
     fn copytree_op_variants_and_exist_ok() {
-        for op in [
-            CopyTreeOp::Default,
-            CopyTreeOp::Sendfile,
-            CopyTreeOp::Userspace,
-        ] {
+        for op in [CopyTreeOp::Default, CopyTreeOp::Sendfile, CopyTreeOp::Userspace] {
             let tmp = truenas_ros::tempdir().unwrap();
             let src = tmp.path().join("src");
             let dst = tmp.path().join("dst");
@@ -1982,13 +1695,11 @@ mod shutil {
         }
     }
 
-    /// A re-run or incremental copy must leave the destination looking like
-    /// the source, whatever was at the name first.
+    /// A re-run or incremental copy must leave the destination looking like the source, whatever was at the name first.
     ///
-    /// `make_file` replaced a collision with `exist_ok`; `make_symlink` and
-    /// `make_special` kept it, so a destination could carry a different
-    /// symlink target - or an entry of a different *type* entirely - while
-    /// `copytree` returned `Ok` with stats claiming it had copied one.
+    /// `make_file` replaced a collision with `exist_ok`; `make_symlink` and `make_special` kept it, so a destination
+    /// could carry a different symlink target - or an entry of a different *type* entirely - while `copytree` returned
+    /// `Ok` with stats claiming it had copied one.
     #[test]
     fn copytree_replaces_a_taken_symlink_or_special() {
         let tmp = truenas_ros::tempdir().unwrap();
@@ -1999,8 +1710,7 @@ mod shutil {
         std::os::unix::fs::symlink("real", src.join("link")).unwrap();
         mkfifo(&src.join("pipe"));
 
-        // A destination that already has all three names taken, two of them
-        // by the wrong kind of object.
+        // A destination that already has all three names taken, two of them by the wrong kind of object.
         std::fs::create_dir(&dst).unwrap();
         std::fs::write(dst.join("other"), b"OLD").unwrap();
         std::os::unix::fs::symlink("other", dst.join("link")).unwrap();
@@ -2023,16 +1733,12 @@ mod shutil {
         );
     }
 
-    /// A copy that fails must leave a *borrowed* destination root at the
-    /// mode it found.
+    /// A copy that fails must leave a *borrowed* destination root at the mode it found.
     ///
-    /// copytree narrows a pre-existing root to 0o700 for the duration, so
-    /// group and other cannot reach files while they are being written -
-    /// but only the success path restored a mode, and the original was
-    /// recorded nowhere, so the caller could not put it back either. On a
-    /// share or system-dataset migration that locks every non-owner
-    /// identity out of the destination, and the error names no permission
-    /// change.
+    /// copytree narrows a pre-existing root to 0o700 for the duration, so group and other cannot reach files while they
+    /// are being written - but only the success path restored a mode, and the original was recorded nowhere, so the
+    /// caller could not put it back either. On a share or system-dataset migration that locks every non-owner identity
+    /// out of the destination, and the error names no permission change.
     #[test]
     fn a_failed_copytree_puts_a_borrowed_root_s_mode_back() {
         let tmp = truenas_ros::tempdir().unwrap();
@@ -2043,16 +1749,12 @@ mod shutil {
 
         // A destination this copy did not create, and is only borrowing.
         std::fs::create_dir(&dst).unwrap();
-        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))
-            .unwrap();
-        // A regular file where the source has a directory: `make_dir`
-        // swallows the `EEXIST` under `exist_ok` and the `O_DIRECTORY`
-        // open behind it answers `ENOTDIR`, which is a copy that fails
-        // after the root has been narrowed.
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A regular file where the source has a directory: `make_dir` swallows the `EEXIST` under `exist_ok` and the
+        // `O_DIRECTORY` open behind it answers `ENOTDIR`, which is a copy that fails after the root has been narrowed.
         std::fs::write(dst.join("sub"), b"in the way").unwrap();
 
-        let err = copytree(&src, &dst, &CopyTreeConfig::default())
-            .expect_err("the copy must fail");
+        let err = copytree(&src, &dst, &CopyTreeConfig::default()).expect_err("the copy must fail");
         assert!(
             matches!(err, truenas_ros::Error::Errno(Errno::ENOTDIR)),
             "unexpected failure: {err:?}"
@@ -2063,8 +1765,7 @@ mod shutil {
             "a borrowed destination root was left narrowed"
         );
 
-        // The control: a copy that succeeds ends at the source root's mode,
-        // which is what `finish_dir` stamps.
+        // The control: a copy that succeeds ends at the source root's mode, which is what `finish_dir` stamps.
         std::fs::remove_file(dst.join("sub")).unwrap();
         copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
         assert_eq!(
@@ -2074,8 +1775,7 @@ mod shutil {
     }
 
     fn mkfifo(p: &std::path::Path) {
-        let c =
-            std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: a NUL-terminated path this test owns.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
     }
@@ -2087,11 +1787,7 @@ mod shutil {
         let dst = tmp.path().join("dst");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("f"), b"x").unwrap();
-        std::fs::set_permissions(
-            src.join("f"),
-            std::fs::Permissions::from_mode(0o640),
-        )
-        .unwrap();
+        std::fs::set_permissions(src.join("f"), std::fs::Permissions::from_mode(0o640)).unwrap();
         copytree(
             &src,
             &dst,
@@ -2102,27 +1798,21 @@ mod shutil {
         )
         .unwrap();
         assert_eq!(
-            std::fs::metadata(dst.join("f"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
+            std::fs::metadata(dst.join("f")).unwrap().permissions().mode() & 0o777,
             0o640
         );
     }
 
     #[test]
     fn copytree_defers_root_metadata_so_children_are_creatable() {
-        // Regression: the destination root's permissions must be applied AFTER
-        // the walk. A read-only source root would otherwise make the dst root
-        // unwritable before its children are created (EACCES unprivileged).
+        // Regression: the destination root's permissions must be applied AFTER the walk. A read-only source root would
+        // otherwise make the dst root unwritable before its children are created (EACCES unprivileged).
         let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("child"), b"hi").unwrap();
-        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o555))
-            .unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let config = CopyTreeConfig {
             flags: CopyFlags::PERMISSIONS,
@@ -2131,23 +1821,14 @@ mod shutil {
         let res = copytree(&src, &dst, &config);
 
         // Restore write so the tempdir cleanup can remove the tree.
-        let _ = std::fs::set_permissions(
-            &src,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755));
 
         let stats = res.expect("read-only-rooted copytree should succeed");
         assert_eq!(stats.files, 1);
         assert_eq!(std::fs::read(dst.join("child")).unwrap(), b"hi");
         // The root's restrictive mode is still applied - just last.
-        assert_eq!(
-            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
-            0o555
-        );
-        let _ = std::fs::set_permissions(
-            &dst,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        assert_eq!(std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777, 0o555);
+        let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
     }
 }
 
@@ -2160,18 +1841,15 @@ mod configfile {
 
     #[test]
     fn writes_global_section_byte_exact() {
-        // The exact bytes the TrueNAS `configfile.py` wrapper emits via
-        // `configparser` for its `[GLOBAL]` section: keys lowercased, `" = "`
-        // delimiter, `str(bool)` booleans, a trailing blank line.
+        // The exact bytes the TrueNAS `configfile.py` wrapper emits via `configparser` for its `[GLOBAL]` section: keys
+        // lowercased, `" = "` delimiter, `str(bool)` booleans, a trailing blank line.
         let mut cfg = ConfigFile::new();
         cfg.add_section("GLOBAL").unwrap();
         cfg.set_bool("GLOBAL", "Enabled", false).unwrap();
         cfg.set_int("GLOBAL", "MaxConcurrentJobs", 4).unwrap();
-        cfg.set_int("GLOBAL", "ReportingStatsWriteInterval", 120)
-            .unwrap();
+        cfg.set_int("GLOBAL", "ReportingStatsWriteInterval", 120).unwrap();
         cfg.set_int("GLOBAL", "RewriteChunkSize", 2048).unwrap();
-        cfg.set_int("GLOBAL", "ReportingCallbackInterval", 200)
-            .unwrap();
+        cfg.set_int("GLOBAL", "ReportingCallbackInterval", 200).unwrap();
         cfg.set_int("GLOBAL", "MaxUsedPercent", 85).unwrap();
         cfg.set_int("GLOBAL", "StatsFlushInterval", 1).unwrap();
         let expected = "[GLOBAL]\n\
@@ -2224,16 +1902,14 @@ mod configfile {
     #[test]
     fn multiline_values_join_and_rstrip() {
         let mut cfg = ConfigFile::raw();
-        cfg.read_str("[s]\nk = one\n  two\n\n  three\n  \n")
-            .unwrap();
+        cfg.read_str("[s]\nk = one\n  two\n\n  three\n  \n").unwrap();
         assert_eq!(cfg.get_raw("s", "k"), Some("one\ntwo\n\nthree"));
     }
 
     #[test]
     fn default_inheritance_and_override() {
         let mut cfg = ConfigFile::new();
-        cfg.read_str("[DEFAULT]\nd = base\nk = def\n[s]\nk = over\n")
-            .unwrap();
+        cfg.read_str("[DEFAULT]\nd = base\nk = def\n[s]\nk = over\n").unwrap();
         assert_eq!(cfg.get("s", "d").unwrap().as_deref(), Some("base"));
         assert_eq!(cfg.get("s", "k").unwrap().as_deref(), Some("over"));
         assert!(cfg.has_option("s", "d"));
@@ -2275,10 +1951,8 @@ mod configfile {
     #[test]
     fn boolean_states() {
         let mut cfg = ConfigFile::new();
-        cfg.read_str(
-            "[s]\na=1\nb=yes\nc=true\nd=on\ne=0\nf=no\ng=false\nh=off\n",
-        )
-        .unwrap();
+        cfg.read_str("[s]\na=1\nb=yes\nc=true\nd=on\ne=0\nf=no\ng=false\nh=off\n")
+            .unwrap();
         for k in ["a", "b", "c", "d"] {
             assert_eq!(cfg.get_bool("s", k).unwrap(), Some(true));
         }
@@ -2290,10 +1964,8 @@ mod configfile {
     #[test]
     fn interpolation_basic_and_escapes() {
         let mut cfg = ConfigFile::new();
-        cfg.read_str(
-            "[DEFAULT]\nbase = /srv\n[s]\np = %(base)s/x\nlit = 100%%\n",
-        )
-        .unwrap();
+        cfg.read_str("[DEFAULT]\nbase = /srv\n[s]\np = %(base)s/x\nlit = 100%%\n")
+            .unwrap();
         assert_eq!(cfg.get("s", "p").unwrap().as_deref(), Some("/srv/x"));
         assert_eq!(cfg.get("s", "lit").unwrap().as_deref(), Some("100%"));
         // `get_raw` bypasses interpolation.
@@ -2303,10 +1975,8 @@ mod configfile {
     #[test]
     fn interpolation_errors_and_depth_limit() {
         let mut cfg = ConfigFile::new();
-        cfg.read_str(
-            "[s]\nbad = 50%\nmissing = %(nope)s\na = %(b)s\nb = %(a)s\n",
-        )
-        .unwrap();
+        cfg.read_str("[s]\nbad = 50%\nmissing = %(nope)s\na = %(b)s\nb = %(a)s\n")
+            .unwrap();
         assert!(matches!(cfg.get("s", "bad"), Err(Error::Parse(_))));
         assert!(matches!(cfg.get("s", "missing"), Err(Error::Parse(_))));
         assert!(matches!(cfg.get("s", "a"), Err(Error::Parse(_))));
@@ -2324,10 +1994,7 @@ mod configfile {
     fn set_rejects_invalid_interpolation_but_raw_allows() {
         let mut cfg = ConfigFile::new();
         cfg.add_section("s").unwrap();
-        assert!(matches!(
-            cfg.set("s", "k", Some("50%")),
-            Err(Error::Validation(_))
-        ));
+        assert!(matches!(cfg.set("s", "k", Some("50%")), Err(Error::Validation(_))));
         cfg.set("s", "k", Some("100%%")).unwrap();
         cfg.set("s", "k", Some("%(other)s")).unwrap();
 
@@ -2341,24 +2008,15 @@ mod configfile {
         let mut cfg = ConfigFile::new();
         cfg.add_section("s").unwrap();
         assert!(matches!(cfg.add_section("s"), Err(Error::Validation(_))));
-        assert!(matches!(
-            cfg.add_section("DEFAULT"),
-            Err(Error::Validation(_))
-        ));
-        assert!(matches!(
-            cfg.set("missing", "k", Some("v")),
-            Err(Error::Validation(_))
-        ));
+        assert!(matches!(cfg.add_section("DEFAULT"), Err(Error::Validation(_))));
+        assert!(matches!(cfg.set("missing", "k", Some("v")), Err(Error::Validation(_))));
         cfg.set("s", "k", Some("v")).unwrap();
         assert!(cfg.has_option("s", "k"));
         assert!(cfg.remove_option("s", "k").unwrap());
         assert!(!cfg.remove_option("s", "k").unwrap());
         assert!(cfg.remove_section("s"));
         assert!(!cfg.remove_section("s"));
-        assert!(matches!(
-            cfg.remove_option("gone", "k"),
-            Err(Error::Validation(_))
-        ));
+        assert!(matches!(cfg.remove_option("gone", "k"), Err(Error::Validation(_))));
     }
 
     #[test]

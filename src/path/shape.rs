@@ -1,99 +1,77 @@
-//! Path *shape*: whether a byte string may name something the `*at`
-//! syscalls can create beneath an anchor. Validation only - nothing here
-//! joins, normalises or resolves.
+//! Path *shape*: whether a byte string may name something the `*at` syscalls can create beneath an anchor. Validation
+//! only - nothing here joins, normalises or resolves.
 //!
 //! # Why there is no `normpath`
 //!
-//! Normalising would be the obvious alternative: fold `a/./b` to `a/b`,
-//! `a/../b` to `b`, and hand the kernel the result. CPython implements
-//! exactly that and warns about it in the same breath
-//! (`Lib/posixpath.py:339-341`):
+//! Normalising would be the obvious alternative: fold `a/./b` to `a/b`, `a/../b` to `b`, and hand the kernel the
+//! result. CPython implements exactly that and warns about it in the same breath (`Lib/posixpath.py:339-341`):
 //!
-//! > Normalize a path, e.g. A//B, A/./B and A/foo/../B all become A/B.
-//! > It should be understood that this may change the meaning of the path
-//! > if it contains symbolic links!
+//! > Normalize a path, e.g. A//B, A/./B and A/foo/../B all become A/B. It should be understood that this may change the
+//! > meaning of the path if it contains symbolic links!
 //!
-//! That is the whole problem. `a/../b` is `b` only when `a` is not a
-//! symlink; when it is, `a/..` is the *target's* parent and the two name
-//! different directories. Folding the path lexically therefore launders a
-//! traversal into something that looks confined - the exact substitution
-//! `RESOLVE_NO_SYMLINKS` exists to refuse. A create that resolved through
-//! a component the caller never named would leave a directory somewhere it
-//! never asked for, and no error would say so.
+//! That is the whole problem. `a/../b` is `b` only when `a` is not a symlink; when it is, `a/..` is the *target's*
+//! parent and the two name different directories. Folding the path lexically therefore launders a traversal into
+//! something that looks confined - the exact substitution `RESOLVE_NO_SYMLINKS` exists to refuse. A create that
+//! resolved through a component the caller never named would leave a directory somewhere it never asked for, and no
+//! error would say so.
 //!
-//! So a path either names its components plainly or it is refused, and the
-//! refusal carries which component was wrong.
+//! So a path either names its components plainly or it is refused, and the refusal carries which component was wrong.
 //!
 //! # What is deliberately not checked
 //!
-//! **Lengths.** `NAME_MAX` is a filesystem property, not a constant: ZFS
-//! raises it to 1023 with the `longname` feature, so a hard 255 here would
-//! refuse names the filesystem would have taken. The kernel answers
-//! `ENAMETOOLONG` and it is the authority.
+//! **Lengths.** `NAME_MAX` is a filesystem property, not a constant: ZFS raises it to 1023 with the `longname` feature,
+//! so a hard 255 here would refuse names the filesystem would have taken. The kernel answers `ENAMETOOLONG` and it is
+//! the authority.
 //!
-//! **Encoding.** A POSIX name is an arbitrary non-NUL byte string. A
-//! UTF-8 rule belongs to whatever models the *keys* a service accepts, not
-//! to the syscall layer.
+//! **Encoding.** A POSIX name is an arbitrary non-NUL byte string. A UTF-8 rule belongs to whatever models the *keys* a
+//! service accepts, not to the syscall layer.
 //!
 //! # Nothing here copies
 //!
-//! Every function borrows the caller's bytes and answers with a `Copy`
-//! enum: [`components`] hands back subslices of its argument
-//! (`slice::split` is lazy), and the two `*_defect` functions only scan.
-//! There is no allocation on either the accepting or the refusing path, so
-//! a caller may validate a path it is about to hand to a syscall without
-//! paying for a second copy of it.
+//! Every function borrows the caller's bytes and answers with a `Copy` enum: [`components`] hands back subslices of its
+//! argument (`slice::split` is lazy), and the two `*_defect` functions only scan. There is no allocation on either the
+//! accepting or the refusing path, so a caller may validate a path it is about to hand to a syscall without paying for
+//! a second copy of it.
 //!
-//! **The screen is applied per call site, not by the path conversion.** No
-//! `TnPath::with_tn_path` implementation calls either function - that trait
-//! converts a path to a `CStr` and screens nothing - so going through it
-//! says nothing about whether a path was judged.
+//! **The screen is applied per call site, not by the path conversion.** No `TnPath::with_tn_path` implementation calls
+//! either function - that trait converts a path to a `CStr` and screens nothing - so going through it says nothing
+//! about whether a path was judged.
 //!
-//! Two rules of thumb, and neither is a substitute for grepping the two
-//! function names. A call that takes a **single component** against an
-//! anchor screens with [`component_defect`], because no `RESOLVE_*` flag
-//! confines a name the caller assembled: `mkdirat`, `unlinkat`,
-//! `renameat2` (both names), `linkat` (both names), and `FsIter::process`
-//! on every name `readdir` hands it. A call that takes a **relative
-//! multi-component path** it will rebuild one component at a time screens
-//! with [`relative_defect`]: `FsIterBuilder::relative_path`, and the fs
-//! reactor's `mkdir_path`/`walk` entry points.
+//! Two rules of thumb, and neither is a substitute for grepping the two function names. A call that takes a **single
+//! component** against an anchor screens with [`component_defect`], because no `RESOLVE_*` flag confines a name the
+//! caller assembled: `mkdirat`, `unlinkat`, `renameat2` (both names), `linkat` (both names), and `FsIter::process` on
+//! every name `readdir` hands it. A call that takes a **relative multi-component path** it will rebuild one component
+//! at a time screens with [`relative_defect`]: `FsIterBuilder::relative_path`, and the fs reactor's `mkdir_path`/`walk`
+//! entry points.
 //!
-//! Everything else - `statx`, `name_to_handle_at`, the plain `openat2`
-//! wrappers - takes the caller's bytes as given, and its confinement is
-//! whatever `RESOLVE_*` flags and anchor it was handed, not this module.
+//! Everything else - `statx`, `name_to_handle_at`, the plain `openat2` wrappers - takes the caller's bytes as given,
+//! and its confinement is whatever `RESOLVE_*` flags and anchor it was handed, not this module.
 //!
-//! The owned components a directory *walk* carries are a different matter:
-//! those outlive the completion that consumes them and have to be owned.
+//! The owned components a directory *walk* carries are a different matter: those outlive the completion that consumes
+//! them and have to be owned.
 
 use std::fmt;
 
 /// Why a byte string cannot name an entry beneath an anchor.
 ///
-/// Each variant names one component's defect rather than reporting a bare
-/// "invalid path", so a caller can say which part of what it was handed
-/// was wrong.
+/// Each variant names one component's defect rather than reporting a bare "invalid path", so a caller can say which
+/// part of what it was handed was wrong.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Defect {
     /// The whole path is empty, where a name is required.
     Empty,
-    /// A leading `/`. An absolute path ignores the anchor descriptor
-    /// entirely, so it can never be confined by one.
+    /// A leading `/`. An absolute path ignores the anchor descriptor entirely, so it can never be confined by one.
     Absolute,
-    /// An empty component - `a//b`, or a trailing `/`. It names what the
-    /// path without it names, so it is a caller assembling a path wrongly
-    /// rather than a path meaning something unintended. Refused rather
-    /// than skipped, because a rule that quietly accepts one malformed
-    /// shape is a worse rule to reason about than one that accepts none.
+    /// An empty component - `a//b`, or a trailing `/`. It names what the path without it names, so it is a caller
+    /// assembling a path wrongly rather than a path meaning something unintended. Refused rather than skipped, because
+    /// a rule that quietly accepts one malformed shape is a worse rule to reason about than one that accepts none.
     EmptyComponent,
-    /// A `.` component, which names the directory it sits in rather than
-    /// an entry within it.
+    /// A `.` component, which names the directory it sits in rather than an entry within it.
     Dot,
-    /// A `..` component. It resolves against whatever the preceding
-    /// component turned out to be, which is not knowable from the path.
+    /// A `..` component. It resolves against whatever the preceding component turned out to be, which is not knowable
+    /// from the path.
     DotDot,
-    /// A NUL byte, which terminates the string the kernel receives and so
-    /// cannot appear inside a name.
+    /// A NUL byte, which terminates the string the kernel receives and so cannot appear inside a name.
     Nul,
     /// A `/` where a single component is required.
     Separator,
@@ -113,17 +91,15 @@ impl fmt::Display for Defect {
     }
 }
 
-/// The components of `path`, split on `/`. An empty path yields one empty
-/// component, as `split` does.
+/// The components of `path`, split on `/`. An empty path yields one empty component, as `split` does.
 pub fn components(path: &[u8]) -> impl Iterator<Item = &[u8]> {
     path.split(|&byte| byte == b'/')
 }
 
 /// Why `name` cannot be a **single** directory entry's name, or `None`.
 ///
-/// This is the rule the `*at` opcodes need: none of `mkdirat`, `linkat`,
-/// `renameat` or `unlinkat` honours a `RESOLVE_*` flag, so a name they are
-/// handed must not resolve anywhere but the directory it is given.
+/// This is the rule the `*at` opcodes need: none of `mkdirat`, `linkat`, `renameat` or `unlinkat` honours a `RESOLVE_*`
+/// flag, so a name they are handed must not resolve anywhere but the directory it is given.
 pub fn component_defect(name: &[u8]) -> Option<Defect> {
     match name {
         b"" => Some(Defect::Empty),
@@ -135,20 +111,16 @@ pub fn component_defect(name: &[u8]) -> Option<Defect> {
     }
 }
 
-/// Why `path` cannot be a relative multi-component path beneath an anchor,
-/// or `None`.
+/// Why `path` cannot be a relative multi-component path beneath an anchor, or `None`.
 ///
-/// Every component must be a plain name: `a/b/c` passes, and `a/../b`,
-/// `./a`, `a//b` and `a/b/` do not. A caller that wants a path resolved
-/// *with* `..` has `openat2` and its `RESOLVE_*` flags, where the kernel
-/// enforces the confinement; this rule is for the paths a walk has to take
-/// apart and create one component at a time, where it cannot.
+/// Every component must be a plain name: `a/b/c` passes, and `a/../b`, `./a`, `a//b` and `a/b/` do not. A caller that
+/// wants a path resolved *with* `..` has `openat2` and its `RESOLVE_*` flags, where the kernel enforces the
+/// confinement; this rule is for the paths a walk has to take apart and create one component at a time, where it
+/// cannot.
 ///
-/// The path admitted here is exactly the path a walk will rebuild, one
-/// `mkdirat` per component - no component is skipped, folded or reordered
-/// on the way. That equality is the point: anything the kernel would
-/// resolve differently from that walk is refused instead of quietly
-/// resolving one way here and another way there.
+/// The path admitted here is exactly the path a walk will rebuild, one `mkdirat` per component - no component is
+/// skipped, folded or reordered on the way. That equality is the point: anything the kernel would resolve differently
+/// from that walk is refused instead of quietly resolving one way here and another way there.
 pub fn relative_defect(path: &[u8]) -> Option<Defect> {
     if path.is_empty() {
         return Some(Defect::Empty);
@@ -157,8 +129,8 @@ pub fn relative_defect(path: &[u8]) -> Option<Defect> {
         return Some(Defect::Absolute);
     }
     components(path).find_map(|c| match component_defect(c) {
-        // Inside a multi-component path an empty split is a doubled or
-        // trailing separator, not a path that is empty outright.
+        // Inside a multi-component path an empty split is a doubled or trailing separator, not a path that is empty
+        // outright.
         Some(Defect::Empty) => Some(Defect::EmptyComponent),
         other => other,
     })
@@ -181,9 +153,8 @@ mod tests {
         ] {
             assert_eq!(component_defect(name), None, "{name:?}");
         }
-        // Length is the kernel's ENAMETOOLONG to give, not this module's:
-        // NAME_MAX moves with the filesystem (ZFS `longname` raises it to
-        // 1023), so a constant here would refuse names ZFS would take.
+        // Length is the kernel's ENAMETOOLONG to give, not this module's: NAME_MAX moves with the filesystem (ZFS
+        // `longname` raises it to 1023), so a constant here would refuse names ZFS would take.
         let overlong = vec![b'x'; 4096];
         assert_eq!(component_defect(&overlong), None);
     }
@@ -216,10 +187,9 @@ mod tests {
         }
     }
 
-    /// The shapes this module exists to refuse, each by name. `a/../b` is
-    /// the one worth stating twice: it is a legal path the kernel would
-    /// resolve, and it is refused anyway, because a walk that has to
-    /// create `b` cannot know what `a/..` will turn out to be.
+    /// The shapes this module exists to refuse, each by name. `a/../b` is the one worth stating twice: it is a legal
+    /// path the kernel would resolve, and it is refused anyway, because a walk that has to create `b` cannot know what
+    /// `a/..` will turn out to be.
     #[test]
     fn a_relative_path_names_its_defect() {
         for (path, defect) in [
@@ -241,10 +211,9 @@ mod tests {
         }
     }
 
-    /// Every component handed back points **into** the caller's buffer, so
-    /// splitting a path costs nothing and a caller may validate the same
-    /// bytes it is about to give the kernel. Change `components` to return
-    /// owned data and this fails.
+    /// Every component handed back points **into** the caller's buffer, so splitting a path costs nothing and a caller
+    /// may validate the same bytes it is about to give the kernel. Change `components` to return owned data and this
+    /// fails.
     #[test]
     fn components_borrow_rather_than_copy() {
         let path = b"alpha/beta/gamma";
@@ -260,14 +229,13 @@ mod tests {
         assert_eq!(seen, 3, "every component was visited");
     }
 
-    /// The defect reported is the FIRST one, so the message names the
-    /// component a reader will find by counting from the left.
+    /// The defect reported is the FIRST one, so the message names the component a reader will find by counting from the
+    /// left.
     #[test]
     fn the_leftmost_defect_is_the_one_reported() {
         assert_eq!(relative_defect(b"./a/../b"), Some(Defect::Dot));
         assert_eq!(relative_defect(b"a/../b//c"), Some(Defect::DotDot));
-        // The empty component comes first here, so it is what is named -
-        // there is no ranking of defects, only position.
+        // The empty component comes first here, so it is what is named - there is no ranking of defects, only position.
         assert_eq!(relative_defect(b"a//../b"), Some(Defect::EmptyComponent));
     }
 }

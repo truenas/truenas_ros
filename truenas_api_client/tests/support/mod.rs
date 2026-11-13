@@ -1,12 +1,9 @@
-//! A scripted mock middlewared: a `UnixListener` thread speaking the real
-//! wire shapes (HTTP 101 upgrade, RFC 6455 frames, JSON-RPC text), driven
-//! by a per-connection script closure.
+//! A scripted mock middlewared: a `UnixListener` thread speaking the real wire shapes (HTTP 101 upgrade, RFC 6455
+//! frames, JSON-RPC text), driven by a per-connection script closure.
 //!
-//! Two invariants are woven through every read rather than asserted in
-//! one test: **every client frame must be masked** (RFC 6455 §5.1 - a
-//! real middlewared's aiohttp closes on an unmasked client frame) and
-//! **every call's `params` must be a JSON Array** (middlewared rejects
-//! named params). Any scenario that elicits a violation fails its join.
+//! Two invariants are woven through every read rather than asserted in one test: **every client frame must be masked**
+//! (RFC 6455 §5.1 - a real middlewared's aiohttp closes on an unmasked client frame) and **every call's `params` must
+//! be a JSON Array** (middlewared rejects named params). Any scenario that elicits a violation fails its join.
 
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -21,9 +18,8 @@ pub struct Wire {
 }
 
 impl Wire {
-    /// Read the HTTP request head (through CRLFCRLF), assert the upgrade
-    /// shape middlewared would see, and answer `101` with the computed
-    /// accept. Returns nothing a script needs; the key never leaves.
+    /// Read the HTTP request head (through CRLFCRLF), assert the upgrade shape middlewared would see, and answer `101`
+    /// with the computed accept. Returns nothing a script needs; the key never leaves.
     pub fn accept_upgrade(&mut self, expect_endpoint: &str) {
         let head = self.read_head();
         let text = String::from_utf8(head).expect("request head is ASCII");
@@ -34,8 +30,7 @@ impl Wire {
             "the upgrade request line"
         );
         assert!(
-            text.lines()
-                .any(|l| l.eq_ignore_ascii_case("host: localhost")),
+            text.lines().any(|l| l.eq_ignore_ascii_case("host: localhost")),
             "Host: localhost, the value every deployment accepts: {text}"
         );
         let key = text
@@ -57,9 +52,8 @@ impl Wire {
         self.stream.write_all(resp.as_bytes()).expect("write 101");
     }
 
-    /// Accept the upgrade *and* the session-setup `core.set_options`
-    /// call (the default, non-legacy session shape), asserting it is the
-    /// first thing on the wire.
+    /// Accept the upgrade *and* the session-setup `core.set_options` call (the default, non-legacy session shape),
+    /// asserting it is the first thing on the wire.
     pub fn accept_session(&mut self, expect_endpoint: &str) {
         self.accept_upgrade(expect_endpoint);
         let (id, params) = self.expect_call("core.set_options");
@@ -68,10 +62,8 @@ impl Wire {
             json!([{ "legacy_jobs": false }]),
             "session setup asks for modern job answering"
         );
-        // The shape middlewared answers with: the options it put in
-        // force, all three of them (`core.set_options` in
-        // `middlewared/service/core_service.py`, against
-        // `CoreSetOptionsResult { result: CoreOptions }`).
+        // The shape middlewared answers with: the options it put in force, all three of them (`core.set_options` in
+        // `middlewared/service/core_service.py`, against `CoreSetOptionsResult { result: CoreOptions }`).
         self.respond_ok(
             &id,
             json!({
@@ -85,9 +77,7 @@ impl Wire {
     /// Answer the upgrade request with an arbitrary non-101 head.
     pub fn refuse_upgrade(&mut self, head: &str) {
         let _ = self.read_head();
-        self.stream
-            .write_all(head.as_bytes())
-            .expect("write refusal");
+        self.stream.write_all(head.as_bytes()).expect("write refusal");
     }
 
     /// Answer with a 101 whose accept digest is wrong.
@@ -97,9 +87,7 @@ impl Wire {
                     Upgrade: websocket\r\n\
                     Connection: Upgrade\r\n\
                     Sec-WebSocket-Accept: c3VyZWx5LW5vdC10aGUtZGlnZXN0\r\n\r\n";
-        self.stream
-            .write_all(resp.as_bytes())
-            .expect("write bad 101");
+        self.stream.write_all(resp.as_bytes()).expect("write bad 101");
     }
 
     fn read_head(&mut self) -> Vec<u8> {
@@ -120,8 +108,7 @@ impl Wire {
         buf
     }
 
-    /// Read one client frame, enforcing the mask invariant, and hand back
-    /// `(opcode, fin, unmasked payload)`.
+    /// Read one client frame, enforcing the mask invariant, and hand back `(opcode, fin, unmasked payload)`.
     pub fn read_frame(&mut self) -> (u8, bool, Vec<u8>) {
         let h = self.read_exact(2);
         let fin = h[0] & 0x80 != 0;
@@ -149,18 +136,16 @@ impl Wire {
         (opcode, fin, payload)
     }
 
-    /// Read frames until a text message arrives (answering pings along
-    /// the way is the *client's* job - any ping the script sent earlier
-    /// comes back as a pong here and is counted, not answered). Enforces
-    /// the params-Array invariant on every call seen.
+    /// Read frames until a text message arrives (answering pings along the way is the *client's* job - any ping the
+    /// script sent earlier comes back as a pong here and is counted, not answered). Enforces the params-Array invariant
+    /// on every call seen.
     pub fn read_text_json(&mut self) -> Value {
         loop {
             let (opcode, fin, payload) = self.read_frame();
             assert!(fin, "the client never fragments (outbound cap)");
             match opcode {
                 0x1 => {
-                    let v: Value = serde_json::from_slice(&payload)
-                        .expect("client text frames are JSON");
+                    let v: Value = serde_json::from_slice(&payload).expect("client text frames are JSON");
                     if let Some(params) = v.get("params") {
                         assert!(
                             params.is_array(),
@@ -179,13 +164,9 @@ impl Wire {
 
     /// Count client TEXT frames until the socket goes quiet for `quiet`.
     ///
-    /// The discriminator a "did the call reach the wire?" scenario needs:
-    /// a call that was accepted but never flushed is invisible to
-    /// `expect_call`, which would simply block.
-    pub fn count_client_text_frames_until_quiet(
-        &mut self,
-        quiet: std::time::Duration,
-    ) -> usize {
+    /// The discriminator a "did the call reach the wire?" scenario needs: a call that was accepted but never flushed is
+    /// invisible to `expect_call`, which would simply block.
+    pub fn count_client_text_frames_until_quiet(&mut self, quiet: std::time::Duration) -> usize {
         self.stream.set_read_timeout(Some(quiet)).expect("timeout");
         let mut n = 0usize;
         loop {
@@ -222,8 +203,7 @@ impl Wire {
         n
     }
 
-    /// Read the next text message and require it to be a call of
-    /// `method`; hand back `(id, params)`.
+    /// Read the next text message and require it to be a call of `method`; hand back `(id, params)`.
     pub fn expect_call(&mut self, method: &str) -> (Value, Value) {
         let v = self.read_text_json();
         assert_eq!(
@@ -236,13 +216,9 @@ impl Wire {
         (id, params)
     }
 
-    /// Count pongs until `n` have arrived, allowing one text message to
-    /// arrive meanwhile (returned). For the ping-flood scenario.
-    pub fn drain_pongs_and_one_call(
-        &mut self,
-        n: usize,
-        method: &str,
-    ) -> (Value, Value) {
+    /// Count pongs until `n` have arrived, allowing one text message to arrive meanwhile (returned). For the ping-flood
+    /// scenario.
+    pub fn drain_pongs_and_one_call(&mut self, n: usize, method: &str) -> (Value, Value) {
         let mut pongs = 0;
         let mut call = None;
         while pongs < n || call.is_none() {
@@ -250,15 +226,11 @@ impl Wire {
             match opcode {
                 0xA => pongs += 1,
                 0x1 => {
-                    let v: Value = serde_json::from_slice(&payload)
-                        .expect("client text is JSON");
+                    let v: Value = serde_json::from_slice(&payload).expect("client text is JSON");
                     if let Some(params) = v.get("params") {
                         assert!(params.is_array(), "INVARIANT: params Array");
                     }
-                    assert_eq!(
-                        v.get("method").and_then(Value::as_str),
-                        Some(method)
-                    );
+                    assert_eq!(v.get("method").and_then(Value::as_str), Some(method));
                     assert!(call.is_none(), "one call expected");
                     call = Some((
                         v.get("id").expect("id").clone(),
@@ -297,35 +269,21 @@ impl Wire {
 
     /// A JSON-RPC success for `id`.
     pub fn respond_ok(&mut self, id: &Value, result: Value) {
-        self.send_text(
-            &json!({ "jsonrpc": "2.0", "result": result, "id": id })
-                .to_string(),
-        );
+        self.send_text(&json!({ "jsonrpc": "2.0", "result": result, "id": id }).to_string());
     }
 
     /// A JSON-RPC error for `id`, middlewared-shaped.
-    pub fn respond_err(
-        &mut self,
-        id: &Value,
-        code: i64,
-        message: &str,
-        data: Option<Value>,
-    ) {
+    pub fn respond_err(&mut self, id: &Value, code: i64, message: &str, data: Option<Value>) {
         let mut error = json!({ "code": code, "message": message });
         if let Some(d) = data {
             error["data"] = d;
         }
-        self.send_text(
-            &json!({ "jsonrpc": "2.0", "error": error, "id": id }).to_string(),
-        );
+        self.send_text(&json!({ "jsonrpc": "2.0", "error": error, "id": id }).to_string());
     }
 
     /// A server notification (no id member - never answered).
     pub fn send_notification(&mut self, method: &str, params: Value) {
-        self.send_text(
-            &json!({ "jsonrpc": "2.0", "method": method, "params": params })
-                .to_string(),
-        );
+        self.send_text(&json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string());
     }
 
     /// A ping the client must answer.
@@ -340,8 +298,8 @@ impl Wire {
         self.send_frame(0x8, true, &payload);
     }
 
-    /// [`read_frame`](Self::read_frame), but `None` at EOF instead of a
-    /// panic - for a script that reads to the end of the connection.
+    /// [`read_frame`](Self::read_frame), but `None` at EOF instead of a panic - for a script that reads to the end of
+    /// the connection.
     pub fn read_frame_or_eof(&mut self) -> Option<(u8, bool, Vec<u8>)> {
         let mut h = [0u8; 2];
         if self.stream.read_exact(&mut h).is_err() {
@@ -379,9 +337,8 @@ impl Wire {
     }
 }
 
-/// A listening mock serving `scripts.len()` connections, in accept order,
-/// each script on its own thread. Join it at the end of the test: a
-/// script's assertion failure surfaces there.
+/// A listening mock serving `scripts.len()` connections, in accept order, each script on its own thread. Join it at the
+/// end of the test: a script's assertion failure surfaces there.
 pub struct Mock {
     pub path: PathBuf,
     // Kept alive so the socket's tempdir survives the test body.
@@ -417,15 +374,9 @@ pub fn serve_one(script: impl FnOnce(Wire) + Send + 'static) -> Mock {
 }
 
 impl Mock {
-    /// Wait for every script to finish, propagating its panics into the
-    /// test.
+    /// Wait for every script to finish, propagating its panics into the test.
     pub fn join(mut self) {
-        let workers = self
-            .accept
-            .take()
-            .expect("join once")
-            .join()
-            .expect("accept thread");
+        let workers = self.accept.take().expect("join once").join().expect("accept thread");
         for w in workers {
             w.join().expect("mock script");
         }

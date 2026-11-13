@@ -1,17 +1,13 @@
-//! The credential broker: a tiny forked process that mints personalities
-//! for *other* identities.
+//! The credential broker: a tiny forked process that mints personalities for *other* identities.
 //!
-//! Registering a personality snapshots the **caller's** credentials, so
-//! minting one for user X means some task must first become X. Doing that
-//! inside the reactor process is a trap: glibc's `setuid` family signals
-//! every thread (`SIGSETXID`), so one call re-identifies the reactor thread
-//! mid-flight, and io-wq workers - kernel clones, invisible to the
-//! broadcast - are left on the old identity, giving one process two
-//! identities depending on which path an op took.
+//! Registering a personality snapshots the **caller's** credentials, so minting one for user X means some task must
+//! first become X. Doing that inside the reactor process is a trap: glibc's `setuid` family signals every thread
+//! (`SIGSETXID`), so one call re-identifies the reactor thread mid-flight, and io-wq workers - kernel clones, invisible
+//! to the broadcast - are left on the old identity, giving one process two identities depending on which path an op
+//! took.
 //!
-//! So the reactor process never changes credentials at all. A broker
-//! process does, and it is deliberately minimal: it holds the ring fds, and
-//! its whole job is *three syscalls and a register*.
+//! So the reactor process never changes credentials at all. A broker process does, and it is deliberately minimal: it
+//! holds the ring fds, and its whole job is *three syscalls and a register*.
 //!
 //! ```text
 //! main (single-threaded)            broker (cloned child, keeps CAP_SETUID)
@@ -28,72 +24,49 @@
 //! Personality <-----------------    reply {id}
 //! ```
 //!
-//! **`clone3`, not `fork`, and every credential syscall in the child is
-//! raw** - both load-bearing, not stylistic:
+//! **`clone3`, not `fork`, and every credential syscall in the child is raw** - both load-bearing, not stylistic:
 //!
-//! - `clone3(CLONE_CLEAR_SIGHAND)` resets the child's inherited signal
-//!   handlers to `SIG_DFL`. A `fork`ed child keeps main's handlers, so a
-//!   signal delivered *inside the impersonation window* would run main's
-//!   handler code at the impersonated identity - a soundness hole. It also
-//!   takes `CLONE_PIDFD` (race-free supervision/reap) and `exit_signal = 0`
-//!   (the library's broker death sends no `SIGCHLD` to the host). See
-//!   [`crate::clone3`].
-//! - The window uses **`SYS_setgroups`/`SYS_setresgid`/`SYS_setresuid`
-//!   directly**, never glibc's wrappers: the wrappers implement POSIX
-//!   process-wide semantics by SIGSETXID-broadcasting to every thread, and in
-//!   a `clone3` child (no glibc fork cleanup, a stale copied thread list) that
-//!   broadcast can deadlock. The raw syscall changes only this single task's
-//!   credentials, which is exactly what a one-thread broker wants. Even the
-//!   reads (`raw_geteuid`/`raw_getegid`/`SYS_getgroups`) go raw so no glibc
-//!   state sits in the credential path. (`truens_pos` `acl_check.c` hit and
-//!   documented this same trap.)
+//! - `clone3(CLONE_CLEAR_SIGHAND)` resets the child's inherited signal handlers to `SIG_DFL`. A `fork`ed child keeps
+//!   main's handlers, so a signal delivered *inside the impersonation window* would run main's handler code at the
+//!   impersonated identity - a soundness hole. It also takes `CLONE_PIDFD` (race-free supervision/reap) and
+//!   `exit_signal = 0` (the library's broker death sends no `SIGCHLD` to the host). See [`crate::clone3`].
+//! - The window uses **`SYS_setgroups`/`SYS_setresgid`/`SYS_setresuid` directly**, never glibc's wrappers: the wrappers
+//!   implement POSIX process-wide semantics by SIGSETXID-broadcasting to every thread, and in a `clone3` child (no
+//!   glibc fork cleanup, a stale copied thread list) that broadcast can deadlock. The raw syscall changes only this
+//!   single task's credentials, which is exactly what a one-thread broker wants. Even the reads
+//!   (`raw_geteuid`/`raw_getegid`/`SYS_getgroups`) go raw so no glibc state sits in the credential path. (`truens_pos`
+//!   `acl_check.c` hit and documented this same trap.)
 //!
-//! **The ring fds are inherited across `fork`, never sent.** The obvious
-//! alternative - keep a broker alive from the start and pass each ring over
-//! the socket with `SCM_RIGHTS` - *cannot work*: since Linux 6.8 the kernel
-//! refuses to attach an io_uring file to a unix socket at all
-//! (`scm_fp_copy` -> `-EINVAL`, kernel commit `a4104821ad65`, which removed
-//! io_uring's own socket-GC handling). Inheritance is why every ring must
-//! exist before [`CredBroker::spawn`] is called. Exist, not be mapped: a
-//! [`RingFd`] from `UringFs::setup_ring` or `net::server::setup_ring` is enough
-//! for the child to inherit, so a reactor that will live on its own thread
-//! is built after the fork, on that thread.
+//! **The ring fds are inherited across `fork`, never sent.** The obvious alternative - keep a broker alive from the
+//! start and pass each ring over the socket with `SCM_RIGHTS` - *cannot work*: since Linux 6.8 the kernel refuses to
+//! attach an io_uring file to a unix socket at all (`scm_fp_copy` -> `-EINVAL`, kernel commit `a4104821ad65`, which
+//! removed io_uring's own socket-GC handling). Inheritance is why every ring must exist before [`CredBroker::spawn`] is
+//! called. Exist, not be mapped: a [`RingFd`] from `UringFs::setup_ring` or `net::server::setup_ring` is enough for the
+//! child to inherit, so a reactor that will live on its own thread is built after the fork, on that thread.
 //!
-//! `pidfd_getfd(2)` *would* lift that ordering rule - it installs through
-//! `receive_fd`, which has no io_uring exclusion - and is deliberately not
-//! used: it is gated on `PTRACE_MODE_ATTACH_REALCREDS`, and since the
-//! broker is main's *child* it is on the wrong side of Yama's default
-//! ancestor-only rule, so it would need `CAP_SYS_PTRACE` - an unscoped
-//! authority to read and write any process's memory, held for life, to
-//! serve a startup-only operation. The full rationale is in the
-//! fs-reactor design, sec. 6.5.
+//! `pidfd_getfd(2)` *would* lift that ordering rule - it installs through `receive_fd`, which has no io_uring
+//! exclusion - and is deliberately not used: it is gated on `PTRACE_MODE_ATTACH_REALCREDS`, and since the broker is
+//! main's *child* it is on the wrong side of Yama's default ancestor-only rule, so it would need `CAP_SYS_PTRACE` - an
+//! unscoped authority to read and write any process's memory, held for life, to serve a startup-only operation. The
+//! full rationale is in the fs-reactor design, sec. 6.5.
 //!
 //! Two properties make this worth the process boundary:
 //!
-//! - **After [`CredBroker::spawn`] the reactor process can never obtain a
-//!   `uid == 0` (root) personality carrying more than the root limit it
-//!   chose at spawn**, and with [`spawn`](CredBroker::spawn) or
-//!   [`spawn_with_caps`](CredBroker::spawn_with_caps) it can obtain none at
-//!   all. It permanently drops `CAP_SETUID`/`CAP_SETGID`, so it cannot
-//!   change identity itself, and the broker refuses to mint uid 0 unless
-//!   [`spawn_with_root`](CredBroker::spawn_with_root) fixed a limit for it,
-//!   and then never with a capability outside that limit, whatever the
-//!   broker itself holds. Note the precise boundary. A *compromised* main
-//!   still holds a [`CredHandle`] and can ask the broker to mint a
-//!   personality for any **non-root** identity, and for root within its
-//!   limit, and can free any id ([`CredHandle::unregister`] takes no
-//!   ownership proof). That is acceptable under the stated model - main
-//!   runs as root, so a compromised main is already root-equivalent - but
-//!   the guarantee is "no forged identity beyond the limits fixed at
-//!   spawn," not "no forging."
-//! - **A minted personality carries no elevated capability unless the
-//!   broker was spawned to allow one.** Dropping to the user's uid clears
-//!   the *effective* capability set (the kernel's setuid fixup), so by
-//!   default the snapshot has the user's authority and no
-//!   `CAP_DAC_OVERRIDE` - the kernel's own permission checks then bind the
-//!   daemon exactly as they would bind the user.
-//!   [`CredBroker::spawn_with_caps`] widens that deliberately, bounded by a
-//!   ceiling fixed before the privilege drop; see [`Caps`].
+//! - **After [`CredBroker::spawn`] the reactor process can never obtain a `uid == 0` (root) personality carrying more
+//!   than the root limit it chose at spawn**, and with [`spawn`](CredBroker::spawn) or
+//!   [`spawn_with_caps`](CredBroker::spawn_with_caps) it can obtain none at all. It permanently drops
+//!   `CAP_SETUID`/`CAP_SETGID`, so it cannot change identity itself, and the broker refuses to mint uid 0 unless
+//!   [`spawn_with_root`](CredBroker::spawn_with_root) fixed a limit for it, and then never with a capability outside
+//!   that limit, whatever the broker itself holds. Note the precise boundary. A *compromised* main still holds a
+//!   [`CredHandle`] and can ask the broker to mint a personality for any **non-root** identity, and for root within its
+//!   limit, and can free any id ([`CredHandle::unregister`] takes no ownership proof). That is acceptable under the
+//!   stated model - main runs as root, so a compromised main is already root-equivalent - but the guarantee is "no
+//!   forged identity beyond the limits fixed at spawn," not "no forging."
+//! - **A minted personality carries no elevated capability unless the broker was spawned to allow one.** Dropping to
+//!   the user's uid clears the *effective* capability set (the kernel's setuid fixup), so by default the snapshot has
+//!   the user's authority and no `CAP_DAC_OVERRIDE` - the kernel's own permission checks then bind the daemon exactly
+//!   as they would bind the user. [`CredBroker::spawn_with_caps`] widens that deliberately, bounded by a ceiling fixed
+//!   before the privilege drop; see [`Caps`].
 //!
 //!   Precisely: it is the *effective* set that is empty. The snapshot's
 //!   *permitted* set still holds whatever the broker had, because the
@@ -120,238 +93,180 @@ use super::single_flight::SingleFlight;
 
 /// The largest supplementary-group list a registration may carry.
 ///
-/// Sized against what winbindd/Samba actually produces for Active Directory
-/// users, not against a guess. Samba imposes no fixed ceiling of its own --
-/// `getgroups_unix_user` tries a 128-entry stack buffer and, on overflow,
-/// *reallocates on the heap and retries* `[V samba source3/lib/system_smbd.c]`,
-/// so it serves users far past any small cap; its real limit is
-/// `sysconf(_SC_NGROUPS_MAX)` (65536 on Linux). The practical ceiling comes
-/// from AD itself: a Kerberos PAC carries roughly 1015 group SIDs before
-/// `MaxTokenSize` problems begin. **4096** therefore clears real-world AD by
-/// several times over while keeping one request inside a single SEQPACKET
-/// datagram (16 KiB - the transport is measured good to ~16k groups, and
-/// fails only past 65536).
+/// Sized against what winbindd/Samba actually produces for Active Directory users, not against a guess. Samba imposes
+/// no fixed ceiling of its own -- `getgroups_unix_user` tries a 128-entry stack buffer and, on overflow, *reallocates
+/// on the heap and retries* `[V samba source3/lib/system_smbd.c]`, so it serves users far past any small cap; its real
+/// limit is `sysconf(_SC_NGROUPS_MAX)` (65536 on Linux). The practical ceiling comes from AD itself: a Kerberos PAC
+/// carries roughly 1015 group SIDs before `MaxTokenSize` problems begin. **4096** therefore clears real-world AD by
+/// several times over while keeping one request inside a single SEQPACKET datagram (16 KiB - the transport is measured
+/// good to ~16k groups, and fails only past 65536).
 ///
-/// A longer list is **rejected, never truncated**: dropping groups silently
-/// changes what the identity may do, which is a permission bug that would
-/// surface as a mysterious `EACCES` far from its cause.
+/// A longer list is **rejected, never truncated**: dropping groups silently changes what the identity may do, which is
+/// a permission bug that would surface as a mysterious `EACCES` far from its cause.
 ///
-/// Note the cost is paid per *registration* and scales with the actual list
-/// length - measured ~93 us at 256 groups, ~320 us at 1024, ~1.4 ms at 4096
-/// (`setgroups` twice, plus copying the credential). Large AD identities are
-/// exactly why [`IdentityCache`] exists: registering once per identity rather
-/// than once per connection keeps that off the connection path.
+/// Note the cost is paid per *registration* and scales with the actual list length - measured ~93 us at 256 groups,
+/// ~320 us at 1024, ~1.4 ms at 4096 (`setgroups` twice, plus copying the credential). Large AD identities are exactly
+/// why [`IdentityCache`] exists: registering once per identity rather than once per connection keeps that off the
+/// connection path.
 pub const MAX_GROUPS: usize = 4096;
 
 /// How many rings one broker will serve.
 ///
-/// A policy bound rather than a structural one: the ring index is a `u8`
-/// in the request header and ring `i` is the child's `RING_FD_BASE + i`,
-/// so nothing in the transport or the fd layout gives way before 255.
-/// What the bound is for is catching a caller that hands the broker a
-/// slice it did not mean to, at the one moment that cannot be retried -
-/// the fork happens once, before any thread exists.
+/// A policy bound rather than a structural one: the ring index is a `u8` in the request header and ring `i` is the
+/// child's `RING_FD_BASE + i`, so nothing in the transport or the fd layout gives way before 255.
+/// What the bound is for is catching a caller that hands the broker a slice it did not mean to, at the one moment that
+/// cannot be retried - the fork happens once, before any thread exists.
 ///
-/// It has to clear a reactor per server thread **plus** any ring that
-/// serves no listener: a sidecar that dials another daemon under a
-/// personality needs one of its own, because a personality id is valid
-/// only on the ring it was minted against. Sized for a ring on every core
-/// of a 128-core machine, so a deployment need not trade one against the
-/// other. Each ring costs the child one descriptor and the renumbering one
-/// more (`child_fd_high_water`).
+/// It has to clear a reactor per server thread **plus** any ring that serves no listener: a sidecar that dials another
+/// daemon under a personality needs one of its own, because a personality id is valid only on the ring it was minted
+/// against. Sized for a ring on every core of a 128-core machine, so a deployment need not trade one against the other.
+/// Each ring costs the child one descriptor and the renumbering one more (`child_fd_high_water`).
 pub const MAX_RINGS: usize = 128;
 
 /// The child's IPC socket, after `tidy_child_fds` normalizes descriptors.
 const SOCK_FD: RawFd = 3;
-/// Ring `i`'s fd in the child: descriptors are renumbered at startup so the
-/// mapping needs no bookkeeping.
+/// Ring `i`'s fd in the child: descriptors are renumbered at startup so the mapping needs no bookkeeping.
 const RING_FD_BASE: RawFd = 4;
 
 // Wire opcodes.
 const OP_REGISTER: u8 = 1;
 const OP_UNREGISTER: u8 = 2;
 
-/// Request header: `op`, `ring`, `ngroups`, `uid`, `gid`, `caps`, then
-/// `ngroups` group ids. (`uid` doubles as the personality id for
-/// `OP_UNREGISTER`.) Both ends compile from this crate, so the layout is an
-/// in-tree detail, not a stable ABI.
+/// Request header: `op`, `ring`, `ngroups`, `uid`, `gid`, `caps`, then `ngroups` group ids. (`uid` doubles as the
+/// personality id for `OP_UNREGISTER`.) Both ends compile from this crate, so the layout is an in-tree detail, not a
+/// stable ABI.
 const HDR_LEN: usize = 16;
 const MAX_REQ: usize = HDR_LEN + 4 * MAX_GROUPS;
 
 tn_bitflags! {
-    /// Capabilities a minted [`Personality`] may carry, on top of the
-    /// identity's own authority.
+    /// Capabilities a minted [`Personality`] may carry, on top of the identity's own authority.
     ///
-    /// Empty by default, and empty is the only value that needs no privilege
-    /// policy - a personality with no capability is bound by the kernel's
-    /// permission checks exactly as the user would be. Anything else is an
-    /// escalation, so it must be allowed twice: once by the mask given to
-    /// [`CredBroker::spawn_with_caps`] (fixed before the privilege drop, out
-    /// of a compromised main's reach) and again per request via
-    /// [`AsUser::caps`].
+    /// Empty by default, and empty is the only value that needs no privilege policy - a personality with no capability
+    /// is bound by the kernel's permission checks exactly as the user would be. Anything else is an escalation, so it
+    /// must be allowed twice: once by the mask given to [`CredBroker::spawn_with_caps`] (fixed before the privilege
+    /// drop, out of a compromised main's reach) and again per request via [`AsUser::caps`].
     ///
-    /// **The bit values are the kernel's own capability numbers**, so a mask
-    /// is exactly the low word of `cap_effective` that the broker installs.
+    /// **The bit values are the kernel's own capability numbers**, so a mask is exactly the low word of `cap_effective`
+    /// that the broker installs.
     ///
     /// # Why these, and not the rest
     ///
-    /// As with [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs), the
-    /// refusals are the point:
+    /// As with [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs), the refusals are the point:
     ///
-    /// - `CAP_CHOWN` changes ownership on any inode of any type on any
-    ///   filesystem. [`Caps::FOWNER`] reaches ownership only through ZFS's
-    ///   NFSv4 path, and only where the ACL is non-trivial. So it is granted
-    ///   to uid 0 alone, as are [`Caps::FSETID`] and [`Caps::MKNOD`], which
-    ///   together are [`Caps::ROOT_ONLY`]. A root personality is the
-    ///   superuser of a file service, and these three are what the
-    ///   superuser's file calls check beyond the other three. Any other
-    ///   identity is refused them, at spawn.
+    /// - `CAP_CHOWN` changes ownership on any inode of any type on any filesystem. [`Caps::FOWNER`] reaches ownership
+    ///   only through ZFS's NFSv4 path, and only where the ACL is non-trivial. So it is granted to uid 0 alone, as are
+    ///   [`Caps::FSETID`] and [`Caps::MKNOD`], which together are [`Caps::ROOT_ONLY`]. A root personality is the
+    ///   superuser of a file service, and these three are what the superuser's file calls check beyond the other three.
+    ///   Any other identity is refused them, at spawn.
     /// - `CAP_SYS_ADMIN` needs no explanation.
     ///
-    /// The two write-side bits are defensible only where the caller confines
-    /// every path op: they bound what may be done *within* a tree and say
-    /// nothing about *which* tree.
+    /// The two write-side bits are defensible only where the caller confines every path op: they bound what may be done
+    /// *within* a tree and say nothing about *which* tree.
     ///
-    /// Add one only with the same treatment these get: the precise kernel
-    /// semantics, verified against the source, written down.
+    /// Add one only with the same treatment these get: the precise kernel semantics, verified against the source,
+    /// written down.
     pub struct Caps: u32 {
         /// `CAP_DAC_READ_SEARCH` - **read the whole filesystem**.
         ///
-        /// Granted to a service that must resolve a path on behalf of a user
-        /// who is entitled to the object but not to traverse every directory
-        /// above it. Verified against Linux 6.18 and OpenZFS 2.4.3:
+        /// Granted to a service that must resolve a path on behalf of a user who is entitled to the object but not to
+        /// traverse every directory above it. Verified against Linux 6.18 and OpenZFS 2.4.3:
         ///
-        /// - **Directories:** grants search *and* `readdir`, on any
-        ///   directory, whatever its mode or ACL. The only condition is that
-        ///   the request carry no write bit (`fs/namei.c:478`).
-        /// - **Regular files:** grants read - but only when the request is
-        ///   *exactly* read (`fs/namei.c:492` tests `mask == MAY_READ`). So
-        ///   `O_RDONLY` on a mode-`0000` file succeeds while `O_RDWR` on the
-        ///   same file still fails `EACCES`. Surprising, and load-bearing.
-        /// - **Never** grants execute, any write, or a way past a read-only
-        ///   mount, an immutable flag, or LSM policy.
-        /// - **On ZFS with NFSv4 ACLs it overrides an explicit DENY
-        ///   entry.** A `deny` ACE is not a boundary against this
-        ///   capability.
-        /// - **It does not grant delete**, and it does not defeat a
-        ///   read-only dataset, `ZFS_IMMUTABLE`, `ZFS_NOUNLINK` or
-        ///   quarantine, which are refused before any capability is
-        ///   consulted.
-        /// - **Namespace caveat.** ZFS tests the capability in the initial
-        ///   user namespace where the VFS tests it against the inode's. The
-        ///   two agree for a reactor in the initial namespace, which is the
-        ///   only supported configuration today; they would diverge under an
-        ///   idmapped mount (see [`crate::mount::idmap`]).
-        /// - It also satisfies the `linkat(AT_EMPTY_PATH)` check
-        ///   (`fs/namei.c:2632`), so a personality holding it can publish an
-        ///   `O_TMPFILE` opened under a *different* personality - lifting the
-        ///   one-[`Lease`]-per-create rule described on
-        ///   [`FsHandle::linkat_file`](crate::uring_fs::FsHandle::linkat_file).
+        /// - **Directories:** grants search *and* `readdir`, on any directory, whatever its mode or ACL. The only
+        ///   condition is that the request carry no write bit (`fs/namei.c:478`).
+        /// - **Regular files:** grants read - but only when the request is *exactly* read (`fs/namei.c:492` tests `mask
+        ///   == MAY_READ`). So `O_RDONLY` on a mode-`0000` file succeeds while `O_RDWR` on the same file still fails
+        ///   `EACCES`. Surprising, and load-bearing.
+        /// - **Never** grants execute, any write, or a way past a read-only mount, an immutable flag, or LSM policy.
+        /// - **On ZFS with NFSv4 ACLs it overrides an explicit DENY entry.** A `deny` ACE is not a boundary against
+        ///   this capability.
+        /// - **It does not grant delete**, and it does not defeat a read-only dataset, `ZFS_IMMUTABLE`, `ZFS_NOUNLINK`
+        ///   or quarantine, which are refused before any capability is consulted.
+        /// - **Namespace caveat.** ZFS tests the capability in the initial user namespace where the VFS tests it
+        ///   against the inode's. The two agree for a reactor in the initial namespace, which is the only supported
+        ///   configuration today; they would diverge under an idmapped mount (see [`crate::mount::idmap`]).
+        /// - It also satisfies the `linkat(AT_EMPTY_PATH)` check (`fs/namei.c:2632`), so a personality holding it can
+        ///   publish an `O_TMPFILE` opened under a *different* personality - lifting the one-[`Lease`]-per-create rule
+        ///   described on [`FsHandle::linkat_file`](crate::uring_fs::FsHandle::linkat_file).
         ///
-        /// There is no narrower capability: `CAP_DAC_OVERRIDE` and
-        /// `CAP_DAC_READ_SEARCH` are the only two DAC bypasses Linux defines,
-        /// and neither grants directory search without also granting file
-        /// read.
+        /// There is no narrower capability: `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` are the only two DAC bypasses
+        /// Linux defines, and neither grants directory search without also granting file read.
         /// (`CAP_DAC_READ_SEARCH` is capability number 2, hence bit 2.)
         DAC_READ_SEARCH = 0x0000_0004;
 
-        /// `CAP_DAC_OVERRIDE` - **read and write the whole filesystem**,
-        /// within whatever the caller's path resolution confines it to.
+        /// `CAP_DAC_OVERRIDE` - **read and write the whole filesystem**, within whatever the caller's path resolution
+        /// confines it to.
         ///
-        /// For a service whose own authorization layer, not the
-        /// filesystem's, decides an operation. On ZFS with NFSv4 ACLs it
-        /// grants a directory unconditionally - create, unlink and rename
-        /// succeed past an explicit DENY ACE - and a regular file read,
-        /// write, and execute wherever the mode carries any execute bit -
-        /// deciding before the ACL is read at all. It also answers the NFSv4
-        /// `chmod`/`chown` retry the VFS makes when its own owner test fails
-        /// (`fs/attr.c:188-196`, `:229-236`), so it rewrites a mode or ACL it
-        /// does not own and, where the ACL is non-trivial, changes the owner
+        /// For a service whose own authorization layer, not the filesystem's, decides an operation. On ZFS with NFSv4
+        /// ACLs it grants a directory unconditionally - create, unlink and rename succeed past an explicit DENY ACE -
+        /// and a regular file read, write, and execute wherever the mode carries any execute bit - deciding before the
+        /// ACL is read at all. It also answers the NFSv4 `chmod`/`chown` retry the VFS makes when its own owner test
+        /// fails (`fs/attr.c:188-196`, `:229-236`), so it rewrites a mode or ACL it does not own and, where the ACL is
+        /// non-trivial, changes the owner
         /// - see [`Caps::FOWNER`] on why an ownership change is the one that
         /// lasts.
         ///
-        /// It does not defeat a DENY `ACE_DELETE` (that is
-        /// [`Caps::FOWNER`]), nor a read-only dataset, `ZFS_IMMUTABLE`,
-        /// `ZFS_NOUNLINK` or quarantine, which are refused before any
-        /// capability is consulted.
+        /// It does not defeat a DENY `ACE_DELETE` (that is [`Caps::FOWNER`]), nor a read-only dataset, `ZFS_IMMUTABLE`,
+        /// `ZFS_NOUNLINK` or quarantine, which are refused before any capability is consulted.
         ///
         /// # This bit requires confinement, and the requirement is structural
         ///
-        /// Unconfined, a personality holding this could create, unlink and
-        /// rename anywhere the reactor can name. `RESOLVE_BENEATH` is what
-        /// bounds it, and it is capability-independent - `LOOKUP_BENEATH` is
-        /// an unconditional `-EXDEV` (`fs/namei.c:1045`, `:2108`) with no
-        /// `capable()` in that path. A consumer that resolves every
-        /// user-supplied name from a per-tenant anchor bounds this bit to
-        /// that subtree; one that does not, does not bound it at all.
+        /// Unconfined, a personality holding this could create, unlink and rename anywhere the reactor can name.
+        /// `RESOLVE_BENEATH` is what bounds it, and it is capability-independent - `LOOKUP_BENEATH` is an unconditional
+        /// `-EXDEV` (`fs/namei.c:1045`, `:2108`) with no `capable()` in that path. A consumer that resolves every
+        /// user-supplied name from a per-tenant anchor bounds this bit to that subtree; one that does not, does not
+        /// bound it at all.
         ///
         /// (`CAP_DAC_OVERRIDE` is capability number 1, hence bit 1.)
         DAC_OVERRIDE = 0x0000_0002;
 
-        /// `CAP_FOWNER` - **act as the owner of every file**, within
-        /// whatever the caller's path resolution confines it to.
+        /// `CAP_FOWNER` - **act as the owner of every file**, within whatever the caller's path resolution confines it
+        /// to.
         ///
-        /// Granted alongside [`Caps::DAC_OVERRIDE`] to a service that must
-        /// complete an operation the filesystem's owner checks would refuse.
-        /// It grants `chmod` and ACL rewrite, and on a file whose NFSv4 ACL
-        /// is non-trivial it grants `chown` - note that it is this bit ZFS
-        /// asks for there, not `CAP_CHOWN`.
+        /// Granted alongside [`Caps::DAC_OVERRIDE`] to a service that must complete an operation the filesystem's owner
+        /// checks would refuse. It grants `chmod` and ACL rewrite, and on a file whose NFSv4 ACL is non-trivial it
+        /// grants `chown` - note that it is this bit ZFS asks for there, not `CAP_CHOWN`.
         ///
-        /// What it adds over [`Caps::DAC_OVERRIDE`], which reaches `chmod`
-        /// and `chown` by its own route, is **delete past an explicit DENY
-        /// `ACE_DELETE`**, which nothing else in this type satisfies.
-        /// It does not defeat a read-only dataset, `ZFS_IMMUTABLE`,
-        /// `ZFS_NOUNLINK` or quarantine, and it does not widen
-        /// [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs), which is
-        /// an allowlist checked before the syscall rather than a DAC
-        /// decision.
+        /// What it adds over [`Caps::DAC_OVERRIDE`], which reaches `chmod` and `chown` by its own route, is **delete
+        /// past an explicit DENY `ACE_DELETE`**, which nothing else in this type satisfies.
+        /// It does not defeat a read-only dataset, `ZFS_IMMUTABLE`, `ZFS_NOUNLINK` or quarantine, and it does not widen
+        /// [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs), which is an allowlist checked before the syscall
+        /// rather than a DAC decision.
         ///
         /// # An ownership change outlives the request that made it
         ///
-        /// Written data can be written again; who the filesystem says owns
-        /// it cannot be undone by the next request. A tenant whose own layer
-        /// is authoritative today can leave ownership state behind that
-        /// becomes authoritative if the same tree is later served under a
-        /// policy where the filesystem decides. Grant it only where that
-        /// later reading is impossible or acceptable - and note that
-        /// declining this bit alone does not close it, because
+        /// Written data can be written again; who the filesystem says owns it cannot be undone by the next request. A
+        /// tenant whose own layer is authoritative today can leave ownership state behind that becomes authoritative if
+        /// the same tree is later served under a policy where the filesystem decides. Grant it only where that later
+        /// reading is impossible or acceptable - and note that declining this bit alone does not close it, because
         /// [`Caps::DAC_OVERRIDE`] reaches the same state.
         ///
         /// (`CAP_FOWNER` is capability number 3, hence bit 3.)
         FOWNER = 0x0000_0008;
 
-        /// `CAP_CHOWN` - **change the owner and group of any file**, for
-        /// uid 0 alone (see [`Caps::ROOT_ONLY`]).
+        /// `CAP_CHOWN` - **change the owner and group of any file**, for uid 0 alone (see [`Caps::ROOT_ONLY`]).
         ///
-        /// The VFS checks it before any filesystem sees a chown
-        /// (`chown_ok` and `chgrp_ok` in `fs/attr.c`). Without it only the
-        /// owner may change the group, and only to a group it is in. On ZFS
-        /// a chown then also needs [`Caps::FOWNER`], which `zfs_setattr`
-        /// asks for through `secpolicy_vnode_chown`, so a root personality
-        /// that is to chown carries both.
+        /// The VFS checks it before any filesystem sees a chown (`chown_ok` and `chgrp_ok` in `fs/attr.c`). Without it
+        /// only the owner may change the group, and only to a group it is in. On ZFS a chown then also needs
+        /// [`Caps::FOWNER`], which `zfs_setattr` asks for through `secpolicy_vnode_chown`, so a root personality that
+        /// is to chown carries both.
         ///
         /// (`CAP_CHOWN` is capability number 0, hence bit 0.)
         CHOWN = 0x0000_0001;
 
-        /// `CAP_FSETID` - **keep the set-user-ID and set-group-ID bits**,
-        /// for uid 0 alone (see [`Caps::ROOT_ONLY`]).
+        /// `CAP_FSETID` - **keep the set-user-ID and set-group-ID bits**, for uid 0 alone (see [`Caps::ROOT_ONLY`]).
         ///
-        /// Without it the kernel drops them when a regular file is written
-        /// or changes owner (`setattr_should_drop_suidgid` in `fs/attr.c`),
-        /// and keeps set-group-ID on a chmod or a create only for a member
-        /// of the group (`in_group_or_capable` and `mode_strip_sgid` in
-        /// `fs/inode.c`). ZFS asks for it in the same cases
-        /// (`secpolicy_vnode_setid_retain`, `secpolicy_vnode_setids_setgids`
-        /// and `secpolicy_vnode_setid_modify`).
+        /// Without it the kernel drops them when a regular file is written or changes owner
+        /// (`setattr_should_drop_suidgid` in `fs/attr.c`), and keeps set-group-ID on a chmod or a create only for a
+        /// member of the group (`in_group_or_capable` and `mode_strip_sgid` in `fs/inode.c`). ZFS asks for it in the
+        /// same cases (`secpolicy_vnode_setid_retain`, `secpolicy_vnode_setids_setgids` and
+        /// `secpolicy_vnode_setid_modify`).
         ///
         /// (`CAP_FSETID` is capability number 4, hence bit 4.)
         FSETID = 0x0000_0010;
 
-        /// `CAP_MKNOD` - **make a character or block device**, for uid 0
-        /// alone (see [`Caps::ROOT_ONLY`]).
+        /// `CAP_MKNOD` - **make a character or block device**, for uid 0 alone (see [`Caps::ROOT_ONLY`]).
         ///
-        /// `vfs_mknod` (`fs/namei.c`) refuses a device without it. A FIFO
-        /// and a socket need nothing.
+        /// `vfs_mknod` (`fs/namei.c`) refuses a device without it. A FIFO and a socket need nothing.
         ///
         /// (`CAP_MKNOD` is capability number 27, hence bit 27.)
         MKNOD = 0x0800_0000;
@@ -359,27 +274,21 @@ tn_bitflags! {
 }
 
 impl Caps {
-    /// The capabilities a root personality may carry and no other may,
-    /// [`Caps::CHOWN`], [`Caps::FSETID`] and [`Caps::MKNOD`].
-    /// [`CredBroker::spawn_with_caps`] refuses them in the limit for
-    /// identities other than root, so only the limit for uid 0 that
-    /// [`CredBroker::spawn_with_root`] fixes may name them.
-    pub const ROOT_ONLY: Caps =
-        Caps::CHOWN.union(Caps::FSETID).union(Caps::MKNOD);
+    /// The capabilities a root personality may carry and no other may, [`Caps::CHOWN`], [`Caps::FSETID`] and
+    /// [`Caps::MKNOD`]. [`CredBroker::spawn_with_caps`] refuses them in the limit for identities other than root, so
+    /// only the limit for uid 0 that [`CredBroker::spawn_with_root`] fixes may name them.
+    pub const ROOT_ONLY: Caps = Caps::CHOWN.union(Caps::FSETID).union(Caps::MKNOD);
 }
 
-/// The identity to impersonate: everything the kernel consults for a
-/// filesystem permission check.
+/// The identity to impersonate: everything the kernel consults for a filesystem permission check.
 ///
-/// `groups` is the full supplementary list. Getting it wrong is a
-/// permission bug in either direction - a missing group denies access the
-/// user should have, an extra one grants access they should not - so the
-/// caller is expected to pass exactly what the directory service reports.
+/// `groups` is the full supplementary list. Getting it wrong is a permission bug in either direction - a missing group
+/// denies access the user should have, an extra one grants access they should not - so the caller is expected to pass
+/// exactly what the directory service reports.
 ///
-/// The list is stored **sorted and deduplicated**, because group membership
-/// is a set: `[27, 4]` and `[4, 27, 4]` describe the same identity, and
-/// equality here decides whether [`IdentityCache`] reuses a personality or
-/// mints a redundant one.
+/// The list is stored **sorted and deduplicated**, because group membership is a set: `[27, 4]` and `[4, 27, 4]`
+/// describe the same identity, and equality here decides whether [`IdentityCache`] reuses a personality or mints a
+/// redundant one.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AsUser {
     /// Filesystem user id.
@@ -401,8 +310,7 @@ impl AsUser {
         }
     }
 
-    /// Set the supplementary groups (normalized to a sorted, deduplicated
-    /// set - see the type docs).
+    /// Set the supplementary groups (normalized to a sorted, deduplicated set - see the type docs).
     pub fn groups(mut self, mut groups: Vec<u32>) -> AsUser {
         groups.sort_unstable();
         groups.dedup();
@@ -415,13 +323,12 @@ impl AsUser {
         &self.groups
     }
 
-    /// Request capabilities on top of this identity's own authority - see
-    /// [`Caps`], and note that the broker's spawn-time mask is the ceiling.
+    /// Request capabilities on top of this identity's own authority - see [`Caps`], and note that the broker's
+    /// spawn-time mask is the ceiling.
     ///
-    /// This participates in equality and hashing for the same reason the
-    /// group list does: it changes what the identity may do, so
-    /// [`IdentityCache`] must mint a *separate* personality rather than hand
-    /// back one registered for the same uid without it.
+    /// This participates in equality and hashing for the same reason the group list does: it changes what the identity
+    /// may do, so [`IdentityCache`] must mint a *separate* personality rather than hand back one registered for the
+    /// same uid without it.
     pub fn caps(mut self, caps: Caps) -> AsUser {
         self.caps = caps;
         self
@@ -433,56 +340,46 @@ impl AsUser {
     }
 }
 
-/// The parent's end of the broker socket, with the mark that says a reply
-/// is owed on it and nobody is going to claim it.
+/// The parent's end of the broker socket, with the mark that says a reply is owed on it and nobody is going to claim
+/// it.
 ///
-/// The two travel under one lock because the mark is only meaningful to
-/// whoever is about to use the socket: a reply carries nothing naming the
-/// request it answers, so a thread that finds the mark set must not send.
+/// The two travel under one lock because the mark is only meaningful to whoever is about to use the socket: a reply
+/// carries nothing naming the request it answers, so a thread that finds the mark set must not send.
 struct BrokerSock {
     fd: OwnedFd,
-    /// Set when a request was delivered and its reply was not received.
-    /// See [`round_trip`].
+    /// Set when a request was delivered and its reply was not received. See [`round_trip`].
     desynced: bool,
 }
 
 struct BrokerInner {
-    /// Serialized: one request at a time (registration is a rare,
-    /// session-setup operation - see the fs-reactor design sec. 16.4).
+    /// Serialized: one request at a time (registration is a rare, session-setup operation - see the fs-reactor design
+    /// sec. 16.4).
     sock: Mutex<BrokerSock>,
     pid: libc::pid_t,
-    /// The broker's pidfd (from `clone3(CLONE_PIDFD)`): race-free death
-    /// detection ([`CredBroker::is_alive`]), signalling, and reaping.
+    /// The broker's pidfd (from `clone3(CLONE_PIDFD)`): race-free death detection ([`CredBroker::is_alive`]),
+    /// signalling, and reaping.
     pidfd: OwnedFd,
-    /// The ring descriptors this broker was spawned over, in the order
-    /// the child renumbered them (ring `i` is the child's
-    /// `RING_FD_BASE + i`). Kept so a handle can be asked for by *ring*
-    /// rather than by position - see [`CredBroker::handle_for`].
+    /// The ring descriptors this broker was spawned over, in the order the child renumbered them (ring `i` is the
+    /// child's `RING_FD_BASE + i`). Kept so a handle can be asked for by *ring* rather than by position - see
+    /// [`CredBroker::handle_for`].
     ring_fds: Vec<RawFd>,
-    /// Whether the broker was spawned with a root limit, so that
-    /// [`CredHandle::register`] can refuse uid 0 with a clear error before
-    /// the broker refuses it with `EPERM`.
+    /// Whether the broker was spawned with a root limit, so that [`CredHandle::register`] can refuse uid 0 with a clear
+    /// error before the broker refuses it with `EPERM`.
     root: bool,
 }
 
 impl Drop for BrokerInner {
     fn drop(&mut self) {
-        // Dropping the last `CredBroker`: no more requests will come, so kill
-        // and reap the broker. `SIGKILL` via the pidfd is PID-reuse-safe and
-        // uncatchable, so a wedged broker cannot linger holding `CAP_SETUID`.
+        // Dropping the last `CredBroker`: no more requests will come, so kill and reap the broker. `SIGKILL` via the
+        // pidfd is PID-reuse-safe and uncatchable, so a wedged broker cannot linger holding `CAP_SETUID`.
         //
-        // `__WALL` is load-bearing. `clone3_fork(0, 0, ..)` gives the child
-        // `exit_signal == 0`, which makes it a "clone child" to
-        // `eligible_child` (`kernel/exit.c:1163`): with neither `__WALL` nor
-        // `__WCLONE`, `waitpid` answers `-1 ECHILD` immediately and the
-        // zombie stays for the host process's life. Nothing else reaps it
-        // either - that is the same `exit_signal == 0` at work, since no
-        // `SIGCHLD` is delivered to hang a handler off. `mount/idmap.rs`
-        // passes `SIGCHLD` and needs no flag; this is the other call site of
-        // the same helper. `ECHILD` (already reaped, e.g. by a consumer's
-        // wildcard reaper) or any non-`EINTR` error ends the loop.
-        // SAFETY: `pidfd_send_signal` on our owned pidfd; NULL siginfo / 0
-        // flags per the man page.
+        // `__WALL` is load-bearing. `clone3_fork(0, 0, ..)` gives the child `exit_signal == 0`, which makes it a "clone
+        // child" to `eligible_child` (`kernel/exit.c:1163`): with neither `__WALL` nor `__WCLONE`, `waitpid` answers
+        // `-1 ECHILD` immediately and the zombie stays for the host process's life. Nothing else reaps it either - that
+        // is the same `exit_signal == 0` at work, since no `SIGCHLD` is delivered to hang a handler off.
+        // `mount/idmap.rs` passes `SIGCHLD` and needs no flag; this is the other call site of the same helper. `ECHILD`
+        // (already reaped, e.g. by a consumer's wildcard reaper) or any non-`EINTR` error ends the loop.
+        // SAFETY: `pidfd_send_signal` on our owned pidfd; NULL siginfo / 0 flags per the man page.
         unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
@@ -493,16 +390,13 @@ impl Drop for BrokerInner {
             );
         }
         // SAFETY: waitpid on our child pid; a NULL status pointer is allowed.
-        let _ = retry_on_eintr(|| unsafe {
-            libc::waitpid(self.pid, std::ptr::null_mut(), libc::__WALL)
-        });
+        let _ = retry_on_eintr(|| unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), libc::__WALL) });
         // `pidfd` and `sock` (OwnedFd) close after this body.
     }
 }
 
-/// A handle to the broker process. `Send + Sync + Clone` - registration
-/// happens on whichever thread authenticates a session, never on the
-/// reactor loop.
+/// A handle to the broker process. `Send + Sync + Clone` - registration happens on whichever thread authenticates a
+/// session, never on the reactor loop.
 #[derive(Clone)]
 pub struct CredBroker {
     inner: Arc<BrokerInner>,
@@ -517,8 +411,8 @@ impl std::fmt::Debug for CredBroker {
     }
 }
 
-/// A broker bound to one ring: what a consumer actually calls to mint and
-/// retire identities. Obtain it from [`CredBroker::handle`].
+/// A broker bound to one ring: what a consumer actually calls to mint and retire identities. Obtain it from
+/// [`CredBroker::handle`].
 #[derive(Clone, Debug)]
 pub struct CredHandle {
     broker: CredBroker,
@@ -526,26 +420,22 @@ pub struct CredHandle {
 }
 
 impl CredHandle {
-    /// Which ring this handle mints on - its position in the slice
-    /// [`CredBroker::spawn`] was given. A [`Personality`] minted here is
-    /// meaningful on that ring and no other.
+    /// Which ring this handle mints on - its position in the slice [`CredBroker::spawn`] was given. A [`Personality`]
+    /// minted here is meaningful on that ring and no other.
     pub fn ring(&self) -> u8 {
         self.ring
     }
 
-    /// Mint a [`Personality`] for `who` - the broker impersonates that
-    /// identity just long enough to snapshot it.
+    /// Mint a [`Personality`] for `who` - the broker impersonates that identity just long enough to snapshot it.
     ///
-    /// Requires the broker to hold `CAP_SETUID`/`CAP_SETGID` (i.e. the
-    /// process was privileged when [`CredBroker::spawn`] ran) unless `who`
-    /// already *is* the broker's own identity, which needs no privilege and
-    /// is the unprivileged path.
+    /// Requires the broker to hold `CAP_SETUID`/`CAP_SETGID` (i.e. the process was privileged when
+    /// [`CredBroker::spawn`] ran) unless `who` already *is* the broker's own identity, which needs no privilege and is
+    /// the unprivileged path.
     ///
-    /// Registering `uid == 0` is refused unless the broker was spawned with
-    /// [`CredBroker::spawn_with_root`], and then it carries no capability
-    /// outside the root limit fixed there. The daemon's own identity comes
-    /// from [`UringFs::register_self`], and a root personality carrying the
-    /// daemon's capabilities is exactly what this design exists to avoid.
+    /// Registering `uid == 0` is refused unless the broker was spawned with [`CredBroker::spawn_with_root`], and then
+    /// it carries no capability outside the root limit fixed there. The daemon's own identity comes from
+    /// [`UringFs::register_self`], and a root personality carrying the daemon's capabilities is exactly what this
+    /// design exists to avoid.
     pub fn register(&self, who: &AsUser) -> crate::Result<Personality> {
         if who.uid == 0 && !self.broker.inner.root {
             return Err(crate::Error::Validation(
@@ -555,10 +445,9 @@ impl CredHandle {
                     .into(),
             ));
         }
-        // `(uid_t)-1`/`(gid_t)-1` are the kernel's "leave unchanged" sentinel
-        // for setres*id; they must never reach the impersonation window (the
-        // broker verifies the drop server-side too, but reject them here for a
-        // clear error rather than a bare EINVAL).
+        // `(uid_t)-1`/`(gid_t)-1` are the kernel's "leave unchanged" sentinel for setres*id; they must never reach the
+        // impersonation window (the broker verifies the drop server-side too, but reject them here for a clear error
+        // rather than a bare EINVAL).
         if who.uid == u32::MAX || who.gid == u32::MAX {
             return Err(crate::Error::Validation(
                 "uid/gid 0xFFFFFFFF is the setres*id no-change sentinel and \
@@ -573,16 +462,12 @@ impl CredHandle {
             )));
         }
         let id = self.broker.request(OP_REGISTER, self.ring, who)?;
-        // Through `Personality::from_raw`, not `Personality` directly:
-        // this is the one `Personality` built from data that crossed a
-        // process boundary, and `from_raw`'s `!= 0` refusal exists for
-        // exactly it. `sqe.personality == 0` means *no credential
-        // override*, so an op stamped with it runs under the reactor
-        // thread's ambient credentials - the root daemon - instead of the
-        // identity that was asked for. The kernel never allocates id 0
-        // (`XA_FLAGS_ALLOC1`), so a reply of 0 is malformed and refusing
-        // it is what keeps "personality 0 is unreachable from this API"
-        // true rather than merely intended.
+        // Through `Personality::from_raw`, not `Personality` directly: this is the one `Personality` built from data
+        // that crossed a process boundary, and `from_raw`'s `!= 0` refusal exists for exactly it. `sqe.personality ==
+        // 0` means *no credential override*, so an op stamped with it runs under the reactor thread's ambient
+        // credentials - the root daemon - instead of the identity that was asked for. The kernel never allocates id 0
+        // (`XA_FLAGS_ALLOC1`), so a reply of 0 is malformed and refusing it is what keeps "personality 0 is unreachable
+        // from this API" true rather than merely intended.
         u16::try_from(id)
             .ok()
             .and_then(Personality::from_raw)
@@ -591,16 +476,13 @@ impl CredHandle {
 
     /// Retire a personality, freeing its kernel-held credential and its id.
     ///
-    /// Call this when a session ends: ids are a `u16` space and each pins a
-    /// credential plus its group list, so leaking them is a real exhaustion
-    /// vector. In-flight operations that already resolved the id complete
-    /// normally; new SQEs naming it fail `EINVAL`.
+    /// Call this when a session ends: ids are a `u16` space and each pins a credential plus its group list, so leaking
+    /// them is a real exhaustion vector. In-flight operations that already resolved the id complete normally; new SQEs
+    /// naming it fail `EINVAL`.
     ///
-    /// Takes no proof of ownership over `who`, so it can free *any* live id
-    /// on the ring - a compromised main can retire other sessions' identities
-    /// (a DoS within its existing power; see the module boundary note).
-    /// Prefer the ref-counted [`IdentityCache`], which frees an id only once
-    /// its last [`Lease`] drops.
+    /// Takes no proof of ownership over `who`, so it can free *any* live id on the ring - a compromised main can retire
+    /// other sessions' identities (a DoS within its existing power; see the module boundary note). Prefer the
+    /// ref-counted [`IdentityCache`], which frees an id only once its last [`Lease`] drops.
     pub fn unregister(&self, who: Personality) -> crate::Result<()> {
         let msg = AsUser::new(u32::from(who.0), 0);
         self.broker.request(OP_UNREGISTER, self.ring, &msg)?;
@@ -610,10 +492,9 @@ impl CredHandle {
 
 /// A registered identity, kept alive by its leases.
 ///
-/// The kernel id is freed by `Drop`, so the `Arc` count *is* the reference
-/// count: the personality outlives the cache entry itself when a lease is
-/// still held, which is exactly the "in-flight work finishes under the old
-/// id" behaviour re-registration needs.
+/// The kernel id is freed by `Drop`, so the `Arc` count *is* the reference count: the personality outlives the cache
+/// entry itself when a lease is still held, which is exactly the "in-flight work finishes under the old id" behaviour
+/// re-registration needs.
 #[derive(Debug)]
 struct IdEntry {
     id: Personality,
@@ -629,15 +510,12 @@ impl Drop for IdEntry {
 
 /// A live borrow of a cached identity.
 ///
-/// A lease keeps its personality registered, but dropping the last one does
-/// **not** retire it: the cache entry holds a reference of its own, so a
-/// cached identity stays registered until
-/// [`invalidate`](IdentityCache::invalidate) (or dropping the whole cache)
-/// releases that one *and* every lease is gone. That is the point of the cache
-/// -- the next connection for the same identity reuses the id instead of paying
-/// another mint. Retiring ids is therefore the consumer's call: invalidate on a
-/// directory-services change or a TTL, or ids accumulate in the per-ring `u16`
-/// space (see [`IdentityCache`]).
+/// A lease keeps its personality registered, but dropping the last one does **not** retire it: the cache entry holds a
+/// reference of its own, so a cached identity stays registered until [`invalidate`](IdentityCache::invalidate) (or
+/// dropping the whole cache) releases that one *and* every lease is gone. That is the point of the cache -- the next
+/// connection for the same identity reuses the id instead of paying another mint. Retiring ids is therefore the
+/// consumer's call: invalidate on a directory-services change or a TTL, or ids accumulate in the per-ring `u16` space
+/// (see [`IdentityCache`]).
 #[derive(Clone, Debug)]
 pub struct Lease(Arc<IdEntry>);
 
@@ -648,16 +526,13 @@ impl Lease {
     }
 }
 
-/// Registers each distinct identity once and hands out reference-counted
-/// [`Lease`]s - the "register on connect, but only if the credentials are
-/// new" pattern.
+/// Registers each distinct identity once and hands out reference-counted [`Lease`]s - the "register on connect, but
+/// only if the credentials are new" pattern.
 ///
 /// Minting is not free (an IPC round trip plus an impersonation window:
-/// order of tens of microseconds), and every live id pins a kernel
-/// credential inside a **`u16`** space that is per-ring. Registering per
-/// *connection* rather than per *identity* therefore caps concurrent
-/// connections at ~65k per ring and does needless work; this collapses both
-/// to per-identity.
+/// order of tens of microseconds), and every live id pins a kernel credential inside a **`u16`** space that is
+/// per-ring. Registering per *connection* rather than per *identity* therefore caps concurrent connections at ~65k per
+/// ring and does needless work; this collapses both to per-identity.
 ///
 /// ```no_run
 /// # use truenas_ros::uring_fs::{AsUser, UringFs, CredBroker, FsConfig, IdentityCache};
@@ -673,17 +548,14 @@ impl Lease {
 /// # Ok::<(), truenas_ros::Error>(())
 /// ```
 ///
-/// **Snapshots are frozen, and nothing expires on its own.** A personality
-/// captures group membership at registration, so a cached identity will not
-/// notice a later directory change - and because the cache holds its own
-/// reference, no id is retired just because its last [`Lease`] dropped. Call
-/// [`invalidate`](Self::invalidate) on a change event, or on a TTL of your
-/// choosing, or [`invalidate_all`](Self::invalidate_all) wholesale: the entry
-/// is removed so the next `acquire` registers fresh, the old id is retired
-/// once the leases already handed out drop, and those leases keep working
-/// meanwhile (in-flight work finishes under the identity it started with).
-/// A daemon that never invalidates accumulates one id per distinct identity it
-/// has ever served, against the per-ring `u16` space.
+/// **Snapshots are frozen, and nothing expires on its own.** A personality captures group membership at registration,
+/// so a cached identity will not notice a later directory change - and because the cache holds its own reference, no id
+/// is retired just because its last [`Lease`] dropped. Call [`invalidate`](Self::invalidate) on a change event, or on a
+/// TTL of your choosing, or [`invalidate_all`](Self::invalidate_all) wholesale: the entry is removed so the next
+/// `acquire` registers fresh, the old id is retired once the leases already handed out drop, and those leases keep
+/// working meanwhile (in-flight work finishes under the identity it started with).
+/// A daemon that never invalidates accumulates one id per distinct identity it has ever served, against the per-ring
+/// `u16` space.
 #[derive(Clone, Debug)]
 pub struct IdentityCache {
     inner: Arc<CacheInner>,
@@ -706,16 +578,13 @@ impl IdentityCache {
         }
     }
 
-    /// A lease on `who`'s personality, registering it only if this is the
-    /// first live use of exactly these credentials.
+    /// A lease on `who`'s personality, registering it only if this is the first live use of exactly these credentials.
     ///
-    /// Concurrent callers asking for the *same* new identity collapse into one
-    /// registration (they serialize on that identity's gate), but the shared
-    /// map lock is held only for an O(1) slot lookup - never across the broker
-    /// round-trip - so cache hits and registrations of *other* identities are
-    /// not blocked behind one mint. That protocol lives in `SingleFlight`
-    /// (`uring_fs/single_flight.rs`), where it is model-checked without a
-    /// broker to fork.
+    /// Concurrent callers asking for the *same* new identity collapse into one registration (they serialize on that
+    /// identity's gate), but the shared map lock is held only for an O(1) slot lookup - never across the broker
+    /// round-trip - so cache hits and registrations of *other* identities are not blocked behind one mint. That
+    /// protocol lives in `SingleFlight` (`uring_fs/single_flight.rs`), where it is model-checked without a broker to
+    /// fork.
     pub fn acquire(&self, who: &AsUser) -> crate::Result<Lease> {
         let creds = &self.inner.creds;
         let entry = self.inner.live.get_or_try_init(who, || {
@@ -727,23 +596,20 @@ impl IdentityCache {
         Ok(Lease(entry))
     }
 
-    /// Forget the cached personality for `who`, so the next
-    /// [`acquire`](Self::acquire) mints a fresh one. Outstanding leases are
-    /// unaffected and retire the old id when they drop.
+    /// Forget the cached personality for `who`, so the next [`acquire`](Self::acquire) mints a fresh one. Outstanding
+    /// leases are unaffected and retire the old id when they drop.
     pub fn invalidate(&self, who: &AsUser) {
         self.inner.live.invalidate(who);
     }
 
-    /// Forget every cached identity (a wholesale directory-services
-    /// change). Existing leases keep working, as in
+    /// Forget every cached identity (a wholesale directory-services change). Existing leases keep working, as in
     /// [`invalidate`](Self::invalidate).
     pub fn invalidate_all(&self) {
         self.inner.live.clear();
     }
 
-    /// How many distinct identities are currently cached and registered. An
-    /// identity whose mint is still in flight does not count (one that failed
-    /// leaves nothing behind at all).
+    /// How many distinct identities are currently cached and registered. An identity whose mint is still in flight does
+    /// not count (one that failed leaves nothing behind at all).
     pub fn len(&self) -> usize {
         self.inner.live.len()
     }
@@ -756,17 +622,14 @@ impl IdentityCache {
 
 /// A reactor whose io_uring ring a [`CredBroker`] registers personalities on.
 ///
-/// Implemented by the standalone [`UringFs`] and by a `net` server built with
-/// an fs pool - so a server can act as *authenticated peers* on its own ring,
-/// the fs ops and net ops interleaving there (fs ops carry a registered
+/// Implemented by the standalone [`UringFs`] and by a `net` server built with an fs pool - so a server can act as
+/// *authenticated peers* on its own ring, the fs ops and net ops interleaving there (fs ops carry a registered
 /// personality, net ops carry 0).
 pub trait BrokerReactor {
     /// The ring descriptor the broker inherits at `fork` and registers on.
     ///
-    /// Hidden by design: a ring fd plus its personality xarray is a credential
-    /// capability (anyone holding it can register creds on the ring), not a
-    /// handle to pass around - [`CredBroker::spawn`] is the only intended
-    /// consumer.
+    /// Hidden by design: a ring fd plus its personality xarray is a credential capability (anyone holding it can
+    /// register creds on the ring), not a handle to pass around - [`CredBroker::spawn`] is the only intended consumer.
     #[doc(hidden)]
     fn broker_ring_fd(&self) -> RawFd;
 }
@@ -777,10 +640,9 @@ impl BrokerReactor for UringFs {
     }
 }
 
-// A ring created ahead of the reactor that will run it (`UringFs::setup_ring`,
-// `net::server::setup_ring`). The broker needs only the descriptor, which exists
-// from `io_uring_setup` on; mapping and driving it happen later, on the
-// thread that receives the `RingFd`.
+// A ring created ahead of the reactor that will run it (`UringFs::setup_ring`, `net::server::setup_ring`). The broker
+// needs only the descriptor, which exists from `io_uring_setup` on; mapping and driving it happen later, on the thread
+// that receives the `RingFd`.
 impl BrokerReactor for RingFd {
     fn broker_ring_fd(&self) -> RawFd {
         self.raw_fd()
@@ -788,119 +650,83 @@ impl BrokerReactor for RingFd {
 }
 
 impl CredBroker {
-    /// Fork the broker process - which inherits `reactors`' ring
-    /// descriptors - then permanently drop `CAP_SETUID`/`CAP_SETGID` from
-    /// **this** process.
+    /// Fork the broker process - which inherits `reactors`' ring descriptors - then permanently drop
+    /// `CAP_SETUID`/`CAP_SETGID` from **this** process.
     ///
     /// # Ordering requirements
     ///
-    /// 1. **Every ring must already exist.** The broker registers on the
-    ///    fds it inherits at `fork`, and there is no way to hand it one
-    ///    afterwards: since Linux 6.8 an io_uring fd cannot be sent over a
-    ///    unix socket (`SCM_RIGHTS` -> `EINVAL`). Build every [`UringFs`]
-    ///    first, then spawn one broker with all of them. Reactors that will
-    ///    run on their own threads cannot be built yet (see 2), so for those
-    ///    create the rings with `UringFs::setup_ring` or `net::server::setup_ring`,
-    ///    spawn the broker over the [`RingFd`]s, and build each reactor on its
-    ///    thread afterwards with `with_ring`.
-    /// 2. **Call this before starting any threads.** Not a style
-    ///    preference - a `fork` without `exec` keeps only the calling
-    ///    thread, and any lock another thread held at that instant (glibc's
-    ///    malloc arena above all) stays locked forever in the child, which
-    ///    would deadlock the broker at its first allocation. This is not
-    ///    checked (a process cannot usefully prove it): the child is written
-    ///    to survive a violation - its three scratch buffers are allocated
-    ///    here, in the parent, and its request loop then allocates nothing and
-    ///    calls only raw syscalls - but that is defence in depth, not a
-    ///    licence. Anything added to the child that allocates, takes a lock,
-    ///    or calls into glibc's stateful machinery makes the rule load-bearing
-    ///    again.
+    /// 1. **Every ring must already exist.** The broker registers on the fds it inherits at `fork`, and there is no way
+    ///    to hand it one afterwards: since Linux 6.8 an io_uring fd cannot be sent over a unix socket (`SCM_RIGHTS` ->
+    ///    `EINVAL`). Build every [`UringFs`] first, then spawn one broker with all of them. Reactors that will run on
+    ///    their own threads cannot be built yet (see 2), so for those create the rings with `UringFs::setup_ring` or
+    ///    `net::server::setup_ring`, spawn the broker over the [`RingFd`]s, and build each reactor on its thread
+    ///    afterwards with `with_ring`.
+    /// 2. **Call this before starting any threads.** Not a style preference - a `fork` without `exec` keeps only the
+    ///    calling thread, and any lock another thread held at that instant (glibc's malloc arena above all) stays
+    ///    locked forever in the child, which would deadlock the broker at its first allocation. This is not checked (a
+    ///    process cannot usefully prove it): the child is written to survive a violation - its three scratch buffers
+    ///    are allocated here, in the parent, and its request loop then allocates nothing and calls only raw syscalls -
+    ///    but that is defence in depth, not a licence. Anything added to the child that allocates, takes a lock, or
+    ///    calls into glibc's stateful machinery makes the rule load-bearing again.
     ///
-    /// The capability drop is the point of the whole exercise, so it is not
-    /// optional: from here on this process can *use* personalities but
-    /// never mint them. (A process that was already unprivileged simply has
-    /// nothing to drop; the broker can then still register its own
-    /// identity.)
+    /// The capability drop is the point of the whole exercise, so it is not optional: from here on this process can
+    /// *use* personalities but never mint them. (A process that was already unprivileged simply has nothing to drop;
+    /// the broker can then still register its own identity.)
     ///
-    /// **Failure is fatal.** An `Err` means the security setup did not
-    /// complete - on a `fork` failure the caps are dropped and no broker
-    /// exists; on a `capset` failure the caps may still be held. Either way
-    /// the caller must abort, never continue serving.
-    pub fn spawn<R: BrokerReactor + ?Sized>(
-        reactors: &[&R],
-    ) -> crate::Result<CredBroker> {
+    /// **Failure is fatal.** An `Err` means the security setup did not complete - on a `fork` failure the caps are
+    /// dropped and no broker exists; on a `capset` failure the caps may still be held. Either way the caller must
+    /// abort, never continue serving.
+    pub fn spawn<R: BrokerReactor + ?Sized>(reactors: &[&R]) -> crate::Result<CredBroker> {
         CredBroker::spawn_with_caps(reactors, Caps::empty())
     }
 
-    /// [`spawn`](Self::spawn), but permitting brokered personalities to carry
-    /// capabilities from `allowed`.
+    /// [`spawn`](Self::spawn), but permitting brokered personalities to carry capabilities from `allowed`.
     ///
-    /// `allowed` is a **ceiling fixed here**, before the privilege drop, and
-    /// the broker enforces it on every request: a registration asking for
-    /// anything outside it fails `EPERM`. That placement is the security
-    /// property. Main can already ask the broker to mint any non-root
-    /// identity (see the module boundary note), so a per-request capability
-    /// with no spawn-time bound would let a compromised main hand itself
-    /// whatever [`Caps`] defines - up to `CAP_DAC_OVERRIDE | CAP_FOWNER`,
-    /// which between them read, write, `chmod`, `chown` and delete anything
-    /// the reactor can name. A ceiling chosen before the fork cannot be
-    /// widened by anything that happens to main afterwards, which is why
-    /// this argument should be the smallest set the deployment needs and
-    /// not the whole of [`Caps`].
+    /// `allowed` is a **ceiling fixed here**, before the privilege drop, and the broker enforces it on every request: a
+    /// registration asking for anything outside it fails `EPERM`. That placement is the security property. Main can
+    /// already ask the broker to mint any non-root identity (see the module boundary note), so a per-request capability
+    /// with no spawn-time bound would let a compromised main hand itself whatever [`Caps`] defines - up to
+    /// `CAP_DAC_OVERRIDE | CAP_FOWNER`, which between them read, write, `chmod`, `chown` and delete anything the
+    /// reactor can name. A ceiling chosen before the fork cannot be widened by anything that happens to main
+    /// afterwards, which is why this argument should be the smallest set the deployment needs and not the whole of
+    /// [`Caps`].
     ///
-    /// `Caps::empty()` - what [`spawn`](Self::spawn) passes - reproduces the
-    /// capability-free behaviour exactly, including skipping the `capset`
-    /// entirely inside the impersonation window.
+    /// `Caps::empty()` - what [`spawn`](Self::spawn) passes - reproduces the capability-free behaviour exactly,
+    /// including skipping the `capset` entirely inside the impersonation window.
     ///
-    /// **Impersonation is available to the first broker in a process, and
-    /// only that one.** This sheds `CAP_SETUID`/`CAP_SETGID` from the caller
-    /// once the child is forked - deliberately, so a compromised main cannot
-    /// mint identities itself - and a child forked afterwards inherits the
-    /// stripped set. A second broker is therefore usable for the calling
-    /// process's own identity and refuses every other with `EPERM`. No error
+    /// **Impersonation is available to the first broker in a process, and only that one.** This sheds
+    /// `CAP_SETUID`/`CAP_SETGID` from the caller once the child is forked - deliberately, so a compromised main cannot
+    /// mint identities itself - and a child forked afterwards inherits the stripped set. A second broker is therefore
+    /// usable for the calling process's own identity and refuses every other with `EPERM`. No error
     /// says so here, because the difference is in what is later asked of it;
     /// [`is_alive`](Self::is_alive) says the same for a supervisor.
     ///
-    /// Capabilities are applied only on the impersonation path. A request
-    /// whose identity already matches the broker's own is refused `EPERM`
-    /// when it asks for any: that path mints the daemon's *own* credentials,
-    /// and handing them extra authority is what [`UringFs::register_self`]
-    /// and this whole process boundary exist to prevent.
+    /// Capabilities are applied only on the impersonation path. A request whose identity already matches the broker's
+    /// own is refused `EPERM` when it asks for any: that path mints the daemon's *own* credentials, and handing them
+    /// extra authority is what [`UringFs::register_self`] and this whole process boundary exist to prevent.
     ///
-    /// [`Caps::ROOT_ONLY`] in `allowed` is refused with a `Validation`
-    /// error, since those capabilities belong to uid 0 alone. This broker
-    /// mints no root personality, which only
-    /// [`spawn_with_root`](Self::spawn_with_root) does.
-    pub fn spawn_with_caps<R: BrokerReactor + ?Sized>(
-        reactors: &[&R],
-        allowed: Caps,
-    ) -> crate::Result<CredBroker> {
+    /// [`Caps::ROOT_ONLY`] in `allowed` is refused with a `Validation` error, since those capabilities belong to uid 0
+    /// alone. This broker mints no root personality, which only [`spawn_with_root`](Self::spawn_with_root) does.
+    pub fn spawn_with_caps<R: BrokerReactor + ?Sized>(reactors: &[&R], allowed: Caps) -> crate::Result<CredBroker> {
         CredBroker::spawn_policy(reactors, allowed, None)
     }
 
-    /// [`spawn_with_caps`](Self::spawn_with_caps), and also permitting a
-    /// root personality, `uid == 0`, carrying capabilities from `root`.
+    /// [`spawn_with_caps`](Self::spawn_with_caps), and also permitting a root personality, `uid == 0`, carrying
+    /// capabilities from `root`.
     ///
-    /// `root` is a second ceiling fixed here, apart from `allowed`, and it
-    /// binds uid 0 alone. A file service that serves a remote superuser
-    /// passes the capabilities that superuser's file calls check, and
-    /// `allowed` stays the ceiling for every other identity. Only `root` may
-    /// hold [`Caps::ROOT_ONLY`].
+    /// `root` is a second ceiling fixed here, apart from `allowed`, and it binds uid 0 alone. A file service that
+    /// serves a remote superuser passes the capabilities that superuser's file calls check, and `allowed` stays the
+    /// ceiling for every other identity. Only `root` may hold [`Caps::ROOT_ONLY`].
     ///
-    /// The window cannot lean on the kernel here. A root personality keeps
-    /// uid 0, and the kernel clears the effective set only when the euid
-    /// leaves root (`cap_emulate_setxuid`, `security/commoncap.c`), so the
-    /// window sets both words of the effective set to exactly what the
-    /// request asked for, never more, and its revert gives the broker its
-    /// own set back before it clears the groups, since `setgroups` needs
-    /// `CAP_SETGID`. A root request never takes the path that registers
-    /// the broker's own credentials. The snapshot's *permitted* set is the
-    /// broker's, inert as for every other identity, since nothing in an
-    /// io_uring operation raises effective from it.
+    /// The window cannot lean on the kernel here. A root personality keeps uid 0, and the kernel clears the effective
+    /// set only when the euid leaves root (`cap_emulate_setxuid`, `security/commoncap.c`), so the window sets both
+    /// words of the effective set to exactly what the request asked for, never more, and its revert gives the broker
+    /// its own set back before it clears the groups, since `setgroups` needs `CAP_SETGID`. A root request never takes
+    /// the path that registers the broker's own credentials. The snapshot's *permitted* set is the broker's, inert as
+    /// for every other identity, since nothing in an io_uring operation raises effective from it.
     ///
-    /// A root personality takes the gid and the groups of the request, so a
-    /// superuser whose primary group is not 0 keeps it, as the kernel's own
-    /// file server keeps it (`nfsd_setuser`, `fs/nfsd/auth.c`).
+    /// A root personality takes the gid and the groups of the request, so a superuser whose primary group is not 0
+    /// keeps it, as the kernel's own file server keeps it (`nfsd_setuser`, `fs/nfsd/auth.c`).
     pub fn spawn_with_root<R: BrokerReactor + ?Sized>(
         reactors: &[&R],
         allowed: Caps,
@@ -909,9 +735,8 @@ impl CredBroker {
         CredBroker::spawn_policy(reactors, allowed, Some(root))
     }
 
-    /// The body of [`spawn_with_caps`](Self::spawn_with_caps) and
-    /// [`spawn_with_root`](Self::spawn_with_root), with the root limit, if
-    /// any.
+    /// The body of [`spawn_with_caps`](Self::spawn_with_caps) and [`spawn_with_root`](Self::spawn_with_root), with the
+    /// root limit, if any.
     fn spawn_policy<R: BrokerReactor + ?Sized>(
         reactors: &[&R],
         allowed: Caps,
@@ -930,8 +755,7 @@ impl CredBroker {
                 reactors.len()
             )));
         }
-        let ring_fds: Vec<RawFd> =
-            reactors.iter().map(|r| r.broker_ring_fd()).collect();
+        let ring_fds: Vec<RawFd> = reactors.iter().map(|r| r.broker_ring_fd()).collect();
 
         let mut sv = [0 as RawFd; 2];
         // SAFETY: `sv` is a valid 2-element array for socketpair to fill.
@@ -947,23 +771,15 @@ impl CredBroker {
         let parent_end = unsafe { crate::fd::owned_from_raw(sv[0]) };
         let child_end = unsafe { crate::fd::owned_from_raw(sv[1]) };
 
-        // The child renumbers its descriptors through a scratch range above
-        // the highest fd it inherits (`tidy_child_fds`), so the layout needs
-        // `n + 1` descriptors of headroom over that high-water mark - a
-        // requirement that grows with the slice, and therefore with
-        // `MAX_RINGS`. `dup3` refuses a target at or above `RLIMIT_NOFILE`
-        // with `EBADF` (`ksys_dup3`, `/CODE/linux` `fs/file.c:1411-1412`)
-        // and `dup2_or_die` then `_exit`s the child - after the fork, so the
-        // parent learns of it only at `recv_reply`, with `CAP_SETUID`
-        // already shed and impersonation unrecoverable without a fresh
-        // process (see `is_alive`). Check the headroom here instead, while
-        // the caller still holds its capabilities and can retry with fewer
-        // rings: a `Validation` error costs it nothing, a dead child costs
-        // it the process.
-        let max_src = ring_fds
-            .iter()
-            .copied()
-            .fold(child_end.as_raw_fd(), |a, b| a.max(b));
+        // The child renumbers its descriptors through a scratch range above the highest fd it inherits
+        // (`tidy_child_fds`), so the layout needs `n + 1` descriptors of headroom over that high-water mark - a
+        // requirement that grows with the slice, and therefore with `MAX_RINGS`. `dup3` refuses a target at or above
+        // `RLIMIT_NOFILE` with `EBADF` (`ksys_dup3`, `/CODE/linux` `fs/file.c:1411-1412`) and `dup2_or_die` then
+        // `_exit`s the child - after the fork, so the parent learns of it only at `recv_reply`, with `CAP_SETUID`
+        // already shed and impersonation unrecoverable without a fresh process (see `is_alive`). Check the headroom
+        // here instead, while the caller still holds its capabilities and can retry with fewer rings: a `Validation`
+        // error costs it nothing, a dead child costs it the process.
+        let max_src = ring_fds.iter().copied().fold(child_end.as_raw_fd(), |a, b| a.max(b));
         let mut lim = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -982,75 +798,57 @@ impl CredBroker {
             }
         }
 
-        // The reply socket is the only thing standing between a stalled
-        // broker and every caller in the process; see `RECV_TIMEOUT`.
+        // The reply socket is the only thing standing between a stalled broker and every caller in the process; see
+        // `RECV_TIMEOUT`.
         set_timeout(parent_end.as_raw_fd(), libc::SO_RCVTIMEO, RECV_TIMEOUT)?;
-        // And the same bound on the way out. A child that has stopped
-        // reading fills the sndbuf, and a blocking `send` then waits
-        // forever holding the socket mutex - wedging every register and
-        // unregister in the process, `IdEntry::drop` on the reactor thread
-        // included, which is the wedge the recv bound exists to prevent.
+        // And the same bound on the way out. A child that has stopped reading fills the sndbuf, and a blocking `send`
+        // then waits forever holding the socket mutex - wedging every register and unregister in the process,
+        // `IdEntry::drop` on the reactor thread included, which is the wedge the recv bound exists to prevent.
         set_timeout(parent_end.as_raw_fd(), libc::SO_SNDTIMEO, RECV_TIMEOUT)?;
 
-        // Fork the broker via `clone3`, not `fork()`, for three reasons --
-        // one of them load-bearing for the privileged window:
-        //   * CLONE_CLEAR_SIGHAND resets the child's inherited signal handlers
-        //     to SIG_DFL, so a signal can never run main's handler code inside
-        //     the impersonation window, at the impersonated identity (a
+        // Fork the broker via `clone3`, not `fork()`, for three reasons -- one of them load-bearing for the privileged
+        // window:
+        //   * CLONE_CLEAR_SIGHAND resets the child's inherited signal handlers to SIG_DFL, so a signal can never run
+        //     main's handler code inside the impersonation window, at the impersonated identity (a
         //     fork-without-exec soundness hazard);
         //   * CLONE_PIDFD gives a race-free pidfd for supervision/reap;
-        //   * exit_signal 0 means the broker's death sends NO SIGCHLD to the
-        //     host - uring_fs is a library and must not disturb the consumer's
-        //     own child reaping (the pidfd carries death instead).
+        //   * exit_signal 0 means the broker's death sends NO SIGCHLD to the host - uring_fs is a library and must not
+        //     disturb the consumer's own child reaping (the pidfd carries death instead).
         // Same single-threaded-at-spawn precondition as fork (sharper, even:
         // a raw clone3 has no glibc atfork net - see `crate::clone3`).
-        // Allocate the broker's scratch buffers HERE, before the fork: the
-        // child inherits them, so its request loop never allocates. A raw
-        // clone3 bypasses glibc's atfork malloc mitigation, so a child that
-        // allocated after the fork could deadlock on an arena lock a concurrent
-        // thread held at fork time - the reason `spawn` must run before any
-        // threads (and why this hardens the test harness, which is not).
+        // Allocate the broker's scratch buffers HERE, before the fork: the child inherits them, so its request loop
+        // never allocates. A raw clone3 bypasses glibc's atfork malloc mitigation, so a child that allocated after the
+        // fork could deadlock on an arena lock a concurrent thread held at fork time - the reason `spawn` must run
+        // before any threads (and why this hardens the test harness, which is not).
         let req = vec![0u8; MAX_REQ];
         let groups = vec![0u32; MAX_GROUPS];
         let scratch = vec![0 as libc::gid_t; MAX_GROUPS];
 
         let mut pidfd: RawFd = -1;
-        // SAFETY: `clone3_fork` requires that the child do nothing that a
-        // fork-copied lock could block. That holds by construction here, not by
-        // trusting the caller's ordering: `broker_main` runs only raw syscalls
-        // over the buffers allocated just above, and ends in `_exit`. The
-        // documented before-any-threads rule is what keeps it that way.
+        // SAFETY: `clone3_fork` requires that the child do nothing that a fork-copied lock could block. That holds by
+        // construction here, not by trusting the caller's ordering: `broker_main` runs only raw syscalls over the
+        // buffers allocated just above, and ends in `_exit`. The documented before-any-threads rule is what keeps it
+        // that way.
         let fork_ret = unsafe { crate::clone3::clone3_fork(0, 0, &mut pidfd) };
         let pid = match fork_ret {
             Ok(pid) => pid,
             Err(e) => {
-                // Shed the mint privilege even on failure: no broker exists,
-                // so main has no use for CAP_SETUID/SETGID. `spawn` failure is
-                // fatal (see the doc).
+                // Shed the mint privilege even on failure: no broker exists, so main has no use for CAP_SETUID/SETGID.
+                // `spawn` failure is fatal (see the doc).
                 let _ = drop_setid_caps();
                 return Err(e.into());
             }
         };
         if pid == 0 {
-            // The child must not run any destructor belonging to the parent
-            // (they would free memory the parent still owns and flush its
-            // buffers a second time), so `broker_main` ends in `_exit`.
-            broker_main(
-                child_end.as_raw_fd(),
-                &ring_fds,
-                allowed,
-                root,
-                req,
-                groups,
-                scratch,
-            );
+            // The child must not run any destructor belonging to the parent (they would free memory the parent still
+            // owns and flush its buffers a second time), so `broker_main` ends in `_exit`.
+            broker_main(child_end.as_raw_fd(), &ring_fds, allowed, root, req, groups, scratch);
         }
         // SAFETY: `CLONE_PIDFD` wrote a fresh owned pidfd for the child.
         let pidfd = unsafe { crate::fd::owned_from_raw(pidfd) };
         drop(child_end);
-        // If this fails the broker is already running but main still holds the
-        // mint caps - an unsafe state. The `?` surfaces it; `spawn` failure is
-        // fatal (see the doc), so the caller aborts rather than serves.
+        // If this fails the broker is already running but main still holds the mint caps - an unsafe state. The `?`
+        // surfaces it; `spawn` failure is fatal (see the doc), so the caller aborts rather than serves.
         drop_setid_caps()?;
         let broker = CredBroker {
             inner: Arc::new(BrokerInner {
@@ -1064,17 +862,14 @@ impl CredBroker {
                 root: root.is_some(),
             }),
         };
-        // Take the child's ready datagram before handing back a handle. A
-        // child that died renumbering its descriptors otherwise reaches the
-        // caller as a live `CredBroker` whose first `register` answers
-        // `ECONNRESET` - with the mint capabilities already shed, so no
-        // second broker can impersonate and the process cannot recover
-        // without restarting. Failing here is what the contract above says
-        // it is, and dropping `broker` kills and reaps the child.
+        // Take the child's ready datagram before handing back a handle. A child that died renumbering its descriptors
+        // otherwise reaches the caller as a live `CredBroker` whose first `register` answers `ECONNRESET` - with the
+        // mint capabilities already shed, so no second broker can impersonate and the process cannot recover without
+        // restarting. Failing here is what the contract above says it is, and dropping `broker` kills and reaps the
+        // child.
         //
-        // Bounded by the same `SO_RCVTIMEO` every other reply on this socket
-        // carries, so a child wedged before its first send costs one
-        // `RECV_TIMEOUT` rather than the process.
+        // Bounded by the same `SO_RCVTIMEO` every other reply on this socket carries, so a child wedged before its
+        // first send costs one `RECV_TIMEOUT` rather than the process.
         {
             let sock = broker.inner.sock.lock().map_err(|_| Errno::EIO)?;
             recv_reply(sock.fd.as_raw_fd())?;
@@ -1084,46 +879,28 @@ impl CredBroker {
 
     /// The handle for the ring `reactor` runs on.
     ///
-    /// Prefer this to [`handle`](Self::handle). A [`Personality`] is
-    /// meaningful only on the ring that minted it - the kernel's id space
-    /// is per-ring and starts at 1 for each, so crossing two rings hits
-    /// rather than misses and runs the operation under another identity
-    /// (see [`Personality`]'s own type docs). Pairing the handle to the
-    /// ring here is what keeps a caller from having to carry that pairing
-    /// itself, in a second list beside the first.
+    /// Prefer this to [`handle`](Self::handle). A [`Personality`] is meaningful only on the ring that minted it - the
+    /// kernel's id space is per-ring and starts at 1 for each, so crossing two rings hits rather than misses and runs
+    /// the operation under another identity (see [`Personality`]'s own type docs). Pairing the handle to the ring here
+    /// is what keeps a caller from having to carry that pairing itself, in a second list beside the first.
     ///
-    /// A reactor this broker was not spawned over is a `Validation`
-    /// error. The match is on the ring descriptor, so a reactor from the
-    /// spawn slice that has since been *dropped* can have its number
-    /// reused by an unrelated ring; keeping the spawn slice alive for the
-    /// broker's life is the existing contract and remains one.
-    pub fn handle_for<R: BrokerReactor + ?Sized>(
-        &self,
-        reactor: &R,
-    ) -> crate::Result<CredHandle> {
+    /// A reactor this broker was not spawned over is a `Validation` error. The match is on the ring descriptor, so a
+    /// reactor from the spawn slice that has since been *dropped* can have its number reused by an unrelated ring;
+    /// keeping the spawn slice alive for the broker's life is the existing contract and remains one.
+    pub fn handle_for<R: BrokerReactor + ?Sized>(&self, reactor: &R) -> crate::Result<CredHandle> {
         let fd = reactor.broker_ring_fd();
-        let index = self
-            .inner
-            .ring_fds
-            .iter()
-            .position(|&r| r == fd)
-            .ok_or_else(|| {
-                crate::Error::Validation(
-                    "that reactor's ring is not one this broker serves"
-                        .to_owned(),
-                )
+        let index =
+            self.inner.ring_fds.iter().position(|&r| r == fd).ok_or_else(|| {
+                crate::Error::Validation("that reactor's ring is not one this broker serves".to_owned())
             })?;
         self.handle(index as u8)
     }
 
-    /// The handle for ring `index` - the position of that [`UringFs`] in
-    /// the slice passed to [`CredBroker::spawn`].
+    /// The handle for ring `index` - the position of that [`UringFs`] in the slice passed to [`CredBroker::spawn`].
     ///
-    /// Positional, so the caller carries the pairing between a ring and
-    /// its index in a second list beside the first, and a personality
-    /// minted through the wrong index runs its operations as another
-    /// ring's identity without failing. [`handle_for`](Self::handle_for)
-    /// takes the reactor instead and cannot be given the wrong one.
+    /// Positional, so the caller carries the pairing between a ring and its index in a second list beside the first,
+    /// and a personality minted through the wrong index runs its operations as another ring's identity without failing.
+    /// [`handle_for`](Self::handle_for) takes the reactor instead and cannot be given the wrong one.
     pub fn handle(&self, index: u8) -> crate::Result<CredHandle> {
         if usize::from(index) >= self.inner.ring_fds.len() {
             return Err(crate::Error::Validation(format!(
@@ -1137,26 +914,21 @@ impl CredBroker {
         })
     }
 
-    /// The broker process's pid (for supervision: if it dies, existing
-    /// personalities keep working - the kernel refcounts them - but no new
-    /// identity can be minted until the process is restarted).
+    /// The broker process's pid (for supervision: if it dies, existing personalities keep working - the kernel
+    /// refcounts them - but no new identity can be minted until the process is restarted).
     pub fn pid(&self) -> i32 {
         self.inner.pid
     }
 
-    /// Whether the broker process is still alive. A dead broker cannot mint
-    /// **new** identities (already-registered personalities keep working --
-    /// the kernel refcounts them), so a supervisor can poll this to restart
-    /// it. Race-free against PID reuse: it polls the pidfd, which becomes
-    /// readable only when *this* child exits. A poll error is reported as
-    /// not-alive (conservative).
+    /// Whether the broker process is still alive. A dead broker cannot mint **new** identities (already-registered
+    /// personalities keep working -- the kernel refcounts them), so a supervisor can poll this to restart it. Race-free
+    /// against PID reuse: it polls the pidfd, which becomes readable only when *this* child exits. A poll error is
+    /// reported as not-alive (conservative).
     ///
-    /// **Alive is not the same as able to mint every identity.** [`spawn`]
-    /// sheds `CAP_SETUID`/`CAP_SETGID` from the calling process once its
-    /// child is forked, so the first broker's child holds them and every
-    /// later one in that process does not. A replacement spawned in place
-    /// serves identities needing no impersonation - the process's own, via
-    /// [`UringFs::register_self`](crate::uring_fs::UringFs::register_self) -
+    /// **Alive is not the same as able to mint every identity.** [`spawn`] sheds `CAP_SETUID`/`CAP_SETGID` from the
+    /// calling process once its child is forked, so the first broker's child holds them and every later one in that
+    /// process does not. A replacement spawned in place serves identities needing no impersonation - the process's own,
+    /// via [`UringFs::register_self`](crate::uring_fs::UringFs::register_self) -
     /// and answers `EPERM` for the rest. Restarting here recovers that much;
     /// recovering impersonation needs a fresh process.
     ///
@@ -1167,9 +939,8 @@ impl CredBroker {
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: poll over one owned pidfd, 0 timeout (non-blocking). Retry
-        // on EINTR so a signal delivered to the daemon can't make a live
-        // broker look dead.
+        // SAFETY: poll over one owned pidfd, 0 timeout (non-blocking). Retry on EINTR so a signal delivered to the
+        // daemon can't make a live broker look dead.
         let r = retry_on_eintr(|| unsafe { libc::poll(&mut pfd, 1, 0) });
         // Ok(0) = timed out, not readable -> still running. Ok(>0) (POLLIN) ->
         // exited. A non-EINTR error is treated conservatively as not-alive.
@@ -1177,8 +948,8 @@ impl CredBroker {
     }
 
     fn request(&self, op: u8, ring: u8, who: &AsUser) -> crate::Result<i64> {
-        // Sized to this request, not to MAX_GROUPS: a large cap must not
-        // put a 16 KiB array on the caller's stack for a two-group user.
+        // Sized to this request, not to MAX_GROUPS: a large cap must not put a 16 KiB array on the caller's stack for a
+        // two-group user.
         let len = HDR_LEN + 4 * who.groups.len();
         let mut req = vec![0u8; len];
         req[0] = op;
@@ -1203,35 +974,26 @@ impl CredBroker {
 
 /// One request/reply exchange, and the whole of the socket's state machine.
 ///
-/// **SECURITY: a reply names no request.** The wire is eight bytes with no
-/// sequence number, so a recv that gives up leaves the broker's answer
-/// queued and the *next* caller receives it: caller A registers uid 1000
-/// and times out while the broker replies id 7, caller B registers uid 2000
-/// and the broker mints id 8, and B is handed 7. `CredHandle::register`
-/// does only a `u16::try_from`, so `IdentityCache` then caches personality
-/// 7 under B's key and every op for uid 2000 carries uid 1000's credential
-/// snapshot, supplementary groups included - and every later reply stays
-/// shifted. The one length check cannot see it: `SOCK_SEQPACKET` always
-/// delivers the full eight bytes.
+/// **SECURITY: a reply names no request.** The wire is eight bytes with no sequence number, so a recv that gives up
+/// leaves the broker's answer queued and the *next* caller receives it: caller A registers uid 1000 and times out while
+/// the broker replies id 7, caller B registers uid 2000 and the broker mints id 8, and B is handed 7.
+/// `CredHandle::register` does only a `u16::try_from`, so `IdentityCache` then caches personality 7 under B's key and
+/// every op for uid 2000 carries uid 1000's credential snapshot, supplementary groups included - and every later reply
+/// stays shifted. The one length check cannot see it: `SOCK_SEQPACKET` always delivers the full eight bytes.
 ///
-/// There is no resynchronising without that sequence number, so the socket
-/// fails closed instead: any recv failure once the request is on the wire
-/// marks it, and every later request answers `EPROTO` rather than a reply
-/// it cannot attribute. A supervisor has [`CredBroker::is_alive`] and
-/// [`CredBroker::pid`] to act on that; a mis-attributed credential it
-/// would never see. `RECV_TIMEOUT`'s own doc names the reachable trigger:
+/// There is no resynchronising without that sequence number, so the socket fails closed instead: any recv failure once
+/// the request is on the wire marks it, and every later request answers `EPROTO` rather than a reply it cannot
+/// attribute. A supervisor has [`CredBroker::is_alive`] and [`CredBroker::pid`] to act on that; a mis-attributed
+/// credential it would never see. `RECV_TIMEOUT`'s own doc names the reachable trigger:
 /// an external cgroup freeze, which thaws and then replies.
 ///
-/// A failed *send* does not mark: `unix_dgram_sendmsg` takes its `-EAGAIN`
-/// arm before `skb_queue_tail` (`net/unix/af_unix.c`), so a send that gave
-/// up delivered nothing and nothing is owed back.
+/// A failed *send* does not mark: `unix_dgram_sendmsg` takes its `-EAGAIN` arm before `skb_queue_tail`
+/// (`net/unix/af_unix.c`), so a send that gave up delivered nothing and nothing is owed back.
 ///
-/// Neither does `ECONNRESET`. That is the one recv failure that **consumed
-/// the queue**: `recv_reply` reports it for a reply that is not eight bytes,
-/// which is either EOF - the child has gone, so nothing is coming - or a
-/// datagram it read and discarded. Either way the socket is left in step,
-/// and marking would trade broker death's own documented vocabulary (see
-/// [`RECV_TIMEOUT`]) for an `EPROTO` that says less.
+/// Neither does `ECONNRESET`. That is the one recv failure that **consumed the queue**: `recv_reply` reports it for a
+/// reply that is not eight bytes, which is either EOF - the child has gone, so nothing is coming - or a datagram it
+/// read and discarded. Either way the socket is left in step, and marking would trade broker death's own documented
+/// vocabulary (see [`RECV_TIMEOUT`]) for an `EPROTO` that says less.
 fn round_trip(sock: &mut BrokerSock, req: &[u8]) -> errno::Result<i64> {
     if sock.desynced {
         return Err(Errno::EPROTO);
@@ -1250,9 +1012,8 @@ fn round_trip(sock: &mut BrokerSock, req: &[u8]) -> errno::Result<i64> {
     if n as usize != req.len() {
         return Err(Errno::EIO);
     }
-    // Delivered. From here a reply is owed on this socket, and anything
-    // but taking it - bar the one ending that proves none is coming -
-    // leaves that reply for whoever sends next.
+    // Delivered. From here a reply is owed on this socket, and anything but taking it - bar the one ending that proves
+    // none is coming - leaves that reply for whoever sends next.
     recv_reply(sock.fd.as_raw_fd()).inspect_err(|e| {
         if *e != Errno::ECONNRESET {
             sock.desynced = true;
@@ -1264,9 +1025,7 @@ fn recv_reply(sock: RawFd) -> errno::Result<i64> {
     let mut buf = [0u8; 8];
     let n = retry_on_eintr(|| {
         // SAFETY: `buf` is a valid 8-byte destination.
-        unsafe {
-            libc::recv(sock, buf.as_mut_ptr().cast::<c_void>(), buf.len(), 0)
-        }
+        unsafe { libc::recv(sock, buf.as_mut_ptr().cast::<c_void>(), buf.len(), 0) }
     })?;
     if n as usize != buf.len() {
         // A short or empty read means the broker died mid-request.
@@ -1277,35 +1036,25 @@ fn recv_reply(sock: RawFd) -> errno::Result<i64> {
 
 /// How long a broker round trip may take before the caller gives up.
 ///
-/// Broker *death* already fails closed - the recv returns 0 and surfaces
-/// `ECONNRESET`. A **stall** did not: the socket mutex spans send and recv,
-/// so one wedged request blocked every other thread's register *and*
-/// unregister, and `IdEntry::drop` calls unregister - so any thread dropping
-/// the last `Lease`, the reactor thread included, wedged with it. There is no
-/// timeout anywhere else on this path and nothing consults `is_alive`.
+/// Broker *death* already fails closed - the recv returns 0 and surfaces `ECONNRESET`. A **stall** did not: the socket
+/// mutex spans send and recv, so one wedged request blocked every other thread's register *and* unregister, and
+/// `IdEntry::drop` calls unregister - so any thread dropping the last `Lease`, the reactor thread included, wedged with
+/// it. There is no timeout anywhere else on this path and nothing consults `is_alive`.
 ///
-/// A healthy round trip is a handful of syscalls in another process, so this
-/// is orders of magnitude above anything real: it exists to convert a
-/// permanent process-wide wedge into a per-call error, not to police
-/// latency. Reachable in-module - the child's `catch_unwind` allocates inside
-/// a fork-copied malloc arena and writes to an fd `tidy_child_fds` already
-/// closed - and from outside by a cgroup freeze, which `signal.rs` notes the
-/// broker deliberately ignores.
+/// A healthy round trip is a handful of syscalls in another process, so this is orders of magnitude above anything
+/// real: it exists to convert a permanent process-wide wedge into a per-call error, not to police latency. Reachable
+/// in-module - the child's `catch_unwind` allocates inside a fork-copied malloc arena and writes to an fd
+/// `tidy_child_fds` already closed - and from outside by a cgroup freeze, which `signal.rs` notes the broker
+/// deliberately ignores.
 ///
-/// Bounds the send too, since a child that has stopped reading wedges the
-/// mutex there instead. Giving up is not free either way - the reply it
-/// leaves behind cannot be attributed, so the socket is spent
-/// ([`round_trip`]) - which is why the value is a ceiling on the
-/// pathological rather than a latency budget.
+/// Bounds the send too, since a child that has stopped reading wedges the mutex there instead. Giving up is not free
+/// either way - the reply it leaves behind cannot be attributed, so the socket is spent ([`round_trip`]) - which is why
+/// the value is a ceiling on the pathological rather than a latency budget.
 const RECV_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound how long `recv` or `send` on `sock` may block (`opt` is
-/// `SO_RCVTIMEO` or `SO_SNDTIMEO`; both take a `timeval`).
-fn set_timeout(
-    sock: RawFd,
-    opt: libc::c_int,
-    d: Duration,
-) -> errno::Result<()> {
+/// Bound how long `recv` or `send` on `sock` may block (`opt` is `SO_RCVTIMEO` or `SO_SNDTIMEO`; both take a
+/// `timeval`).
+fn set_timeout(sock: RawFd, opt: libc::c_int, d: Duration) -> errno::Result<()> {
     let tv = libc::timeval {
         tv_sec: d.as_secs() as libc::time_t,
         tv_usec: d.subsec_micros() as libc::suseconds_t,
@@ -1340,30 +1089,25 @@ struct CapData {
     inheritable: u32,
 }
 
-/// Set the calling process's **effective** set to exactly `caps`, inside the
-/// impersonation window, leaving permitted and inheritable untouched.
+/// Set the calling process's **effective** set to exactly `caps`, inside the impersonation window, leaving permitted
+/// and inheritable untouched.
 ///
-/// Both words are written. `Caps` lives in the low word, so the high word,
-/// capabilities 32 and up such as `CAP_BPF` and `CAP_PERFMON`, is cleared.
-/// A window that left root finds it empty already, and a root window finds
-/// it full, which is why it is never left as read.
+/// Both words are written. `Caps` lives in the low word, so the high word, capabilities 32 and up such as `CAP_BPF` and
+/// `CAP_PERFMON`, is cleared.
+/// A window that left root finds it empty already, and a root window finds it full, which is why it is never left as
+/// read.
 ///
 /// Only effective is written, and that is deliberate rather than sloppy:
 ///
-/// - Effective is the set the kernel actually consults --
-///   `cap_capable_helper` tests `cap_raised(cred->cap_effective, cap)` - so
-///   it is the whole of what the snapshot needs.
-/// - Permitted **must not** be narrowed here. `capset` can only ever drop
-///   from permitted, never restore it, so trimming it inside the window
-///   would strip the broker's own `CAP_SETUID` for good and wedge every
-///   later request. Permitted is inert for authorization; nothing in an
-///   io_uring operation raises effective from it.
+/// - Effective is the set the kernel actually consults -- `cap_capable_helper` tests `cap_raised(cred->cap_effective,
+///   cap)` - so it is the whole of what the snapshot needs.
+/// - Permitted **must not** be narrowed here. `capset` can only ever drop from permitted, never restore it, so trimming
+///   it inside the window would strip the broker's own `CAP_SETUID` for good and wedge every later request. Permitted
+///   is inert for authorization; nothing in an io_uring operation raises effective from it.
 ///
-/// This works without `PR_SET_KEEPCAPS` because the window's
-/// `setresuid(uid, uid, 0)` keeps saved-uid 0: the kernel clears *permitted*
-/// only when real, effective and saved uid all leave root
-/// (`cap_emulate_setxuid`), so permitted survives the drop with effective
-/// emptied - leaving exactly the headroom this raises back.
+/// This works without `PR_SET_KEEPCAPS` because the window's `setresuid(uid, uid, 0)` keeps saved-uid 0: the kernel
+/// clears *permitted* only when real, effective and saved uid all leave root (`cap_emulate_setxuid`), so permitted
+/// survives the drop with effective emptied - leaving exactly the headroom this raises back.
 fn set_effective_caps(caps: Caps) -> errno::Result<()> {
     let mut hdr = CapHeader {
         version: VERSION_3,
@@ -1371,33 +1115,19 @@ fn set_effective_caps(caps: Caps) -> errno::Result<()> {
     };
     let mut data = [CapData::default(); 2];
     // SAFETY: capget fills two CapData words for VERSION_3.
-    Errno::result(unsafe {
-        libc::syscall(
-            libc::SYS_capget,
-            std::ptr::addr_of_mut!(hdr),
-            data.as_mut_ptr(),
-        )
-    })?;
-    // `Caps` bits are kernel capability numbers, all below 32, so the mask is
-    // the low word verbatim, and the high word holds none of them.
+    Errno::result(unsafe { libc::syscall(libc::SYS_capget, std::ptr::addr_of_mut!(hdr), data.as_mut_ptr()) })?;
+    // `Caps` bits are kernel capability numbers, all below 32, so the mask is the low word verbatim, and the high word
+    // holds none of them.
     data[0].effective = caps.bits();
     data[1].effective = 0;
     // SAFETY: capset reads the same two-word layout back.
-    Errno::result(unsafe {
-        libc::syscall(
-            libc::SYS_capset,
-            std::ptr::addr_of_mut!(hdr),
-            data.as_ptr(),
-        )
-    })?;
+    Errno::result(unsafe { libc::syscall(libc::SYS_capset, std::ptr::addr_of_mut!(hdr), data.as_ptr()) })?;
     Ok(())
 }
 
-/// Give the calling process's effective set back the whole of its permitted
-/// set, both words, as returning to euid 0 from another uid does
-/// (`cap_emulate_setxuid`, `security/commoncap.c`). A root window never
-/// leaves uid 0, so nothing else gives it back, and `capset` raises effective
-/// within permitted with no capability of its own (`cap_capset`).
+/// Give the calling process's effective set back the whole of its permitted set, both words, as returning to euid 0
+/// from another uid does (`cap_emulate_setxuid`, `security/commoncap.c`). A root window never leaves uid 0, so nothing
+/// else gives it back, and `capset` raises effective within permitted with no capability of its own (`cap_capset`).
 fn restore_effective_caps() -> errno::Result<()> {
     let mut hdr = CapHeader {
         version: VERSION_3,
@@ -1405,29 +1135,17 @@ fn restore_effective_caps() -> errno::Result<()> {
     };
     let mut data = [CapData::default(); 2];
     // SAFETY: capget fills two CapData words for VERSION_3.
-    Errno::result(unsafe {
-        libc::syscall(
-            libc::SYS_capget,
-            std::ptr::addr_of_mut!(hdr),
-            data.as_mut_ptr(),
-        )
-    })?;
+    Errno::result(unsafe { libc::syscall(libc::SYS_capget, std::ptr::addr_of_mut!(hdr), data.as_mut_ptr()) })?;
     for word in &mut data {
         word.effective = word.permitted;
     }
     // SAFETY: capset reads the same two-word layout back.
-    Errno::result(unsafe {
-        libc::syscall(
-            libc::SYS_capset,
-            std::ptr::addr_of_mut!(hdr),
-            data.as_ptr(),
-        )
-    })?;
+    Errno::result(unsafe { libc::syscall(libc::SYS_capset, std::ptr::addr_of_mut!(hdr), data.as_ptr()) })?;
     Ok(())
 }
 
-/// Drop `CAP_SETUID`/`CAP_SETGID` from every capability set of the calling
-/// process. Succeeds trivially where they were not held.
+/// Drop `CAP_SETUID`/`CAP_SETGID` from every capability set of the calling process. Succeeds trivially where they were
+/// not held.
 fn drop_setid_caps() -> errno::Result<()> {
     // `<linux/capability.h>`; `libc` exposes neither constant.
     const CAP_SETGID: u32 = 6;
@@ -1440,47 +1158,29 @@ fn drop_setid_caps() -> errno::Result<()> {
     };
     let mut data = [CapData::default(); 2];
     // SAFETY: capget fills two CapData words for VERSION_3.
-    Errno::result(unsafe {
-        libc::syscall(
-            libc::SYS_capget,
-            std::ptr::addr_of_mut!(hdr),
-            data.as_mut_ptr(),
-        )
-    })?;
+    Errno::result(unsafe { libc::syscall(libc::SYS_capget, std::ptr::addr_of_mut!(hdr), data.as_mut_ptr()) })?;
     // CAP_SETGID (6) and CAP_SETUID (7) both live in the low word.
     data[0].effective &= mask;
     data[0].permitted &= mask;
     data[0].inheritable &= mask;
     // SAFETY: capset reads the same two-word layout back.
-    Errno::result(unsafe {
-        libc::syscall(
-            libc::SYS_capset,
-            std::ptr::addr_of_mut!(hdr),
-            data.as_ptr(),
-        )
-    })?;
-    // Effective/permitted/inheritable are not the whole story: a process whose
-    // real or effective uid is 0 has its permitted set recomputed as
-    // `cap_combine(cap_bset, cap_inheritable)` on the next `execve` (the
-    // kernel's `handle_privileged_root`, security/commoncap.c), so a bounding
-    // set that still holds these caps hands them straight back after any exec.
-    // Drop them from the bounding set too, so the drop survives an exec.
+    Errno::result(unsafe { libc::syscall(libc::SYS_capset, std::ptr::addr_of_mut!(hdr), data.as_ptr()) })?;
+    // Effective/permitted/inheritable are not the whole story: a process whose real or effective uid is 0 has its
+    // permitted set recomputed as `cap_combine(cap_bset, cap_inheritable)` on the next `execve` (the kernel's
+    // `handle_privileged_root`, security/commoncap.c), so a bounding set that still holds these caps hands them
+    // straight back after any exec. Drop them from the bounding set too, so the drop survives an exec.
     //
-    // `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, which an unprivileged caller does
-    // not have. Testing `PR_CAPBSET_READ` first would not help: the bounding
-    // set of an ordinary process is *full*, so the read reports the cap present
-    // and the drop then fails `EPERM`. Key the tolerance on the uid instead,
-    // because that is what the kernel's recompute is keyed on - a reactor that
-    // is not root has nothing to regain, so a refused drop costs it nothing.
-    // A root reactor that cannot drop really has lost the guarantee this
-    // module promises, so there the error surfaces and `spawn` fails.
+    // `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, which an unprivileged caller does not have. Testing `PR_CAPBSET_READ`
+    // first would not help: the bounding set of an ordinary process is *full*, so the read reports the cap present and
+    // the drop then fails `EPERM`. Key the tolerance on the uid instead, because that is what the kernel's recompute is
+    // keyed on - a reactor that is not root has nothing to regain, so a refused drop costs it nothing.
+    // A root reactor that cannot drop really has lost the guarantee this module promises, so there the error surfaces
+    // and `spawn` fails.
     const PR_CAPBSET_DROP: libc::c_long = 24;
     let is_root = raw_getuid() == 0 || raw_geteuid() == 0;
     for cap in [CAP_SETUID, CAP_SETGID] {
         // SAFETY: prctl with scalar arguments.
-        let rc = unsafe {
-            libc::syscall(libc::SYS_prctl, PR_CAPBSET_DROP, cap as libc::c_long)
-        };
+        let rc = unsafe { libc::syscall(libc::SYS_prctl, PR_CAPBSET_DROP, cap as libc::c_long) };
         if rc != 0 {
             let e = Errno::last();
             if is_root || e != Errno::EPERM {
@@ -1497,11 +1197,10 @@ fn drop_setid_caps() -> errno::Result<()> {
 
 /// The forked child's whole life. Never returns.
 ///
-/// Deliberately allocation-free and panic-free in the request loop: the
-/// scratch buffers are allocated by the parent and moved in, every other
-/// buffer is a fixed-size stack array, and every failure becomes an errno in
-/// the reply. Errors are never logged - writing a log line inside an
-/// impersonation window would perform file I/O as the impersonated user.
+/// Deliberately allocation-free and panic-free in the request loop: the scratch buffers are allocated by the parent and
+/// moved in, every other buffer is a fixed-size stack array, and every failure becomes an errno in the reply. Errors
+/// are never logged - writing a log line inside an impersonation window would perform file I/O as the impersonated
+/// user.
 fn broker_main(
     sock: RawFd,
     ring_fds: &[RawFd],
@@ -1512,35 +1211,28 @@ fn broker_main(
     scratch: Vec<libc::gid_t>,
 ) -> ! {
     let nrings = tidy_child_fds(sock, ring_fds);
-    // Say the layout took, before anything can be asked of it. `dup2_or_die`
-    // exits for a reason the parent cannot see - a scratch target at or above
-    // `RLIMIT_NOFILE` answers `EBADF` (`ksys_dup3`, `/CODE/linux`
-    // `fs/file.c:1411-1412`), which a process holding descriptors near its
-    // soft limit at spawn time reaches - and `spawn`, whose failure is
-    // documented as fatal, must not report a completed security setup for a
-    // child that is already gone. Eight bytes on the same socket every reply
-    // rides, consumed by `spawn` before it hands back a handle.
+    // Say the layout took, before anything can be asked of it. `dup2_or_die` exits for a reason the parent cannot see -
+    // a scratch target at or above `RLIMIT_NOFILE` answers `EBADF` (`ksys_dup3`, `/CODE/linux` `fs/file.c:1411-1412`),
+    // which a process holding descriptors near its soft limit at spawn time reaches - and `spawn`, whose failure is
+    // documented as fatal, must not report a completed security setup for a child that is already gone. Eight bytes on
+    // the same socket every reply rides, consumed by `spawn` before it hands back a handle.
     if reply(SOCK_FD, 0).is_err() {
         // SAFETY: `_exit` in the forked child; no destructors, no flush.
         unsafe { libc::_exit(4) }
     }
-    // A panic inside request handling must not unwind past `_exit` and run the
-    // parent's `Drop` handlers / flush its buffers on the shared copy-on-write
-    // image. Contain it here and exit non-zero; under `panic = "abort"` the
-    // child aborts instead, which is equally safe.
-    let ok = std::panic::catch_unwind(move || {
-        broker_loop(nrings, allowed, root, req, groups, scratch)
-    })
-    .is_ok();
-    // SAFETY: `_exit` never runs atexit handlers or destructors - exactly what
-    // a forked child sharing the parent's heap image must do.
+    // A panic inside request handling must not unwind past `_exit` and run the parent's `Drop` handlers / flush its
+    // buffers on the shared copy-on-write image. Contain it here and exit non-zero; under `panic = "abort"` the child
+    // aborts instead, which is equally safe.
+    let ok = std::panic::catch_unwind(move || broker_loop(nrings, allowed, root, req, groups, scratch)).is_ok();
+    // SAFETY: `_exit` never runs atexit handlers or destructors - exactly what a forked child sharing the parent's heap
+    // image must do.
     unsafe { libc::_exit(if ok { 0 } else { 1 }) }
 }
 
 /// One validated broker request header.
 ///
-/// `Copy` and free of owned fields on purpose: the broker loop is
-/// allocation-free (see `broker_loop`), so decoding must not allocate.
+/// `Copy` and free of owned fields on purpose: the broker loop is allocation-free (see `broker_loop`), so decoding must
+/// not allocate.
 ///
 /// `pub` only so the `__fuzz` seam in the parent module can re-export it;
 /// `broker` is a private module, so this is unreachable without that seam.
@@ -1550,37 +1242,28 @@ pub struct Req {
     pub op: u8,
     /// Ring index, already checked against the broker's ring count.
     pub ring: usize,
-    /// Supplementary group count, already checked against `MAX_GROUPS` and
-    /// against the datagram's exact length.
+    /// Supplementary group count, already checked against `MAX_GROUPS` and against the datagram's exact length.
     pub ngroups: usize,
     /// The identity's uid - or, for `OP_UNREGISTER`, the personality id.
     pub uid: u32,
     /// The identity's gid.
     pub gid: u32,
-    /// Requested capabilities, already checked to be a subset of the
-    /// spawn-time ceiling, the root limit for a registration of uid 0.
+    /// Requested capabilities, already checked to be a subset of the spawn-time ceiling, the root limit for a
+    /// registration of uid 0.
     pub caps: Caps,
 }
 
-/// Decode and validate one request datagram, or return the negated errno the
-/// broker replies with.
+/// Decode and validate one request datagram, or return the negated errno the broker replies with.
 ///
-/// This is the privilege boundary: the child runs with `CAP_SETUID` and mints
-/// personalities from whatever this accepts, so every field is checked before
-/// it reaches `register_as`. Split out from `broker_loop` so the check is
-/// pure and can be driven by `fuzz/fuzz_targets/broker_request.rs`.
+/// This is the privilege boundary: the child runs with `CAP_SETUID` and mints personalities from whatever this accepts,
+/// so every field is checked before it reaches `register_as`. Split out from `broker_loop` so the check is pure and can
+/// be driven by `fuzz/fuzz_targets/broker_request.rs`.
 ///
-/// A registration of uid 0 is held to `root`, the limit
-/// [`CredBroker::spawn_with_root`] fixed, and refused `EPERM` when the
-/// broker has none. Every other request is held to `allowed`.
+/// A registration of uid 0 is held to `root`, the limit [`CredBroker::spawn_with_root`] fixed, and refused `EPERM` when
+/// the broker has none. Every other request is held to `allowed`.
 ///
 /// Allocation-free, like its caller.
-pub fn decode_request(
-    req: &[u8],
-    nrings: usize,
-    allowed: Caps,
-    root: Option<Caps>,
-) -> std::result::Result<Req, i64> {
+pub fn decode_request(req: &[u8], nrings: usize, allowed: Caps, root: Option<Caps>) -> std::result::Result<Req, i64> {
     if req.len() < HDR_LEN {
         return Err(-(libc::EINVAL as i64));
     }
@@ -1591,22 +1274,16 @@ pub fn decode_request(
     let gid = u32::from_le_bytes([req[8], req[9], req[10], req[11]]);
     let caps_bits = u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
 
-    // Exact length, not a lower bound: a datagram truncated by the fixed-size
-    // receive buffer must be refused, never read as though the missing tail
-    // were zeroes.
-    if ring >= nrings
-        || ngroups > MAX_GROUPS
-        || req.len() != HDR_LEN + 4 * ngroups
-    {
+    // Exact length, not a lower bound: a datagram truncated by the fixed-size receive buffer must be refused, never
+    // read as though the missing tail were zeroes.
+    if ring >= nrings || ngroups > MAX_GROUPS || req.len() != HDR_LEN + 4 * ngroups {
         return Err(-(libc::EINVAL as i64));
     }
-    // An unknown bit is a newer client against an older broker, or a corrupt
-    // request; either way it is not something to silently mask off, because the
-    // caller would then get a personality weaker than it asked for and discover
-    // it as an EACCES far from here.
-    // uid 0 is held to the root limit alone. The id of `OP_UNREGISTER` rides
-    // in the uid field and asks for no capability, so it stays with
-    // `allowed`.
+    // An unknown bit is a newer client against an older broker, or a corrupt request; either way it is not something to
+    // silently mask off, because the caller would then get a personality weaker than it asked for and discover it as an
+    // EACCES far from here.
+    // uid 0 is held to the root limit alone. The id of `OP_UNREGISTER` rides in the uid field and asks for no
+    // capability, so it stays with `allowed`.
     let ceiling = match (op, root) {
         (OP_REGISTER, Some(root)) if uid == 0 => root,
         (OP_REGISTER, None) if uid == 0 => return Err(-(libc::EPERM as i64)),
@@ -1614,8 +1291,7 @@ pub fn decode_request(
     };
     let caps = match Caps::from_bits(caps_bits) {
         Some(c) if ceiling.contains(c) => c,
-        // Outside the spawn-time ceiling, or not a capability this build knows
-        // how to mint.
+        // Outside the spawn-time ceiling, or not a capability this build knows how to mint.
         _ => return Err(-(libc::EPERM as i64)),
     };
     Ok(Req {
@@ -1630,35 +1306,25 @@ pub fn decode_request(
 
 /// Copy the request's `ngroups` supplementary gids into `out`.
 ///
-/// `req` must be a datagram [`decode_request`] accepted with this `ngroups`,
-/// which fixes its length at `HDR_LEN + 4 * ngroups`. Writes into the caller's
-/// scratch buffer rather than returning a `Vec`, so the broker loop stays
+/// `req` must be a datagram [`decode_request`] accepted with this `ngroups`, which fixes its length at `HDR_LEN + 4 *
+/// ngroups`. Writes into the caller's scratch buffer rather than returning a `Vec`, so the broker loop stays
 /// allocation-free.
 pub fn decode_groups(req: &[u8], ngroups: usize, out: &mut [u32]) {
     for (i, g) in out.iter_mut().take(ngroups).enumerate() {
         let at = HDR_LEN + 4 * i;
-        *g = u32::from_le_bytes([
-            req[at],
-            req[at + 1],
-            req[at + 2],
-            req[at + 3],
-        ]);
+        *g = u32::from_le_bytes([req[at], req[at + 1], req[at + 2], req[at + 3]]);
     }
 }
 
-/// The broker's request loop, split out so a panic in it is catchable at the
-/// `_exit` boundary (see [`broker_main`]).
+/// The broker's request loop, split out so a panic in it is catchable at the `_exit` boundary (see [`broker_main`]).
 ///
-/// The three scratch buffers are allocated by the **parent** before the fork
-/// and moved in here: a raw `clone3` bypasses glibc's atfork malloc mitigation,
-/// so allocating in the child could deadlock on an arena lock a concurrent
-/// thread held at fork time.
+/// The three scratch buffers are allocated by the **parent** before the fork and moved in here: a raw `clone3` bypasses
+/// glibc's atfork malloc mitigation, so allocating in the child could deadlock on an arena lock a concurrent thread
+/// held at fork time.
 ///
-/// The loop is then allocation-free, and so is leaving it: the buffers are
-/// `mem::forget`ed rather than dropped, because owning them by value means
-/// the frame's drop glue is three `free()` calls - the same arena lock, from
-/// the same child. The guarantee has to cover the return, not just the
-/// steady state.
+/// The loop is then allocation-free, and so is leaving it: the buffers are `mem::forget`ed rather than dropped, because
+/// owning them by value means the frame's drop glue is three `free()` calls - the same arena lock, from the same child.
+/// The guarantee has to cover the return, not just the steady state.
 fn broker_loop(
     nrings: usize,
     allowed: Caps,
@@ -1689,28 +1355,18 @@ fn broker_loop(
         let ring_fd = RING_FD_BASE + ring as RawFd;
 
         let res: i64 = match op {
-            // `decode_request` already refused uid 0 without a root limit,
-            // and this says so again where the window opens.
+            // `decode_request` already refused uid 0 without a root limit, and this says so again where the window
+            // opens.
             OP_REGISTER if uid != 0 || root.is_some() => {
                 decode_groups(&req[..n], ngroups, &mut groups);
-                register_as(
-                    ring_fd,
-                    uid,
-                    gid,
-                    caps,
-                    &groups[..ngroups],
-                    &mut scratch,
-                )
+                register_as(ring_fd, uid, gid, caps, &groups[..ngroups], &mut scratch)
             }
             OP_UNREGISTER => match u16::try_from(uid) {
                 // The id rides in the uid field; freeing needs no creds.
-                Ok(id) => {
-                    match crate::uring::sys::unregister_personality(ring_fd, id)
-                    {
-                        Ok(()) => 0,
-                        Err(e) => -(e as i32 as i64),
-                    }
-                }
+                Ok(id) => match crate::uring::sys::unregister_personality(ring_fd, id) {
+                    Ok(()) => 0,
+                    Err(e) => -(e as i32 as i64),
+                },
                 Err(_) => -(libc::EINVAL as i64),
             },
             _ => -(libc::EINVAL as i64),
@@ -1719,40 +1375,32 @@ fn broker_loop(
             break;
         }
     }
-    // The loop is allocation-free, but *returning* was not: these three are
-    // owned here, so the frame's drop glue is three `free()` calls - on the
-    // same arena lock the raw `clone3` may have caught held, which is the
-    // deadlock this whole design avoids. `free` is not `malloc`, but it takes
-    // that lock just the same.
+    // The loop is allocation-free, but *returning* was not: these three are owned here, so the frame's drop glue is
+    // three `free()` calls - on the same arena lock the raw `clone3` may have caught held, which is the deadlock this
+    // whole design avoids. `free` is not `malloc`, but it takes that lock just the same.
     //
-    // Leaking is free: `broker_main` `_exit`s on the next line, so the
-    // kernel reclaims the child's whole address space regardless, and
-    // nothing in this process ever reads the buffers again.
+    // Leaking is free: `broker_main` `_exit`s on the next line, so the kernel reclaims the child's whole address space
+    // regardless, and nothing in this process ever reads the buffers again.
     std::mem::forget(req);
     std::mem::forget(groups);
     std::mem::forget(scratch);
     // Returns to `broker_main`, which `_exit`s (0 on this clean shutdown).
 }
 
-/// Renumber the child's descriptors to a fixed layout - the IPC socket at
-/// [`SOCK_FD`], ring `i` at `RING_FD_BASE + i` - then close everything else
-/// it inherited. Returns the ring count.
+/// Renumber the child's descriptors to a fixed layout - the IPC socket at [`SOCK_FD`], ring `i` at `RING_FD_BASE + i` -
+/// then close everything else it inherited. Returns the ring count.
 ///
-/// The moves go through a scratch range first, because a source descriptor
-/// may already sit in a destination slot, and a direct `dup2` would clobber
-/// a descriptor not yet copied.
+/// The moves go through a scratch range first, because a source descriptor may already sit in a destination slot, and a
+/// direct `dup2` would clobber a descriptor not yet copied.
 fn tidy_child_fds(sock: RawFd, ring_fds: &[RawFd]) -> usize {
     let n = ring_fds.len();
-    // The scratch range must sit above BOTH the highest inherited source fd
-    // AND the final target range [SOCK_FD, RING_FD_BASE + n): copying down
-    // into the target must never clobber a source or a not-yet-copied ring.
-    // A fixed base would collide once the daemon had opened enough fds (TLS
-    // certs, many listeners) before creating the rings.
+    // The scratch range must sit above BOTH the highest inherited source fd AND the final target range [SOCK_FD,
+    // RING_FD_BASE + n): copying down into the target must never clobber a source or a not-yet-copied ring. A fixed
+    // base would collide once the daemon had opened enough fds (TLS certs, many listeners) before creating the rings.
     let max_src = ring_fds.iter().copied().fold(sock, |a, b| a.max(b));
     let scratch_base = max_src.max(RING_FD_BASE + n as RawFd) + 1;
-    // SAFETY: dup2/close_range on descriptors this forked child owns. A failed
-    // dup2 would leave a wrong layout (serving requests off a stray fd, or a
-    // missing ring), so `dup2_or_die` aborts the child instead.
+    // SAFETY: dup2/close_range on descriptors this forked child owns. A failed dup2 would leave a wrong layout (serving
+    // requests off a stray fd, or a missing ring), so `dup2_or_die` aborts the child instead.
     unsafe {
         dup2_or_die(sock, scratch_base);
         for (i, &fd) in ring_fds.iter().enumerate() {
@@ -1761,25 +1409,14 @@ fn tidy_child_fds(sock: RawFd, ring_fds: &[RawFd]) -> usize {
         // The target range now holds nothing we still need; copy down.
         dup2_or_die(scratch_base, SOCK_FD);
         for i in 0..n {
-            dup2_or_die(
-                scratch_base + 1 + i as RawFd,
-                RING_FD_BASE + i as RawFd,
-            );
+            dup2_or_die(scratch_base + 1 + i as RawFd, RING_FD_BASE + i as RawFd);
         }
-        // Keep ONLY the socket (SOCK_FD) and the rings; scrub everything else
-        // the child inherited - the scratch copies AND fds 0/1/2, where a
-        // daemon that closed stdio could have let a ring or the parent IPC end
-        // land (a leaked ring fd is a credential capability; a leaked parent
-        // end keeps the socket from ever reaching EOF, stranding a CAP_SETUID
-        // broker). The broker never uses stdio and never execs. A pre-5.9
-        // kernel without close_range leaves them open - best-effort; the fds
-        // are CLOEXEC-marked.
-        libc::syscall(
-            libc::SYS_close_range,
-            0u32,
-            (SOCK_FD - 1) as libc::c_uint,
-            0,
-        );
+        // Keep ONLY the socket (SOCK_FD) and the rings; scrub everything else the child inherited - the scratch copies
+        // AND fds 0/1/2, where a daemon that closed stdio could have let a ring or the parent IPC end land (a leaked
+        // ring fd is a credential capability; a leaked parent end keeps the socket from ever reaching EOF, stranding a
+        // CAP_SETUID broker). The broker never uses stdio and never execs. A pre-5.9 kernel without close_range leaves
+        // them open - best-effort; the fds are CLOEXEC-marked.
+        libc::syscall(libc::SYS_close_range, 0u32, (SOCK_FD - 1) as libc::c_uint, 0);
         libc::syscall(
             libc::SYS_close_range,
             (RING_FD_BASE + n as RawFd) as libc::c_uint,
@@ -1790,22 +1427,19 @@ fn tidy_child_fds(sock: RawFd, ring_fds: &[RawFd]) -> usize {
     n
 }
 
-/// The highest descriptor number [`tidy_child_fds`] will name for a child
-/// inheriting `n` rings whose highest inherited descriptor is `max_src`.
+/// The highest descriptor number [`tidy_child_fds`] will name for a child inheriting `n` rings whose highest inherited
+/// descriptor is `max_src`.
 ///
-/// Split out so it can be checked before the fork: `dup3` refuses a target
-/// at or above `RLIMIT_NOFILE` (`ksys_dup3`, `/CODE/linux`
-/// `fs/file.c:1411-1412`), and in the child that refusal is a `_exit`, not
-/// an error the parent can act on. The value grows with `n`, so it is what
-/// makes [`MAX_RINGS`] cost descriptors rather than nothing.
+/// Split out so it can be checked before the fork: `dup3` refuses a target at or above `RLIMIT_NOFILE` (`ksys_dup3`,
+/// `/CODE/linux` `fs/file.c:1411-1412`), and in the child that refusal is a `_exit`, not an error the parent can act
+/// on. The value grows with `n`, so it is what makes [`MAX_RINGS`] cost descriptors rather than nothing.
 fn child_fd_high_water(max_src: RawFd, n: usize) -> RawFd {
     let scratch_base = max_src.max(RING_FD_BASE + n as RawFd) + 1;
     scratch_base + n as RawFd
 }
 
-/// `dup2(from, to)` retrying `EINTR`, aborting the (forked) child on any
-/// other failure - a wrong descriptor layout must never go on to serve
-/// requests.
+/// `dup2(from, to)` retrying `EINTR`, aborting the (forked) child on any other failure - a wrong descriptor layout must
+/// never go on to serve requests.
 ///
 /// # Safety
 ///
@@ -1830,9 +1464,7 @@ unsafe fn dup2_or_die(from: RawFd, to: RawFd) {
 fn recv_request(sock: RawFd, buf: &mut [u8]) -> errno::Result<usize> {
     let n = retry_on_eintr(|| {
         // SAFETY: `buf` is a valid destination for its own length.
-        unsafe {
-            libc::recv(sock, buf.as_mut_ptr().cast::<c_void>(), buf.len(), 0)
-        }
+        unsafe { libc::recv(sock, buf.as_mut_ptr().cast::<c_void>(), buf.len(), 0) }
     })?;
     Ok(n as usize)
 }
@@ -1841,14 +1473,7 @@ fn reply(sock: RawFd, value: i64) -> errno::Result<()> {
     let buf = value.to_le_bytes();
     let n = retry_on_eintr(|| {
         // SAFETY: `buf` is a valid 8-byte source.
-        unsafe {
-            libc::send(
-                sock,
-                buf.as_ptr().cast::<c_void>(),
-                buf.len(),
-                libc::MSG_NOSIGNAL,
-            )
-        }
+        unsafe { libc::send(sock, buf.as_ptr().cast::<c_void>(), buf.len(), libc::MSG_NOSIGNAL) }
     })?;
     if n as usize != buf.len() {
         return Err(Errno::EIO);
@@ -1856,14 +1481,11 @@ fn reply(sock: RawFd, value: i64) -> errno::Result<()> {
     Ok(())
 }
 
-/// Raw `geteuid`/`getegid` - the whole credential path in the cloned broker
-/// child must use raw syscalls, never glibc's wrappers. The *setters* would
-/// otherwise SIGSETXID-broadcast across glibc's stale (fork-copied) thread
-/// list and can deadlock (this is why `register_as` uses `SYS_setres*id`
-/// directly; cf. `truens_pos` `acl_check.c`). These reads don't broadcast,
-/// but going raw keeps the security post-condition from trusting glibc not to
-/// proxy/cache the effective id after a raw `setresuid` - no glibc state in
-/// the loop, by construction.
+/// Raw `geteuid`/`getegid` - the whole credential path in the cloned broker child must use raw syscalls, never glibc's
+/// wrappers. The *setters* would otherwise SIGSETXID-broadcast across glibc's stale (fork-copied) thread list and can
+/// deadlock (this is why `register_as` uses `SYS_setres*id` directly; cf. `truens_pos` `acl_check.c`). These reads
+/// don't broadcast, but going raw keeps the security post-condition from trusting glibc not to proxy/cache the
+/// effective id after a raw `setresuid` - no glibc state in the loop, by construction.
 fn raw_geteuid() -> u32 {
     // SAFETY: `geteuid` takes no arguments and cannot fail.
     unsafe { libc::syscall(libc::SYS_geteuid) as u32 }
@@ -1879,44 +1501,30 @@ fn raw_getegid() -> u32 {
     unsafe { libc::syscall(libc::SYS_getegid) as u32 }
 }
 
-/// **The impersonation window.** Become `uid`/`gid`/`groups`, snapshot
-/// those credentials into a personality, and revert.
+/// **The impersonation window.** Become `uid`/`gid`/`groups`, snapshot those credentials into a personality, and
+/// revert.
 ///
-/// Every credential call is a *raw* syscall: glibc's wrappers implement
-/// POSIX process-wide semantics by signalling every thread, which is both
-/// unnecessary here (the broker is single-threaded) and precisely the
-/// behaviour that makes in-process impersonation unsound.
+/// Every credential call is a *raw* syscall: glibc's wrappers implement POSIX process-wide semantics by signalling
+/// every thread, which is both unnecessary here (the broker is single-threaded) and precisely the behaviour that makes
+/// in-process impersonation unsound.
 ///
-/// Ordering is load-bearing. Groups and gids are set while still
-/// privileged; the uid drop comes last and keeps **saved-uid 0** so the
-/// window can be closed again. As euid leaves 0 the kernel's setuid fixup
-/// clears the effective capability set - which is what leaves the snapshot
-/// carrying the user's authority and no `CAP_DAC_OVERRIDE`, unless `caps`
-/// asks for something the spawn-time policy allowed.
+/// Ordering is load-bearing. Groups and gids are set while still privileged; the uid drop comes last and keeps
+/// **saved-uid 0** so the window can be closed again. As euid leaves 0 the kernel's setuid fixup clears the effective
+/// capability set - which is what leaves the snapshot carrying the user's authority and no `CAP_DAC_OVERRIDE`, unless
+/// `caps` asks for something the spawn-time policy allowed.
 ///
-/// uid 0 never leaves root, so nothing clears its effective set. For it the
-/// window always writes the effective set itself, to exactly `caps`, and
-/// never takes the path that registers the broker's own credentials, which
-/// would be the broker's whole authority under the caller's name.
-/// Nothing else runs inside the window: no allocation, no logging, no
-/// fallible work that could unwind.
-fn register_as(
-    ring_fd: RawFd,
-    uid: u32,
-    gid: u32,
-    caps: Caps,
-    groups: &[u32],
-    scratch: &mut [libc::gid_t],
-) -> i64 {
-    // Registering credentials identical to the broker's own needs no
-    // privilege transition at all - and this is the path an unprivileged
-    // process takes, where `setgroups` would fail even for an unchanged
-    // list (it always demands CAP_SETGID). Never for uid 0, whose effective
-    // set the window must write, since a broker running as root matches it.
+/// uid 0 never leaves root, so nothing clears its effective set. For it the window always writes the effective set
+/// itself, to exactly `caps`, and never takes the path that registers the broker's own credentials, which would be the
+/// broker's whole authority under the caller's name.
+/// Nothing else runs inside the window: no allocation, no logging, no fallible work that could unwind.
+fn register_as(ring_fd: RawFd, uid: u32, gid: u32, caps: Caps, groups: &[u32], scratch: &mut [libc::gid_t]) -> i64 {
+    // Registering credentials identical to the broker's own needs no privilege transition at all - and this is the path
+    // an unprivileged process takes, where `setgroups` would fail even for an unchanged list (it always demands
+    // CAP_SETGID). Never for uid 0, whose effective set the window must write, since a broker running as root matches
+    // it.
     if uid != 0 && !needs_impersonation(uid, gid, groups, scratch) {
-        // No transition means no setuid fixup, so the broker's own effective
-        // set would go into the snapshot untouched. Granting capabilities
-        // here would hand out the daemon's own authority under another name.
+        // No transition means no setuid fixup, so the broker's own effective set would go into the snapshot untouched.
+        // Granting capabilities here would hand out the daemon's own authority under another name.
         if !caps.is_empty() {
             return -(libc::EPERM as i64);
         }
@@ -1926,33 +1534,21 @@ fn register_as(
         };
     }
 
-    // The window's security reasoning holds from euid 0 and from nowhere
-    // else (`cap_emulate_setxuid`, `security/commoncap.c:1132-1136`): the
-    // effective capability set is cleared only when the *old* euid was
-    // root - which is what keeps the snapshot free of the broker's own
-    // authority - and a return to euid 0 refills effective from permitted,
-    // which is what makes saved-uid 0 the way back. A broker running at
-    // another euid with CAP_SETUID raised would stamp its whole effective
-    // set into every personality and park 0 in a saved-uid `revert` then
-    // escalates into root permanently. Refuse the window rather than enter
-    // it with reasoning that does not apply; a cross-identity request from
-    // a caller with no privilege fails EPERM either way (setgroups demands
-    // CAP_SETGID).
+    // The window's security reasoning holds from euid 0 and from nowhere else (`cap_emulate_setxuid`,
+    // `security/commoncap.c:1132-1136`): the effective capability set is cleared only when the *old* euid was root -
+    // which is what keeps the snapshot free of the broker's own authority - and a return to euid 0 refills effective
+    // from permitted, which is what makes saved-uid 0 the way back. A broker running at another euid with CAP_SETUID
+    // raised would stamp its whole effective set into every personality and park 0 in a saved-uid `revert` then
+    // escalates into root permanently. Refuse the window rather than enter it with reasoning that does not apply; a
+    // cross-identity request from a caller with no privilege fails EPERM either way (setgroups demands CAP_SETGID).
     if raw_geteuid() != 0 {
         return -(libc::EPERM as i64);
     }
 
     // --- window opens ---
-    // SAFETY: raw setgroups/setresgid/setresuid on a single-threaded
-    // process; each is checked, and every exit path closes the window via
-    // `revert`.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_setgroups,
-            groups.len() as libc::size_t,
-            groups.as_ptr(),
-        )
-    };
+    // SAFETY: raw setgroups/setresgid/setresuid on a single-threaded process; each is checked, and every exit path
+    // closes the window via `revert`.
+    let rc = unsafe { libc::syscall(libc::SYS_setgroups, groups.len() as libc::size_t, groups.as_ptr()) };
     if rc < 0 {
         let e = Errno::last_raw();
         revert();
@@ -1975,26 +1571,21 @@ fn register_as(
         return -(e as i64);
     }
 
-    // Fail CLOSED: confirm the drop actually took effect before snapshotting.
-    // The kernel treats a `(uid_t)-1`/`(gid_t)-1` argument to setres*id as
-    // "leave unchanged" and returns success, so a request for uid/gid
-    // `0xFFFFFFFF` slips past the `uid != 0` guards yet leaves the broker fully
-    // root - `REGISTER_PERSONALITY` would then snapshot root creds with
-    // `CAP_DAC_OVERRIDE`. Re-reading the effective ids closes that and every
-    // future no-op/sentinel hole: a mismatch means we are not the requested
-    // identity, so refuse rather than mint a forged personality. Raw reads
-    // (see `raw_geteuid`) - no glibc between the raw `setresuid` and this
-    // check.
+    // Fail CLOSED: confirm the drop actually took effect before snapshotting. The kernel treats a
+    // `(uid_t)-1`/`(gid_t)-1` argument to setres*id as "leave unchanged" and returns success, so a request for uid/gid
+    // `0xFFFFFFFF` slips past the `uid != 0` guards yet leaves the broker fully root - `REGISTER_PERSONALITY` would
+    // then snapshot root creds with `CAP_DAC_OVERRIDE`. Re-reading the effective ids closes that and every future
+    // no-op/sentinel hole: a mismatch means we are not the requested identity, so refuse rather than mint a forged
+    // personality. Raw reads (see `raw_geteuid`) - no glibc between the raw `setresuid` and this check.
     if raw_geteuid() != uid || raw_getegid() != gid {
         revert();
         return -(libc::EINVAL as i64);
     }
 
-    // Set the *effective* set the snapshot is about to capture to exactly
-    // the requested capabilities. Ordered after the euid check on purpose,
-    // since the credentials being elevated must already be proven to be the
-    // requested identity's. uid 0 always goes through here, even asking for
-    // nothing, since its effective set is still the broker's own.
+    // Set the *effective* set the snapshot is about to capture to exactly the requested capabilities. Ordered after the
+    // euid check on purpose, since the credentials being elevated must already be proven to be the requested
+    // identity's. uid 0 always goes through here, even asking for nothing, since its effective set is still the
+    // broker's own.
     if (uid == 0 || !caps.is_empty())
         && let Err(e) = set_effective_caps(caps)
     {
@@ -2012,28 +1603,15 @@ fn register_as(
 }
 
 /// Does `who` differ from the broker's current credentials?
-fn needs_impersonation(
-    uid: u32,
-    gid: u32,
-    groups: &[u32],
-    scratch: &mut [libc::gid_t],
-) -> bool {
-    // Compare against the EFFECTIVE ids: `REGISTER_PERSONALITY` snapshots the
-    // effective/fs identity, so the skip-the-window fast path is sound only
-    // when the effective ids already match (a broker running ruid != euid --
-    // e.g. launched setuid - must not treat a real-uid match as sufficient).
-    // Raw reads only (see `raw_geteuid`).
+fn needs_impersonation(uid: u32, gid: u32, groups: &[u32], scratch: &mut [libc::gid_t]) -> bool {
+    // Compare against the EFFECTIVE ids: `REGISTER_PERSONALITY` snapshots the effective/fs identity, so the
+    // skip-the-window fast path is sound only when the effective ids already match (a broker running ruid != euid --
+    // e.g. launched setuid - must not treat a real-uid match as sufficient). Raw reads only (see `raw_geteuid`).
     if uid != raw_geteuid() || gid != raw_getegid() {
         return true;
     }
     // SAFETY: raw `getgroups` into `scratch`; its length bounds the write.
-    let n = unsafe {
-        libc::syscall(
-            libc::SYS_getgroups,
-            scratch.len() as libc::c_long,
-            scratch.as_mut_ptr(),
-        )
-    };
+    let n = unsafe { libc::syscall(libc::SYS_getgroups, scratch.len() as libc::c_long, scratch.as_mut_ptr()) };
     if n < 0 {
         return true;
     }
@@ -2042,59 +1620,46 @@ fn needs_impersonation(
 
 /// Is `groups` a different *set* from the broker's current `cur`?
 ///
-/// `true` sends the request through the impersonation window, which is always
-/// sound; a wrong `false` serves it under the *broker's* credentials. Pure
-/// over its two arguments so the property can be driven from any host --
-/// `needs_impersonation` around it reads the live process, and one with fewer
-/// than two supplementary groups cannot forge a list to compare.
+/// `true` sends the request through the impersonation window, which is always sound; a wrong `false` serves it under
+/// the *broker's* credentials. Pure over its two arguments so the property can be driven from any host --
+/// `needs_impersonation` around it reads the live process, and one with fewer than two supplementary groups cannot
+/// forge a list to compare.
 fn group_set_differs(cur: &[u32], groups: &[u32]) -> bool {
     if cur.len() != groups.len() {
         return true;
     }
-    // Equal length plus one-way containment is not set equality once a gid
-    // repeats: a request for `[1, 1]` against a current `[1, 2]` satisfies
-    // both and would take the fast path, registering the broker's *own*
-    // credentials - group 2 included - under the caller's name. A repeat is
-    // never something the fast path needs to serve, so it goes through the
-    // window, where `setgroups` installs exactly what was asked for.
-    // Quadratic over a supplementary list, and allocation-free, which the
-    // forked child requires.
-    let repeats =
-        |l: &[u32]| l.iter().enumerate().any(|(i, g)| l[..i].contains(g));
+    // Equal length plus one-way containment is not set equality once a gid repeats: a request for `[1, 1]` against a
+    // current `[1, 2]` satisfies both and would take the fast path, registering the broker's *own* credentials - group
+    // 2 included - under the caller's name. A repeat is never something the fast path needs to serve, so it goes
+    // through the window, where `setgroups` installs exactly what was asked for. Quadratic over a supplementary list,
+    // and allocation-free, which the forked child requires.
+    let repeats = |l: &[u32]| l.iter().enumerate().any(|(i, g)| l[..i].contains(g));
     if repeats(groups) || repeats(cur) {
         return true;
     }
     groups.iter().any(|g| !cur.contains(g))
 }
 
-/// Close the impersonation window. The effective capability set first, since
-/// a root window narrowed it without leaving uid 0 and `setgroups` needs
-/// `CAP_SETGID`. Done later, the gid would still come back through saved
-/// gid 0 and nothing would fail, but the broker would keep the groups of the
-/// root personality it had just minted. Then the uid, which is what restores
-/// the privilege a window that left root dropped, and then the gid and the
-/// groups.
+/// Close the impersonation window. The effective capability set first, since a root window narrowed it without leaving
+/// uid 0 and `setgroups` needs `CAP_SETGID`. Done later, the gid would still come back through saved gid 0 and nothing
+/// would fail, but the broker would keep the groups of the root personality it had just minted. Then the uid, which is
+/// what restores the privilege a window that left root dropped, and then the gid and the groups.
 fn revert() {
-    // Each call is attempted unconditionally, since a failure here is
-    // unrecoverable and must not be masked by a later success.
+    // Each call is attempted unconditionally, since a failure here is unrecoverable and must not be masked by a later
+    // success.
     let _ = restore_effective_caps();
     // SAFETY: restoring credentials via saved-uid 0.
     unsafe {
         libc::syscall(libc::SYS_setresuid, 0, 0, 0);
         libc::syscall(libc::SYS_setresgid, 0, 0, 0);
-        libc::syscall(
-            libc::SYS_setgroups,
-            0 as libc::size_t,
-            std::ptr::null::<u32>(),
-        );
+        libc::syscall(libc::SYS_setgroups, 0 as libc::size_t, std::ptr::null::<u32>());
     }
 }
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-    /// Whether a root-only test may proceed. `false` means the caller
-    /// returns without asserting; `TRUENAS_ROS_REQUIRE_ROOT` turns that skip
-    /// into a failure where CI arms it (the QEMU job, the only place this
+    /// Whether a root-only test may proceed. `false` means the caller returns without asserting;
+    /// `TRUENAS_ROS_REQUIRE_ROOT` turns that skip into a failure where CI arms it (the QEMU job, the only place this
     /// module's impersonation paths run at all).
     fn root_or_skip(what: &str) -> bool {
         if super::raw_geteuid() == 0 {
@@ -2108,32 +1673,26 @@ mod tests {
         false
     }
 
-    /// The pre-fork headroom check must be exactly the range
-    /// `tidy_child_fds` renumbers through, and must scale with the ring
-    /// count - otherwise raising `MAX_RINGS` moves a `dup3` `EBADF` into
-    /// the window after `CAP_SETUID` is shed, where no caller can act on
-    /// it.
+    /// The pre-fork headroom check must be exactly the range `tidy_child_fds` renumbers through, and must scale with
+    /// the ring count - otherwise raising `MAX_RINGS` moves a `dup3` `EBADF` into the window after `CAP_SETUID` is
+    /// shed, where no caller can act on it.
     #[test]
     fn the_child_fd_high_water_scales_with_the_ring_count() {
         // Low `max_src`: the target range itself is the floor.
         assert_eq!(child_fd_high_water(3, 1), RING_FD_BASE + 1 + 1 + 1);
-        // High `max_src`: scratch sits above it, one slot per ring plus the
-        // socket's own copy.
+        // High `max_src`: scratch sits above it, one slot per ring plus the socket's own copy.
         assert_eq!(child_fd_high_water(900, 8), 900 + 1 + 8);
         assert_eq!(child_fd_high_water(900, 16), 900 + 1 + 16);
         // Doubling MAX_RINGS costs exactly MAX_RINGS more descriptors.
         assert_eq!(
-            child_fd_high_water(900, MAX_RINGS)
-                - child_fd_high_water(900, MAX_RINGS / 2),
+            child_fd_high_water(900, MAX_RINGS) - child_fd_high_water(900, MAX_RINGS / 2),
             (MAX_RINGS / 2) as RawFd
         );
     }
 
-    /// `spawn` refuses before the fork when the layout cannot fit under
-    /// `RLIMIT_NOFILE`, rather than forking a child that `_exit`s inside
-    /// `tidy_child_fds`. Driven through the arithmetic rather than by
-    /// lowering the process limit, which every other test in this binary
-    /// shares.
+    /// `spawn` refuses before the fork when the layout cannot fit under `RLIMIT_NOFILE`, rather than forking a child
+    /// that `_exit`s inside `tidy_child_fds`. Driven through the arithmetic rather than by lowering the process limit,
+    /// which every other test in this binary shares.
     #[test]
     fn a_layout_that_cannot_fit_is_refused_not_forked() {
         let soft: u64 = 64;
@@ -2143,8 +1702,7 @@ mod tests {
             u64::from(top.unsigned_abs()) >= soft,
             "{MAX_RINGS} rings over fd 60 must not fit under a soft limit of {soft}"
         );
-        // The same daemon with one ring does fit, so the refusal is about
-        // the slice and a caller can retry.
+        // The same daemon with one ring does fit, so the refusal is about the slice and a caller can retry.
         let one = child_fd_high_water(60, 1);
         assert!(
             u64::from(one.unsigned_abs()) < soft,
@@ -2152,17 +1710,14 @@ mod tests {
         );
     }
 
-    /// Both halves of the ready handshake `spawn` consults before it hands
-    /// back a handle.
+    /// Both halves of the ready handshake `spawn` consults before it hands back a handle.
     ///
-    /// A child that dies renumbering its descriptors never sends its ready
-    /// datagram, and its socket end closes with it - so the parent's read
-    /// is a short one, which is the `ECONNRESET` broker death has always
-    /// spelled. A live child's eight bytes read back as a reply.
+    /// A child that dies renumbering its descriptors never sends its ready datagram, and its socket end closes with
+    /// it - so the parent's read is a short one, which is the `ECONNRESET` broker death has always spelled. A live
+    /// child's eight bytes read back as a reply.
     ///
-    /// The other half of the protocol - that `spawn` consumes exactly this
-    /// datagram, so the first `register` is not answered by it - is what
-    /// every brokered test in `test/uring_fs.rs` would fail on.
+    /// The other half of the protocol - that `spawn` consumes exactly this datagram, so the first `register` is not
+    /// answered by it - is what every brokered test in `test/uring_fs.rs` would fail on.
     #[test]
     fn a_child_that_dies_before_its_ready_datagram_reads_as_broker_death() {
         use std::os::fd::AsRawFd;
@@ -2180,12 +1735,7 @@ mod tests {
             };
             assert_eq!(rc, 0, "socketpair: {}", super::Errno::last());
             // SAFETY: fresh owned fds from socketpair.
-            unsafe {
-                (
-                    crate::fd::owned_from_raw(sv[0]),
-                    crate::fd::owned_from_raw(sv[1]),
-                )
-            }
+            unsafe { (crate::fd::owned_from_raw(sv[0]), crate::fd::owned_from_raw(sv[1])) }
         }
 
         let (parent, child) = pair();
@@ -2208,15 +1758,12 @@ mod tests {
 
     /// A repeated gid must not buy the no-impersonation fast path.
     ///
-    /// That path registers the broker's *own* credentials, so taking it for
-    /// a request whose group list only looks like the current one hands the
-    /// caller whatever the broker holds. Equal length plus one-way
-    /// containment satisfies `[1, 1]` against a current `[1, 2]` - same
-    /// count, every requested gid present - while the sets differ by group
+    /// That path registers the broker's *own* credentials, so taking it for a request whose group list only looks like
+    /// the current one hands the caller whatever the broker holds. Equal length plus one-way containment satisfies `[1,
+    /// 1]` against a current `[1, 2]` - same count, every requested gid present - while the sets differ by group
     /// 2. Driven on `group_set_differs` rather than on
-    /// `needs_impersonation`, which reads the live process: a host with
-    /// fewer than two supplementary groups cannot forge a list at all, and
-    /// on the QEMU lane the suite runs as root, whose only group is root.
+    /// `needs_impersonation`, which reads the live process: a host with fewer than two supplementary groups cannot
+    /// forge a list at all, and on the QEMU lane the suite runs as root, whose only group is root.
     #[test]
     fn a_repeated_gid_does_not_take_the_no_impersonation_path() {
         assert!(
@@ -2232,10 +1779,9 @@ mod tests {
         assert!(super::group_set_differs(&[1], &[1, 2]));
     }
 
-    /// The fast path is taken only on genuine set equality - swept, rather
-    /// than argued from the three clauses that implement it. Every sequence
-    /// pair over a 3-symbol alphabet up to length 3, checked against a
-    /// sorted-vector oracle that is deliberately not the shipped algorithm.
+    /// The fast path is taken only on genuine set equality - swept, rather than argued from the three clauses that
+    /// implement it. Every sequence pair over a 3-symbol alphabet up to length 3, checked against a sorted-vector
+    /// oracle that is deliberately not the shipped algorithm.
     #[test]
     fn the_group_fast_path_is_exactly_set_equality() {
         fn seqs() -> Vec<Vec<u32>> {
@@ -2257,9 +1803,8 @@ mod tests {
         let mut fast = 0usize;
         for cur in &all {
             for want in &all {
-                // The oracle: multiset equality, which for the fast path to
-                // be sound must coincide with set equality - a repeat is
-                // exactly where the two part company.
+                // The oracle: multiset equality, which for the fast path to be sound must coincide with set equality -
+                // a repeat is exactly where the two part company.
                 let (mut a, mut b) = (cur.clone(), want.clone());
                 a.sort_unstable();
                 b.sort_unstable();
@@ -2267,17 +1812,11 @@ mod tests {
                 let differs = super::group_set_differs(cur, want);
                 if !differs {
                     fast += 1;
-                    assert!(
-                        same_multiset,
-                        "fast path on unequal sets: {cur:?} vs {want:?}"
-                    );
+                    assert!(same_multiset, "fast path on unequal sets: {cur:?} vs {want:?}");
                 }
-                // A repeat on either side must never be served fast, even
-                // when the multisets do match: `setgroups` is what installs
-                // the list the caller asked for.
-                let repeats = |l: &[u32]| {
-                    l.iter().enumerate().any(|(i, g)| l[..i].contains(g))
-                };
+                // A repeat on either side must never be served fast, even when the multisets do match: `setgroups` is
+                // what installs the list the caller asked for.
+                let repeats = |l: &[u32]| l.iter().enumerate().any(|(i, g)| l[..i].contains(g));
                 if repeats(cur) || repeats(want) {
                     assert!(differs, "repeat took the fast path: {cur:?}");
                 }
@@ -2290,11 +1829,9 @@ mod tests {
     use crate::uring::ring::Ring;
     use std::mem::size_of;
 
-    /// The server-side fail-closed check in `register_as`: even if a caller
-    /// bypassed the input guards, a `(uid_t)-1` request must NOT mint a
-    /// personality - the kernel no-ops the setres*id drop, so the euid
-    /// post-condition rejects it - and the broker must be left back at root.
-    /// (Root-only: impersonation needs `CAP_SETUID`.)
+    /// The server-side fail-closed check in `register_as`: even if a caller bypassed the input guards, a `(uid_t)-1`
+    /// request must NOT mint a personality - the kernel no-ops the setres*id drop, so the euid post-condition rejects
+    /// it - and the broker must be left back at root. (Root-only: impersonation needs `CAP_SETUID`.)
     #[test]
     fn register_as_rejects_the_no_change_sentinel() {
         if !root_or_skip("register_as_rejects_the_no_change_sentinel") {
@@ -2306,30 +1843,15 @@ mod tests {
             Err(e) => panic!("Ring::new: {e}"),
         };
         let mut scratch = [0 as libc::gid_t; 8];
-        let out = register_as(
-            ring.raw_fd(),
-            u32::MAX,
-            u32::MAX,
-            Caps::empty(),
-            &[],
-            &mut scratch,
-        );
+        let out = register_as(ring.raw_fd(), u32::MAX, u32::MAX, Caps::empty(), &[], &mut scratch);
         assert!(out < 0, "sentinel uid/gid must be refused, got id {out}");
-        // The window was reverted: we are root again, able to impersonate a
-        // real (non-sentinel) uid on the same ring.
+        // The window was reverted: we are root again, able to impersonate a real (non-sentinel) uid on the same ring.
         assert_eq!(raw_geteuid(), 0, "euid restored after refusal");
-        let ok = register_as(
-            ring.raw_fd(),
-            65534,
-            65534,
-            Caps::empty(),
-            &[],
-            &mut scratch,
-        );
+        let ok = register_as(ring.raw_fd(), 65534, 65534, Caps::empty(), &[], &mut scratch);
         assert!(ok > 0, "a real uid still registers after the refusal: {ok}");
 
-        // The sentinel is refused *before* any capability is raised, so a
-        // capability request cannot smuggle one past the euid post-condition.
+        // The sentinel is refused *before* any capability is raised, so a capability request cannot smuggle one past
+        // the euid post-condition.
         let out = register_as(
             ring.raw_fd(),
             u32::MAX,
@@ -2342,14 +1864,11 @@ mod tests {
         assert_eq!(raw_geteuid(), 0, "euid restored after the caps refusal");
     }
 
-    /// `drop_setid_caps` must clear CAP_SETUID/CAP_SETGID from the **bounding
-    /// set**, not only effective/permitted/inheritable. A process whose real or
-    /// effective uid is 0 regains its bounding set into `permitted` on the next
-    /// `execve` (`handle_privileged_root`, `security/commoncap.c`), so a
-    /// bounding set that still carried these caps would undo the drop the
-    /// module promises is permanent. Root-only: the drop needs the caps present
-    /// and CAP_SETPCAP to leave the bounding set. Done in a forked child
-    /// because the drop is irreversible.
+    /// `drop_setid_caps` must clear CAP_SETUID/CAP_SETGID from the **bounding set**, not only
+    /// effective/permitted/inheritable. A process whose real or effective uid is 0 regains its bounding set into
+    /// `permitted` on the next `execve` (`handle_privileged_root`, `security/commoncap.c`), so a bounding set that
+    /// still carried these caps would undo the drop the module promises is permanent. Root-only: the drop needs the
+    /// caps present and CAP_SETPCAP to leave the bounding set. Done in a forked child because the drop is irreversible.
     #[test]
     fn drop_setid_caps_clears_the_bounding_set() {
         const CAP_SETGID: libc::c_long = 6;
@@ -2358,20 +1877,16 @@ mod tests {
         if !root_or_skip("drop_setid_caps_clears_the_bounding_set") {
             return;
         }
-        // SAFETY: fork; the child only makes async-signal-safe syscalls and
-        // `_exit`s, so it is sound from a threaded test harness.
+        // SAFETY: fork; the child only makes async-signal-safe syscalls and `_exit`s, so it is sound from a threaded
+        // test harness.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork");
         if pid == 0 {
             let ok = drop_setid_caps().is_ok();
             // SAFETY: prctl with scalar arguments.
-            let u = unsafe {
-                libc::syscall(libc::SYS_prctl, PR_CAPBSET_READ, CAP_SETUID)
-            };
+            let u = unsafe { libc::syscall(libc::SYS_prctl, PR_CAPBSET_READ, CAP_SETUID) };
             // SAFETY: prctl with scalar arguments.
-            let g = unsafe {
-                libc::syscall(libc::SYS_prctl, PR_CAPBSET_READ, CAP_SETGID)
-            };
+            let g = unsafe { libc::syscall(libc::SYS_prctl, PR_CAPBSET_READ, CAP_SETGID) };
             // SAFETY: `_exit` in a forked child; runs no destructors.
             unsafe { libc::_exit(i32::from(!(ok && u == 0 && g == 0))) }
         }
@@ -2386,18 +1901,14 @@ mod tests {
         );
     }
 
-    /// A root window writes the effective set itself, so it must write both
-    /// words exactly. Root holds capabilities in the high word too, such as
-    /// `CAP_BPF` and `CAP_PERFMON`, and a high word left as read would ride
-    /// into every root personality. `restore_effective_caps` then gives the
-    /// whole of permitted back, both words. Root-only, and in a forked child,
-    /// since it changes the process's capabilities. The high word of
-    /// permitted must hold something, or the test would prove nothing.
+    /// A root window writes the effective set itself, so it must write both words exactly. Root holds capabilities in
+    /// the high word too, such as `CAP_BPF` and `CAP_PERFMON`, and a high word left as read would ride into every root
+    /// personality. `restore_effective_caps` then gives the whole of permitted back, both words. Root-only, and in a
+    /// forked child, since it changes the process's capabilities. The high word of permitted must hold something, or
+    /// the test would prove nothing.
     #[test]
     fn set_effective_caps_writes_both_words_and_restore_gives_them_back() {
-        if !root_or_skip(
-            "set_effective_caps_writes_both_words_and_restore_gives_them_back",
-        ) {
+        if !root_or_skip("set_effective_caps_writes_both_words_and_restore_gives_them_back") {
             return;
         }
         fn read() -> Option<[CapData; 2]> {
@@ -2407,31 +1918,20 @@ mod tests {
             };
             let mut data = [CapData::default(); 2];
             // SAFETY: capget fills two CapData words for VERSION_3.
-            let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_capget,
-                    std::ptr::addr_of_mut!(hdr),
-                    data.as_mut_ptr(),
-                )
-            };
+            let rc = unsafe { libc::syscall(libc::SYS_capget, std::ptr::addr_of_mut!(hdr), data.as_mut_ptr()) };
             (rc == 0).then_some(data)
         }
-        // SAFETY: fork; the child only makes async-signal-safe syscalls and
-        // `_exit`s, so it is sound from a threaded test harness.
+        // SAFETY: fork; the child only makes async-signal-safe syscalls and `_exit`s, so it is sound from a threaded
+        // test harness.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork");
         if pid == 0 {
             let asked = Caps::CHOWN | Caps::MKNOD;
             let set = set_effective_caps(asked).is_ok();
-            let narrowed = read().is_some_and(|d| {
-                d[0].effective == asked.bits()
-                    && d[1].effective == 0
-                    && d[1].permitted != 0
-            });
+            let narrowed =
+                read().is_some_and(|d| d[0].effective == asked.bits() && d[1].effective == 0 && d[1].permitted != 0);
             let restored = restore_effective_caps().is_ok();
-            let back = read().is_some_and(|d| {
-                d.iter().all(|word| word.effective == word.permitted)
-            });
+            let back = read().is_some_and(|d| d.iter().all(|word| word.effective == word.permitted));
             let ok = set && narrowed && restored && back;
             // SAFETY: `_exit` in a forked child; runs no destructors.
             unsafe { libc::_exit(i32::from(!ok)) }
@@ -2447,14 +1947,11 @@ mod tests {
         );
     }
 
-    /// A root window narrows the broker's effective set without leaving uid
-    /// 0, so `revert` must give it back before it clears the groups, since
-    /// `setgroups` needs `CAP_SETGID`. The gid would come back anyway,
-    /// through saved gid 0, and nothing would fail, but the broker would keep
-    /// the groups of the root personality it had just minted. So the broker's
-    /// own credentials are read after the window, which must leave them as
-    /// every window does, uid and gid 0, no groups and the whole effective
-    /// set. Root-only, and in a forked child, since a window changes them.
+    /// A root window narrows the broker's effective set without leaving uid 0, so `revert` must give it back before it
+    /// clears the groups, since `setgroups` needs `CAP_SETGID`. The gid would come back anyway, through saved gid 0,
+    /// and nothing would fail, but the broker would keep the groups of the root personality it had just minted. So the
+    /// broker's own credentials are read after the window, which must leave them as every window does, uid and gid 0,
+    /// no groups and the whole effective set. Root-only, and in a forked child, since a window changes them.
     #[test]
     fn a_root_window_closes_as_every_window_does() {
         if !root_or_skip("a_root_window_closes_as_every_window_does") {
@@ -2466,32 +1963,18 @@ mod tests {
             Err(e) => panic!("Ring::new: {e}"),
         };
         fn groups(out: &mut [libc::gid_t]) -> i64 {
-            // SAFETY: raw `getgroups` into `out`, its length bounding the
-            // write.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_getgroups,
-                    out.len() as libc::c_long,
-                    out.as_mut_ptr(),
-                )
-            }
+            // SAFETY: raw `getgroups` into `out`, its length bounding the write.
+            unsafe { libc::syscall(libc::SYS_getgroups, out.len() as libc::c_long, out.as_mut_ptr()) }
         }
-        // SAFETY: fork; the child only makes async-signal-safe syscalls and
-        // `_exit`s, so it is sound from a threaded test harness.
+        // SAFETY: fork; the child only makes async-signal-safe syscalls and `_exit`s, so it is sound from a threaded
+        // test harness.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork");
         if pid == 0 {
             let mut after = [0; 8];
             let mut scratch = [0 as libc::gid_t; 8];
             let caps = Caps::DAC_OVERRIDE;
-            let id = register_as(
-                ring.raw_fd(),
-                0,
-                4400,
-                caps,
-                &[4401],
-                &mut scratch,
-            );
+            let id = register_as(ring.raw_fd(), 0, 4400, caps, &[4401], &mut scratch);
             let has = groups(&mut after);
             let mut hdr = CapHeader {
                 version: VERSION_3,
@@ -2499,20 +1982,9 @@ mod tests {
             };
             let mut data = [CapData::default(); 2];
             // SAFETY: capget fills two CapData words for VERSION_3.
-            let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_capget,
-                    std::ptr::addr_of_mut!(hdr),
-                    data.as_mut_ptr(),
-                )
-            };
-            let whole =
-                rc == 0 && data.iter().all(|w| w.effective == w.permitted);
-            let ok = id > 0
-                && raw_geteuid() == 0
-                && raw_getegid() == 0
-                && has == 0
-                && whole;
+            let rc = unsafe { libc::syscall(libc::SYS_capget, std::ptr::addr_of_mut!(hdr), data.as_mut_ptr()) };
+            let whole = rc == 0 && data.iter().all(|w| w.effective == w.permitted);
+            let ok = id > 0 && raw_geteuid() == 0 && raw_getegid() == 0 && has == 0 && whole;
             // SAFETY: `_exit` in a forked child; runs no destructors.
             unsafe { libc::_exit(i32::from(!ok)) }
         }
@@ -2527,10 +1999,9 @@ mod tests {
         );
     }
 
-    /// A registration of uid 0 is held to the root limit alone, and refused
-    /// when the broker has none, while every other request is held to the
-    /// limit for other identities. The id of an unregistration rides in the
-    /// uid field, so an id of 0 there is no root.
+    /// A registration of uid 0 is held to the root limit alone, and refused when the broker has none, while every other
+    /// request is held to the limit for other identities. The id of an unregistration rides in the uid field, so an id
+    /// of 0 there is no root.
     #[test]
     fn a_registration_of_uid_0_is_held_to_the_root_limit() {
         let request = |op: u8, uid: u32, caps: Caps| {
@@ -2541,10 +2012,8 @@ mod tests {
             req
         };
         let allowed = Caps::DAC_READ_SEARCH;
-        let decoded = |op, uid, caps, root| {
-            decode_request(&request(op, uid, caps), 1, allowed, root)
-                .map(|req| req.caps)
-        };
+        let decoded =
+            |op, uid, caps, root| decode_request(&request(op, uid, caps), 1, allowed, root).map(|req| req.caps);
         let eperm = Err(-(libc::EPERM as i64));
         assert_eq!(decoded(OP_REGISTER, 0, Caps::empty(), None), eperm);
         let root = Some(Caps::DAC_OVERRIDE | Caps::CHOWN);
@@ -2556,31 +2025,26 @@ mod tests {
         assert_eq!(unregister, Ok(Caps::empty()));
     }
 
-    /// The other half of the bounding-set drop: an unprivileged caller must
-    /// still get `Ok`.
+    /// The other half of the bounding-set drop: an unprivileged caller must still get `Ok`.
     ///
-    /// `spawn`'s contract says a process that was already unprivileged simply
-    /// has nothing to drop, and `drop_setid_caps` failing makes `spawn` fatal.
-    /// `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, and an ordinary process's
-    /// bounding set is *full* - so reading the cap first and dropping only when
-    /// present would `EPERM` here rather than skip. The uid is what the
-    /// kernel's regain path is keyed on, so it is what the tolerance is keyed
-    /// on. Root-only because it has to shed privilege to test the shed.
+    /// `spawn`'s contract says a process that was already unprivileged simply has nothing to drop, and
+    /// `drop_setid_caps` failing makes `spawn` fatal. `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, and an ordinary process's
+    /// bounding set is *full* - so reading the cap first and dropping only when present would `EPERM` here rather than
+    /// skip. The uid is what the kernel's regain path is keyed on, so it is what the tolerance is keyed on. Root-only
+    /// because it has to shed privilege to test the shed.
     #[test]
     fn drop_setid_caps_tolerates_an_unprivileged_caller() {
         if !root_or_skip("drop_setid_caps_tolerates_an_unprivileged_caller") {
             return;
         }
-        // SAFETY: fork; the child only makes async-signal-safe syscalls and
-        // `_exit`s, so it is sound from a threaded test harness.
+        // SAFETY: fork; the child only makes async-signal-safe syscalls and `_exit`s, so it is sound from a threaded
+        // test harness.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork");
         if pid == 0 {
             // Become nobody: no CAP_SETPCAP, but a still-full bounding set.
             // SAFETY: scalar arguments; the child exits either way.
-            let dropped = unsafe {
-                libc::syscall(libc::SYS_setresuid, 65534, 65534, 65534)
-            };
+            let dropped = unsafe { libc::syscall(libc::SYS_setresuid, 65534, 65534, 65534) };
             let ok = dropped == 0 && drop_setid_caps().is_ok();
             // SAFETY: `_exit` in a forked child; runs no destructors.
             unsafe { libc::_exit(i32::from(!ok)) }
@@ -2596,15 +2060,12 @@ mod tests {
         );
     }
 
-    /// **SECURITY.** A recv that gives up leaves the broker's reply on
-    /// the socket, and the wire carries nothing naming the request it
-    /// answers - so without the mark the *next* caller receives it and
-    /// `register` hands one identity another's personality.
+    /// **SECURITY.** A recv that gives up leaves the broker's reply on the socket, and the wire carries nothing naming
+    /// the request it answers - so without the mark the *next* caller receives it and `register` hands one identity
+    /// another's personality.
     ///
-    /// Both halves are here, because the mark is only worth what the
-    /// hazard is: the refusal, and then the same socket with the mark
-    /// cleared by hand, which really does answer the previous caller's
-    /// id.
+    /// Both halves are here, because the mark is only worth what the hazard is: the refusal, and then the same socket
+    /// with the mark cleared by hand, which really does answer the previous caller's id.
     #[test]
     fn a_timed_out_request_refuses_the_next_caller_not_its_reply() {
         let mut sv = [0 as RawFd; 2];
@@ -2619,40 +2080,24 @@ mod tests {
         })
         .expect("socketpair");
         // SAFETY: fresh fds from socketpair.
-        let (parent, child) = unsafe {
-            (
-                crate::fd::owned_from_raw(sv[0]),
-                crate::fd::owned_from_raw(sv[1]),
-            )
-        };
-        set_timeout(
-            parent.as_raw_fd(),
-            libc::SO_RCVTIMEO,
-            Duration::from_millis(50),
-        )
-        .expect("SO_RCVTIMEO");
+        let (parent, child) = unsafe { (crate::fd::owned_from_raw(sv[0]), crate::fd::owned_from_raw(sv[1])) };
+        set_timeout(parent.as_raw_fd(), libc::SO_RCVTIMEO, Duration::from_millis(50)).expect("SO_RCVTIMEO");
         let mut sock = BrokerSock {
             fd: parent,
             desynced: false,
         };
 
-        // A broker that does not answer in time - a cgroup freeze, say,
-        // which `RECV_TIMEOUT` names.
+        // A broker that does not answer in time - a cgroup freeze, say, which `RECV_TIMEOUT` names.
         let req = [0u8; HDR_LEN];
         let e = round_trip(&mut sock, &req).expect_err("the recv must give up");
         assert_eq!(e, Errno::EAGAIN, "SO_RCVTIMEO expiry");
         assert!(sock.desynced, "a reply is owed on this socket");
 
-        // It thaws and replies. The request was delivered, so this is a
-        // real reply - for a caller that has gone.
+        // It thaws and replies. The request was delivered, so this is a real reply - for a caller that has gone.
         reply(child.as_raw_fd(), 7).expect("the broker answers late");
 
         let e = round_trip(&mut sock, &req).expect_err("desynced must refuse");
-        assert_eq!(
-            e,
-            Errno::EPROTO,
-            "a reply that cannot be attributed is not an answer"
-        );
+        assert_eq!(e, Errno::EPROTO, "a reply that cannot be attributed is not an answer");
 
         // The control: what the refusal is standing in front of.
         sock.desynced = false;
@@ -2662,11 +2107,9 @@ mod tests {
             "the socket really does hand the previous caller's id over"
         );
 
-        // The one recv failure that consumed the queue is not a desync
-        // and keeps its own errno. Driven with a reply the broker could
-        // never send - a short datagram - because that reaches
-        // `recv_reply`'s length check with the peer still open, where a
-        // closed peer would fail at the send instead.
+        // The one recv failure that consumed the queue is not a desync and keeps its own errno. Driven with a reply the
+        // broker could never send - a short datagram - because that reaches `recv_reply`'s length check with the peer
+        // still open, where a closed peer would fail at the send instead.
         let short = [0u8; 4];
         // SAFETY: a valid 4-byte source on the child end.
         Errno::result(unsafe {
@@ -2683,21 +2126,15 @@ mod tests {
             Errno::ECONNRESET,
             "broker death must keep its own vocabulary"
         );
-        assert!(
-            !sock.desynced,
-            "a recv that consumed the queue leaves nothing stale"
-        );
+        assert!(!sock.desynced, "a recv that consumed the queue leaves nothing stale");
     }
 
-    /// Pin the kernel behaviour that shapes this whole module: an io_uring
-    /// descriptor **cannot** be passed over a unix socket. `scm_fp_copy`
-    /// rejects it with `EINVAL` (kernel commit `a4104821ad65`, Linux 6.8,
-    /// which dropped io_uring's unix-socket GC support).
+    /// Pin the kernel behaviour that shapes this whole module: an io_uring descriptor **cannot** be passed over a unix
+    /// socket. `scm_fp_copy` rejects it with `EINVAL` (kernel commit `a4104821ad65`, Linux 6.8, which dropped
+    /// io_uring's unix-socket GC support).
     ///
-    /// If this ever starts succeeding, a broker could be forked before any
-    /// ring exists and receive rings later; until then the fds must be
-    /// inherited across `fork`, which is why [`CredBroker::spawn`] takes
-    /// the reactors themselves.
+    /// If this ever starts succeeding, a broker could be forked before any ring exists and receive rings later; until
+    /// then the fds must be inherited across `fork`, which is why [`CredBroker::spawn`] takes the reactors themselves.
     #[test]
     fn io_uring_fd_cannot_cross_scm_rights() {
         let ring = match Ring::new(4) {
@@ -2717,12 +2154,7 @@ mod tests {
         })
         .unwrap();
         // SAFETY: fresh fds from socketpair.
-        let (a, b) = unsafe {
-            (
-                crate::fd::owned_from_raw(sv[0]),
-                crate::fd::owned_from_raw(sv[1]),
-            )
-        };
+        let (a, b) = unsafe { (crate::fd::owned_from_raw(sv[0]), crate::fd::owned_from_raw(sv[1])) };
 
         let payload = [0u8; 4];
         let mut cmsg_buf = [0u8; 64];
@@ -2736,17 +2168,14 @@ mod tests {
         msg.msg_iovlen = 1;
         msg.msg_control = cmsg_buf.as_mut_ptr().cast::<c_void>();
         // SAFETY: CMSG_SPACE is pure arithmetic.
-        msg.msg_controllen =
-            unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) }
-                as libc::size_t;
+        msg.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as u32) } as libc::size_t;
         let fd = ring.raw_fd();
         // SAFETY: the control buffer holds one SCM_RIGHTS cmsg for one fd.
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len =
-                libc::CMSG_LEN(size_of::<RawFd>() as u32) as libc::size_t;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as libc::size_t;
             std::ptr::copy_nonoverlapping(
                 std::ptr::addr_of!(fd).cast::<u8>(),
                 libc::CMSG_DATA(cmsg),
@@ -2756,11 +2185,7 @@ mod tests {
         // SAFETY: `msg` is fully initialized and outlives the call.
         let rc = unsafe { libc::sendmsg(a.as_raw_fd(), &msg, 0) };
         assert_eq!(rc, -1, "the kernel must refuse an io_uring fd here");
-        assert_eq!(
-            Errno::last(),
-            Errno::EINVAL,
-            "refusal is EINVAL from scm_fp_copy"
-        );
+        assert_eq!(Errno::last(), Errno::EINVAL, "refusal is EINVAL from scm_fp_copy");
         drop(b);
     }
 }

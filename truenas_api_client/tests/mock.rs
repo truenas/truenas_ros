@@ -1,12 +1,10 @@
-//! Integration tests against a scripted mock middlewared (see
-//! `support/mod.rs`): a real `ApiClient` on a real io_uring ring dialing a
-//! real unix socket, with the server side canned. Every scenario's mock
-//! asserts the two standing invariants on every frame it reads - client
-//! frames are masked, call params are Arrays - so any test that elicits a
+//! Integration tests against a scripted mock middlewared (see `support/mod.rs`): a real `ApiClient` on a real io_uring
+//! ring dialing a real unix socket, with the server side canned. Every scenario's mock asserts the two standing
+//! invariants on every frame it reads - client frames are masked, call params are Arrays - so any test that elicits a
 //! violation fails at its join.
 //!
-//! Skips (loudly under `TRUENAS_ROS_REQUIRE_IO_URING`) when io_uring is
-//! unavailable, exactly like the parent crate's net tests.
+//! Skips (loudly under `TRUENAS_ROS_REQUIRE_IO_URING`) when io_uring is unavailable, exactly like the parent crate's
+//! net tests.
 
 mod support;
 
@@ -14,8 +12,8 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use support::{Mock, Wire, serve, serve_one};
 use truenas_api_client::{
-    ApiClient, ApiConfig, ApiError, ApiEvent, CALL_BUDGET, HandshakeError,
-    MAX_CALL_RETRIES, MIN_API_VERSION, SessionOpts, params, validate_endpoint,
+    ApiClient, ApiConfig, ApiError, ApiEvent, CALL_BUDGET, HandshakeError, MAX_CALL_RETRIES, MIN_API_VERSION,
+    SessionOpts, params, validate_endpoint,
 };
 
 /// The scenario-default config against `mock`'s socket.
@@ -27,8 +25,8 @@ fn config(mock: &Mock) -> ApiConfig {
     }
 }
 
-/// The environment-skip discipline: io_uring absent is a skip, unless CI
-/// armed the REQUIRE variable; anything else is a real failure.
+/// The environment-skip discipline: io_uring absent is a skip, unless CI armed the REQUIRE variable; anything else is a
+/// real failure.
 fn client_or_skip_cfg(cfg: ApiConfig) -> Option<ApiClient> {
     match ApiClient::new(cfg) {
         Ok(c) => Some(c),
@@ -36,12 +34,7 @@ fn client_or_skip_cfg(cfg: ApiConfig) -> Option<ApiClient> {
             assert!(
                 matches!(
                     e.raw_os_error(),
-                    Some(
-                        libc::EPERM
-                            | libc::ENOSYS
-                            | libc::EACCES
-                            | libc::ENOMEM
-                    )
+                    Some(libc::EPERM | libc::ENOSYS | libc::EACCES | libc::ENOMEM)
                 ),
                 "ring setup failed for a non-environmental reason: {e}"
             );
@@ -59,25 +52,19 @@ fn client_or_skip(mock: &Mock) -> Option<ApiClient> {
     client_or_skip_cfg(config(mock))
 }
 
-/// Close a session and pump the client until the teardown completes.
-/// `close` only *queues* the WebSocket close frame; the pump is what
-/// flushes it (so a mock blocked on `expect_close` unblocks) and reaps the
-/// transport close.
+/// Close a session and pump the client until the teardown completes. `close` only *queues* the WebSocket close frame;
+/// the pump is what flushes it (so a mock blocked on `expect_close` unblocks) and reaps the transport close.
 fn shutdown(api: &mut ApiClient, sid: truenas_api_client::SessionId) {
     api.close(sid);
     while api.is_open(sid) {
-        match api
-            .pump(Some(Duration::from_secs(10)))
-            .expect("pump to close")
-        {
+        match api.pump(Some(Duration::from_secs(10))).expect("pump to close") {
             Some(_) => {}
             None => break,
         }
     }
 }
 
-/// The whole happy path: dial, upgrade, session setup observed first on
-/// the wire, one call, one typed answer.
+/// The whole happy path: dial, upgrade, session setup observed first on the wire, one call, one typed answer.
 #[test]
 fn handshake_and_ping() {
     let mock = serve_one(|mut w: Wire| {
@@ -106,10 +93,7 @@ fn non_101_fails_connect() {
         return;
     };
     match api.connect(SessionOpts::default()) {
-        Err(ApiError::Handshake(HandshakeError::NotSwitching {
-            status,
-            reason,
-        })) => {
+        Err(ApiError::Handshake(HandshakeError::NotSwitching { status, reason })) => {
             assert_eq!(status, 404);
             assert_eq!(reason, "Not Found");
         }
@@ -118,8 +102,7 @@ fn non_101_fails_connect() {
     mock.join();
 }
 
-/// A 101 whose accept digest is wrong is a refused session - the peer did
-/// not parse our key.
+/// A 101 whose accept digest is wrong is a refused session - the peer did not parse our key.
 #[test]
 fn bad_accept_fails_connect() {
     let mock = serve_one(|mut w: Wire| {
@@ -135,13 +118,10 @@ fn bad_accept_fails_connect() {
     mock.join();
 }
 
-/// middlewared's -32001 payload decodes into the typed CallError, and a
-/// -32000 is its own retryable variant.
+/// middlewared's -32001 payload decodes into the typed CallError, and a -32000 is its own retryable variant.
 ///
-/// A `-32000` is reissued rather than reported, so the caller only hears
-/// about it once the reissues are spent - which is what the repeated
-/// refusals below are: the same call arriving again, under its own id,
-/// after each backoff.
+/// A `-32000` is reissued rather than reported, so the caller only hears about it once the reissues are spent - which
+/// is what the repeated refusals below are: the same call arriving again, under its own id, after each backoff.
 #[test]
 fn call_error_envelope() {
     let mock = serve_one(|mut w: Wire| {
@@ -164,8 +144,7 @@ fn call_error_envelope() {
                 "extra": [["pool_create.name", "Invalid name", 22]]
             })),
         );
-        // Refuse every reissue, then one more: the last is the one the
-        // caller is told about.
+        // Refuse every reissue, then one more: the last is the one the caller is told about.
         for _ in 0..=MAX_CALL_RETRIES {
             let (id, _) = w.expect_call("pool.create");
             w.respond_err(&id, -32000, "Too many concurrent calls", None);
@@ -198,9 +177,8 @@ fn call_error_envelope() {
     mock.join();
 }
 
-/// collection_update and notify_unsubscribed decode and dispatch - both
-/// carry *named* params (middlewared notifies by-name even though it
-/// rejects by-name inbound).
+/// collection_update and notify_unsubscribed decode and dispatch - both carry *named* params (middlewared notifies
+/// by-name even though it rejects by-name inbound).
 #[test]
 fn notification_dispatch() {
     let mock = serve_one(|mut w: Wire| {
@@ -235,10 +213,7 @@ fn notification_dispatch() {
             assert_eq!(update.msg, "changed");
             assert_eq!(update.collection, "core.get_jobs");
             assert_eq!(update.id, Some(json!(17)));
-            assert_eq!(
-                update.fields.as_ref().and_then(|f| f.get("progress")),
-                Some(&json!(40))
-            );
+            assert_eq!(update.fields.as_ref().and_then(|f| f.get("progress")), Some(&json!(40)));
         }
         other => panic!("expected CollectionUpdate, got {other:?}"),
     }
@@ -267,8 +242,7 @@ fn notification_dispatch() {
     mock.join();
 }
 
-/// Unprompted pushes flow with zero calls in flight - the API-level twin
-/// of the parent crate's read-gate liveness pin.
+/// Unprompted pushes flow with zero calls in flight - the API-level twin of the parent crate's read-gate liveness pin.
 #[test]
 fn notifications_flow_without_calls() {
     const PUSHES: usize = 5;
@@ -297,8 +271,7 @@ fn notifications_flow_without_calls() {
     mock.join();
 }
 
-/// A multi-megabyte single-frame result (64-bit length form) arrives
-/// intact through the placement path.
+/// A multi-megabyte single-frame result (64-bit length form) arrives intact through the placement path.
 #[test]
 fn big_inbound_frame() {
     const BIG: usize = 8 * 1024 * 1024;
@@ -312,24 +285,21 @@ fn big_inbound_frame() {
         return;
     };
     let sid = api.connect(SessionOpts::default()).expect("connect");
-    let got: String =
-        api.call(sid, "config.download", &params!()).expect("call");
+    let got: String = api.call(sid, "config.download", &params!()).expect("call");
     assert_eq!(got.len(), BIG);
     assert!(got.bytes().all(|b| b == b'x'));
     shutdown(&mut api, sid);
     mock.join();
 }
 
-/// A response fragmented across three continuations, with a ping injected
-/// between fragments: the pong goes out mid-reassembly and the reassembled
-/// message completes the call.
+/// A response fragmented across three continuations, with a ping injected between fragments: the pong goes out
+/// mid-reassembly and the reassembled message completes the call.
 #[test]
 fn fragmented_message_with_interleaved_ping() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
         let (id, _) = w.expect_call("core.ping");
-        let msg =
-            json!({ "jsonrpc": "2.0", "result": "pong", "id": id }).to_string();
+        let msg = json!({ "jsonrpc": "2.0", "result": "pong", "id": id }).to_string();
         let bytes = msg.as_bytes();
         let (a, rest) = bytes.split_at(bytes.len() / 3);
         let (b, c) = rest.split_at(rest.len() / 2);
@@ -337,8 +307,8 @@ fn fragmented_message_with_interleaved_ping() {
         w.send_ping(b"mid-frag");
         w.send_frame(0x0, false, b);
         w.send_frame(0x0, true, c);
-        // The pong must arrive (read_text_json would also skip it; read
-        // the frame explicitly to assert its payload echoes).
+        // The pong must arrive (read_text_json would also skip it; read the frame explicitly to assert its payload
+        // echoes).
         let (opcode, _fin, payload) = w.read_frame();
         assert_eq!(opcode, 0xA, "a pong answers the ping");
         assert_eq!(payload, b"mid-frag");
@@ -353,9 +323,8 @@ fn fragmented_message_with_interleaved_ping() {
     mock.join();
 }
 
-/// A hundred pings answered without wedging anything - the
-/// `awaiting`-FIFO analysis pinned at the API level - and a call still
-/// round-trips afterwards.
+/// A hundred pings answered without wedging anything - the `awaiting`-FIFO analysis pinned at the API level - and a
+/// call still round-trips afterwards.
 #[test]
 fn ping_flood_never_wedges() {
     const FLOOD: usize = 100;
@@ -377,13 +346,11 @@ fn ping_flood_never_wedges() {
     mock.join();
 }
 
-/// An oversized outbound message is refused before the wire - middlewared
-/// would close the whole connection - and the session keeps serving.
+/// An oversized outbound message is refused before the wire - middlewared would close the whole connection - and the
+/// session keeps serving.
 ///
-/// The method has to be one middlewared does *not* exempt: it grants the
-/// extended cap per method, after parsing, so 70 KiB under
-/// `filesystem.file_receive` is a message the server accepts and this
-/// client must not refuse.
+/// The method has to be one middlewared does *not* exempt: it grants the extended cap per method, after parsing, so 70
+/// KiB under `filesystem.file_receive` is a message the server accepts and this client must not refuse.
 #[test]
 fn oversize_outbound_refused() {
     let mock = serve_one(|mut w: Wire| {
@@ -410,8 +377,8 @@ fn oversize_outbound_refused() {
     mock.join();
 }
 
-/// The server killing the connection mid-call (the close 1009 shape) fails
-/// the call with the close reason and surfaces the session's end.
+/// The server killing the connection mid-call (the close 1009 shape) fails the call with the close reason and surfaces
+/// the session's end.
 #[test]
 fn server_close_mid_call() {
     let mock = serve_one(|mut w: Wire| {
@@ -442,30 +409,25 @@ fn server_close_mid_call() {
     mock.join();
 }
 
-/// A timed-out call surfaces `Timeout`, its late answer is dropped
-/// silently, and the session keeps working.
+/// A timed-out call surfaces `Timeout`, its late answer is dropped silently, and the session keeps working.
 ///
-/// The mock never *withholds* the fresh call's answer - a mock is
-/// sequential, so sleeping before reading the fresh call would time the
-/// fresh call out too, which is a test artifact, not the behavior under
-/// test. Instead it reads the slow call, waits for the fresh call (the
-/// client sends it only after the slow one times out), answers the fresh
-/// one at once, and answers the slow one *late* - the abandoned answer
-/// the session must swallow.
+/// The mock never *withholds* the fresh call's answer - a mock is sequential, so sleeping before reading the fresh call
+/// would time the fresh call out too, which is a test artifact, not the behavior under test. Instead it reads the slow
+/// call, waits for the fresh call (the client sends it only after the slow one times out), answers the fresh one at
+/// once, and answers the slow one *late* - the abandoned answer the session must swallow.
 #[test]
 fn call_timeout_abandons() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
         let (slow_id, _) = w.expect_call("slow.method");
-        // Blocks until the client, having abandoned the slow call, sends
-        // this one - so answering it now is well inside its own deadline.
+        // Blocks until the client, having abandoned the slow call, sends this one - so answering it now is well inside
+        // its own deadline.
         let (fresh_id, _) = w.expect_call("fast.method");
         w.respond_ok(&fresh_id, json!("fresh"));
         // The abandoned call's answer, arriving after the client gave up.
         w.respond_ok(&slow_id, json!("late"));
-        // Stay up until the client closes, so a mock-initiated EOF does
-        // not race the "late answer is swallowed" check with a
-        // SessionClosed.
+        // Stay up until the client closes, so a mock-initiated EOF does not race the "late answer is swallowed" check
+        // with a SessionClosed.
         w.expect_close();
     });
     let cfg = ApiConfig {
@@ -481,13 +443,10 @@ fn call_timeout_abandons() {
         Err(ApiError::Timeout) => {}
         other => panic!("expected Timeout, got {other:?}"),
     }
-    let fresh: String = api
-        .call(sid, "fast.method", &params!())
-        .expect("fresh call");
+    let fresh: String = api.call(sid, "fast.method", &params!()).expect("fresh call");
     assert_eq!(fresh, "fresh");
-    // The late answer to the abandoned call is swallowed: pumping now
-    // surfaces no CallDone (the session stays open - the mock holds it
-    // until we close).
+    // The late answer to the abandoned call is swallowed: pumping now surfaces no CallDone (the session stays open -
+    // the mock holds it until we close).
     match api.pump(Some(Duration::from_millis(200))).expect("pump") {
         None => {}
         Some(ApiEvent::CallDone { .. }) => {
@@ -499,31 +458,27 @@ fn call_timeout_abandons() {
     mock.join();
 }
 
-/// The per-session legacy opt-out: no core.set_options on the wire, and a
-/// job method's result is the bare integer job id.
+/// The per-session legacy opt-out: no core.set_options on the wire, and a job method's result is the bare integer job
+/// id.
 #[test]
 fn job_id_when_legacy() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_upgrade("/api/current");
-        // The FIRST call must be the job itself - an expect_call of it
-        // fails if a set_options snuck in ahead.
+        // The FIRST call must be the job itself - an expect_call of it fails if a set_options snuck in ahead.
         let (id, _) = w.expect_call("update.run");
         w.respond_ok(&id, json!(42));
     });
     let Some(mut api) = client_or_skip(&mock) else {
         return;
     };
-    let sid = api
-        .connect(SessionOpts::default().legacy_jobs())
-        .expect("connect");
+    let sid = api.connect(SessionOpts::default().legacy_jobs()).expect("connect");
     let job: i64 = api.call(sid, "update.run", &params!()).expect("job call");
     assert_eq!(job, 42);
     shutdown(&mut api, sid);
     mock.join();
 }
 
-/// Two sessions on one client: answers and events route by session, and a
-/// slow call on one never blocks the other.
+/// Two sessions on one client: answers and events route by session, and a slow call on one never blocks the other.
 #[test]
 fn multi_session_isolation() {
     let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
@@ -536,9 +491,8 @@ fn multi_session_isolation() {
                 .recv_timeout(Duration::from_secs(10))
                 .expect("fast session finished first");
             w.respond_ok(&id, json!("slow-done"));
-            // Stay up until the client closes, so the reply is not raced
-            // by a mock-initiated EOF (which would surface as a
-            // SessionClosed ahead of the CallDone).
+            // Stay up until the client closes, so the reply is not raced by a mock-initiated EOF (which would surface
+            // as a SessionClosed ahead of the CallDone).
             w.expect_close();
         }),
         Box::new(move |mut w: Wire| {
@@ -556,11 +510,8 @@ fn multi_session_isolation() {
     let s1 = api.connect(SessionOpts::default()).expect("s1");
     let s2 = api.connect(SessionOpts::default()).expect("s2");
 
-    let slow = api
-        .call_start(s1, "slow.method", &params!())
-        .expect("start");
-    let fast: String =
-        api.call(s2, "fast.method", &params!()).expect("fast call");
+    let slow = api.call_start(s1, "slow.method", &params!()).expect("start");
+    let fast: String = api.call(s2, "fast.method", &params!()).expect("fast call");
     assert_eq!(fast, "fast-done");
 
     match api.pump(Some(Duration::from_secs(10))).expect("pump") {
@@ -576,9 +527,8 @@ fn multi_session_isolation() {
     mock.join();
 }
 
-/// subscribe/unsubscribe round-trip: the server ident is held internally,
-/// events dispatch while subscribed, and the unsubscribe carries the same
-/// ident back.
+/// subscribe/unsubscribe round-trip: the server ident is held internally, events dispatch while subscribed, and the
+/// unsubscribe carries the same ident back.
 #[test]
 fn subscribe_unsubscribe_round_trip() {
     let mock = serve_one(|mut w: Wire| {
@@ -603,9 +553,7 @@ fn subscribe_unsubscribe_round_trip() {
     };
     let sid = api.connect(SessionOpts::default()).expect("connect");
 
-    let call = api
-        .subscribe_start(sid, "core.get_jobs")
-        .expect("subscribe");
+    let call = api.subscribe_start(sid, "core.get_jobs").expect("subscribe");
     let sub = match api.pump(Some(Duration::from_secs(10))).expect("pump") {
         Some(ApiEvent::SubscriptionReady { call: c, sub }) => {
             assert_eq!(c, call);
@@ -631,8 +579,8 @@ fn subscribe_unsubscribe_round_trip() {
     mock.join();
 }
 
-/// call_start returns before any answer exists, and completions arrive
-/// through the pump - the non-blocking contract, pinned.
+/// call_start returns before any answer exists, and completions arrive through the pump - the non-blocking contract,
+/// pinned.
 #[test]
 fn call_start_is_non_blocking() {
     let (got_call_tx, got_call_rx) = std::sync::mpsc::channel::<()>();
@@ -652,13 +600,11 @@ fn call_start_is_non_blocking() {
     let sid = api.connect(SessionOpts::default()).expect("connect");
 
     let call = api.call_start(sid, "core.ping", &params!()).expect("start");
-    // Not yet answered: the mock is holding the reply hostage. Pump long
-    // enough for the send to flush so the mock can even see the call.
+    // Not yet answered: the mock is holding the reply hostage. Pump long enough for the send to flush so the mock can
+    // even see the call.
     while got_call_rx.try_recv().is_err() {
         assert!(
-            api.pump(Some(Duration::from_millis(50)))
-                .expect("pump")
-                .is_none(),
+            api.pump(Some(Duration::from_millis(50))).expect("pump").is_none(),
             "no event can exist before the mock answers"
         );
     }
@@ -675,38 +621,27 @@ fn call_start_is_non_blocking() {
     mock.join();
 }
 
-/// A timed-out call returns its concurrency slot. `CALL_BUDGET` calls the
-/// server never answers, all timed out locally, must not leave the session
-/// unable to send anything further: the caller has just been handed
-/// `Timeout` for each and is entitled to issue more.
+/// A timed-out call returns its concurrency slot. `CALL_BUDGET` calls the server never answers, all timed out locally,
+/// must not leave the session unable to send anything further: the caller has just been handed `Timeout` for each and
+/// is entitled to issue more.
 ///
-/// Under the defect this covers, the call after the timeouts is accepted
-/// (`call_start` answers `Ok`) but never reaches the wire, so the mock's
-/// `expect_call("after.timeouts")` reads the close frame instead and
-/// panics - a failure, not a hang.
+/// Under the defect this covers, the call after the timeouts is accepted (`call_start` answers `Ok`) but never reaches
+/// the wire, so the mock's `expect_call("after.timeouts")` reads the close frame instead and panics - a failure, not a
+/// hang.
 #[test]
 fn a_timed_out_call_returns_its_budget_slot() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
         // Fill the budget and answer none of it.
-        let ids: Vec<_> = (0..CALL_BUDGET)
-            .map(|_| w.expect_call("core.ping").0)
-            .collect();
-        // A call issued after every one of those timed out must NOT
-        // reach the wire: this server is still holding all eight, and
-        // being told nothing by the client giving up.
-        // Long enough to cover the client's submission (which follows
-        // the 250 ms timeouts) and short enough that the answer below
-        // still beats that submission's own deadline.
-        let quiet =
-            w.count_client_text_frames_until_quiet(Duration::from_millis(350));
-        assert_eq!(
-            quiet, 0,
-            "the client sent more while the server held every slot"
-        );
-        // Answering one is what frees a slot - and the tombstone for that
-        // long-abandoned call must still correlate, or this answer faults
-        // the session instead of releasing the queue.
+        let ids: Vec<_> = (0..CALL_BUDGET).map(|_| w.expect_call("core.ping").0).collect();
+        // A call issued after every one of those timed out must NOT reach the wire: this server is still holding all
+        // eight, and being told nothing by the client giving up.
+        // Long enough to cover the client's submission (which follows the 250 ms timeouts) and short enough that the
+        // answer below still beats that submission's own deadline.
+        let quiet = w.count_client_text_frames_until_quiet(Duration::from_millis(350));
+        assert_eq!(quiet, 0, "the client sent more while the server held every slot");
+        // Answering one is what frees a slot - and the tombstone for that long-abandoned call must still correlate, or
+        // this answer faults the session instead of releasing the queue.
         w.respond_ok(&ids[0], json!(null));
         let (id, _) = w.expect_call("after.timeouts");
         w.respond_ok(&id, json!("sent-after-a-slot-came-back"));
@@ -745,8 +680,7 @@ fn a_timed_out_call_returns_its_budget_slot() {
     loop {
         match api.pump(Some(Duration::from_secs(10))).expect("pump") {
             Some(ApiEvent::CallDone { call, result }) if call == after => {
-                let got: String =
-                    result.expect("answered").decode().expect("a string");
+                let got: String = result.expect("answered").decode().expect("a string");
                 assert_eq!(got, "sent-after-a-slot-came-back");
                 break;
             }
@@ -760,15 +694,12 @@ fn a_timed_out_call_returns_its_budget_slot() {
     mock.join();
 }
 
-/// `core.set_options`' answer is the authority on what is in force, not the
-/// request. A server that answers `legacy_jobs: true` after this session
-/// asked for modern answering must fail setup, because every job call's
-/// result would then be the job's integer id where the caller expects the
-/// job's result — a silently wrong value, not an error.
+/// `core.set_options`' answer is the authority on what is in force, not the request. A server that answers
+/// `legacy_jobs: true` after this session asked for modern answering must fail setup, because every job call's result
+/// would then be the job's integer id where the caller expects the job's result — a silently wrong value, not an error.
 ///
-/// The reference Python client reads the same echo
-/// (`truenas/api_client`, the `_set_options_call` arm) rather than trusting
-/// its own request.
+/// The reference Python client reads the same echo (`truenas/api_client`, the `_set_options_call` arm) rather than
+/// trusting its own request.
 #[test]
 fn a_set_options_echo_contradicting_the_request_fails_setup() {
     let mock = serve_one(|mut w: Wire| {
@@ -783,21 +714,15 @@ fn a_set_options_echo_contradicting_the_request_fails_setup() {
     };
     match api.connect(SessionOpts::default()) {
         Err(ApiError::Protocol(what)) => {
-            assert!(
-                what.contains("legacy_jobs"),
-                "the refusal names the option: {what}"
-            );
+            assert!(what.contains("legacy_jobs"), "the refusal names the option: {what}");
         }
         other => panic!("expected a Protocol refusal, got {other:?}"),
     }
 }
 
-/// A silent echo is a refusal too, and for a sharper reason than a
-/// contradicting one: every API version that honours `legacy_jobs`
-/// answers with a required object, so the only versions that answer
-/// nothing are the ones that dropped the option and left
-/// `App.legacy_jobs` at `true`. Proceeding there decodes every job's
-/// integer id as the caller's result.
+/// A silent echo is a refusal too, and for a sharper reason than a contradicting one: every API version that honours
+/// `legacy_jobs` answers with a required object, so the only versions that answer nothing are the ones that dropped the
+/// option and left `App.legacy_jobs` at `true`. Proceeding there decodes every job's integer id as the caller's result.
 #[test]
 fn a_set_options_echo_without_the_member_fails_setup() {
     for echo in [json!(null), json!({ "py_exceptions": false })] {
@@ -810,17 +735,16 @@ fn a_set_options_echo_without_the_member_fails_setup() {
             return;
         };
         match api.connect(SessionOpts::default()) {
-            Err(ApiError::Protocol(what)) => assert!(
-                what.contains("legacy_jobs"),
-                "the refusal names the option: {what}"
-            ),
+            Err(ApiError::Protocol(what)) => {
+                assert!(what.contains("legacy_jobs"), "the refusal names the option: {what}")
+            }
             other => panic!("expected a Protocol refusal, got {other:?}"),
         }
     }
 }
 
-/// The positive control for both refusals above: the echo middlewared
-/// actually sends opens the session and serves a call.
+/// The positive control for both refusals above: the echo middlewared actually sends opens the session and serves a
+/// call.
 #[test]
 fn the_echo_middlewared_sends_opens_the_session() {
     let mock = serve_one(|mut w: Wire| {
@@ -839,10 +763,9 @@ fn the_echo_middlewared_sends_opens_the_session() {
     mock.join();
 }
 
-/// A `{:?}` on an event is how a consumer's log gets written, and a
-/// method's result is whatever it asked middlewared for. Report the size,
-/// not the content - the line middlewared itself draws between the caller
-/// and the audit record (`api/base/handler/remove_secrets.py`).
+/// A `{:?}` on an event is how a consumer's log gets written, and a method's result is whatever it asked middlewared
+/// for. Report the size, not the content - the line middlewared itself draws between the caller and the audit record
+/// (`api/base/handler/remove_secrets.py`).
 #[test]
 fn debug_on_an_event_does_not_print_the_server_result() {
     const SECRET: &str = "s3cr3t-token-do-not-log";
@@ -865,21 +788,15 @@ fn debug_on_an_event_does_not_print_the_server_result() {
         return;
     };
     let sid = api.connect(SessionOpts::default()).expect("connect");
-    let call = api
-        .call_start(sid, "auth.generate_token", &params!())
-        .expect("send");
+    let call = api.call_start(sid, "auth.generate_token", &params!()).expect("send");
     let mut seen_call = false;
     let mut seen_update = false;
     while !(seen_call && seen_update) {
-        let Some(ev) = api.pump(Some(Duration::from_secs(10))).expect("pump")
-        else {
+        let Some(ev) = api.pump(Some(Duration::from_secs(10))).expect("pump") else {
             panic!("timed out waiting for both events")
         };
         let printed = format!("{ev:?}");
-        assert!(
-            !printed.contains(SECRET),
-            "Debug leaked the payload: {printed}"
-        );
+        assert!(!printed.contains(SECRET), "Debug leaked the payload: {printed}");
         match &ev {
             ApiEvent::CallDone { call: c, result } => {
                 assert_eq!(*c, call);
@@ -892,12 +809,7 @@ fn debug_on_an_event_does_not_print_the_server_result() {
             }
             ApiEvent::CollectionUpdate { update, .. } => {
                 assert!(
-                    update
-                        .fields
-                        .as_ref()
-                        .expect("fields")
-                        .to_string()
-                        .contains(SECRET),
+                    update.fields.as_ref().expect("fields").to_string().contains(SECRET),
                     "the value itself must survive"
                 );
                 seen_update = true;
@@ -909,11 +821,9 @@ fn debug_on_an_event_does_not_print_the_server_result() {
     mock.join();
 }
 
-/// `Instant + Duration` panics on overflow and the durations here are
-/// the caller's: `Duration::MAX` is an ordinary way to spell "wait as
-/// long as it takes", and a library must not abort the process over it.
-/// An unrepresentable deadline is no deadline, which is what `None`
-/// already means on every one of these paths.
+/// `Instant + Duration` panics on overflow and the durations here are the caller's: `Duration::MAX` is an ordinary way
+/// to spell "wait as long as it takes", and a library must not abort the process over it. An unrepresentable deadline
+/// is no deadline, which is what `None` already means on every one of these paths.
 #[test]
 fn an_unrepresentable_timeout_is_no_timeout() {
     let mock = serve_one(|mut w: Wire| {
@@ -931,8 +841,8 @@ fn an_unrepresentable_timeout_is_no_timeout() {
         return;
     };
     let sid = api.connect(SessionOpts::default()).expect("connect");
-    // And on `pump`'s own argument: an answer is on its way, so an
-    // unrepresentable bound waits for it instead of aborting.
+    // And on `pump`'s own argument: an answer is on its way, so an unrepresentable bound waits for it instead of
+    // aborting.
     let call = api.call_start(sid, "core.ping", &params!()).expect("send");
     match api.pump(Some(Duration::MAX)).expect("pump") {
         Some(ApiEvent::CallDone { call: c, result }) => {
@@ -945,29 +855,24 @@ fn an_unrepresentable_timeout_is_no_timeout() {
     mock.join();
 }
 
-/// Every route that removes a session drains `pending` first, so a call
-/// the session accepted is answered rather than stranded.
+/// Every route that removes a session drains `pending` first, so a call the session accepted is answered rather than
+/// stranded.
 ///
-/// This is the surviving half of what `Phase::Setup` made
-/// unconstructible. `call_start` now refuses until the setup echo lands,
-/// so no caller call can be in flight when `Act::SetupFailed` or
-/// `Act::Failed` fires - but the property those two routes were given
-/// `fail_session` for is about *every* removal route, and `Act::Fault`
-/// reaches a session that is fully open with real work outstanding.
+/// This is the surviving half of what `Phase::Setup` made unconstructible. `call_start` now refuses until the setup
+/// echo lands, so no caller call can be in flight when `Act::SetupFailed` or `Act::Failed` fires - but the property
+/// those two routes were given `fail_session` for is about *every* removal route, and `Act::Fault` reaches a session
+/// that is fully open with real work outstanding.
 ///
-/// Strand it and `ApiClient::call` waits on a `CallDone` that can never
-/// come, for as long as `call_timeout` allows - which is for ever by
-/// default. `SessionClosed` does not substitute: `wait_for`'s predicate
-/// is per-event, so a session-level report is stashed as a skipped event
-/// rather than delivered as the call's answer.
+/// Strand it and `ApiClient::call` waits on a `CallDone` that can never come, for as long as `call_timeout` allows -
+/// which is for ever by default. `SessionClosed` does not substitute: `wait_for`'s predicate is per-event, so a
+/// session-level report is stashed as a skipped event rather than delivered as the call's answer.
 #[test]
 fn a_faulted_session_answers_the_call_it_accepted() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
         let (_id, _) = w.expect_call("slow.method");
-        // An answer naming a call that was never made: JSON-RPC has no
-        // reading of it, so the session faults with the real call still
-        // outstanding.
+        // An answer naming a call that was never made: JSON-RPC has no reading of it, so the session faults with the
+        // real call still outstanding.
         w.respond_ok(&json!(999_999), json!(null));
         let _ = w.read_frame_or_eof();
     });
@@ -983,9 +888,7 @@ fn a_faulted_session_answers_the_call_it_accepted() {
     let mut closed = false;
     for _ in 0..50 {
         match api.pump(Some(Duration::from_millis(200))) {
-            Ok(Some(ApiEvent::CallDone { call: c, result })) if c == call => {
-                answered = Some(result)
-            }
+            Ok(Some(ApiEvent::CallDone { call: c, result })) if c == call => answered = Some(result),
             Ok(Some(ApiEvent::SessionClosed { session, reason })) => {
                 assert_eq!(session, sid);
                 assert!(
@@ -1007,33 +910,26 @@ fn a_faulted_session_answers_the_call_it_accepted() {
         other => panic!("the accepted call must be failed, got {other:?}"),
     }
     assert!(!api.is_open(sid));
-    // Dropped before the join: the fault's `close_now` is what gives the
-    // script its EOF, and the script is blocked in `read_frame_or_eof`
-    // waiting for it.
+    // Dropped before the join: the fault's `close_now` is what gives the script its EOF, and the script is blocked in
+    // `read_frame_or_eof` waiting for it.
     drop(api);
     mock.join();
 }
 
-/// No caller's call joins a session whose setup has not answered, and a
-/// setup that then fails still reports itself.
+/// No caller's call joins a session whose setup has not answered, and a setup that then fails still reports itself.
 ///
-/// `connect_start` promises calls before ready are refused, and the
-/// window this closes is the one where they were not: `Phase::Open` used
-/// to be set at the `101`, with `core.set_options` still outstanding. In
-/// that window the peer's `App.legacy_jobs` is at its default of `true`
-/// (`api/base/server/app.py`), so a job method answers with the job's
-/// integer id rather than the job's result
-/// (`api/base/server/method.py`) - the silent substitution
-/// `legacy_jobs_in_force` fails the whole session over when the echo
-/// says it.
+/// `connect_start` promises calls before ready are refused, and the window this closes is the one where they were not:
+/// `Phase::Open` used to be set at the `101`, with `core.set_options` still outstanding. In that window the peer's
+/// `App.legacy_jobs` is at its default of `true` (`api/base/server/app.py`), so a job method answers with the job's
+/// integer id rather than the job's result (`api/base/server/method.py`) - the silent substitution
+/// `legacy_jobs_in_force` fails the whole session over when the echo says it.
 #[test]
 fn no_call_is_accepted_before_setup_answers() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_upgrade("/api/current");
         let (id, _) = w.expect_call("core.set_options");
-        // Nothing else may reach the wire before this answer; the
-        // client-side assertion below is what proves it, and the
-        // params-Array/mask invariants would catch a stray frame here.
+        // Nothing else may reach the wire before this answer; the client-side assertion below is what proves it, and
+        // the params-Array/mask invariants would catch a stray frame here.
         std::thread::sleep(Duration::from_millis(150));
         w.respond_err(&id, -32000, "no options for you", None);
     });
@@ -1042,16 +938,14 @@ fn no_call_is_accepted_before_setup_answers() {
     };
     let sid = api.connect_start(SessionOpts::default()).expect("dial");
 
-    // Every attempt across the whole setup phase is refused, and the
-    // refusal is the one `connect_start` documents.
+    // Every attempt across the whole setup phase is refused, and the refusal is the one `connect_start` documents.
     let mut failed = false;
     let mut attempts = 0;
     for _ in 0..50 {
         match api.call_start(sid, "core.ping", &params!()) {
             Ok(c) => panic!("a call was accepted before ready: {c:?}"),
             Err(ApiError::Closed { .. }) => attempts += 1,
-            // Once the setup failure lands the session is gone, which is
-            // the other legitimate refusal.
+            // Once the setup failure lands the session is gone, which is the other legitimate refusal.
             Err(ApiError::UnknownSession) => {}
             Err(e) => panic!("unexpected refusal: {e}"),
         }
@@ -1073,10 +967,9 @@ fn no_call_is_accepted_before_setup_answers() {
     mock.join();
 }
 
-/// The deferred queue is bounded in bytes as well as in items. The count
-/// is a pipelining depth; each item carries its own encoded params and
-/// nothing bounds those at enqueue, so a count alone leaves the queue's
-/// memory at the item cap times whatever the caller queues.
+/// The deferred queue is bounded in bytes as well as in items. The count is a pipelining depth; each item carries its
+/// own encoded params and nothing bounds those at enqueue, so a count alone leaves the queue's memory at the item cap
+/// times whatever the caller queues.
 #[test]
 fn the_deferred_queue_is_bounded_in_bytes_too() {
     let mock = serve_one(|mut w: Wire| {
@@ -1117,10 +1010,9 @@ fn the_deferred_queue_is_bounded_in_bytes_too() {
     mock.join();
 }
 
-/// A blocking wait sets aside every event that is not the one it wants,
-/// and a subscribed session lets the *peer* decide how many of those
-/// there are. Bound it: past the cap the wait fails rather than
-/// buffering, and the events set aside are still there for `pump`.
+/// A blocking wait sets aside every event that is not the one it wants, and a subscribed session lets the *peer* decide
+/// how many of those there are. Bound it: past the cap the wait fails rather than buffering, and the events set aside
+/// are still there for `pump`.
 #[test]
 fn a_blocking_wait_will_not_buffer_without_bound() {
     const FLOOD: usize = 64;
@@ -1155,8 +1047,7 @@ fn a_blocking_wait_will_not_buffer_without_bound() {
         }
         other => panic!("expected the wait to be bounded, got {other:?}"),
     }
-    // What was set aside is still deliverable - the bound refuses the
-    // wait, it does not drop the peer's events.
+    // What was set aside is still deliverable - the bound refuses the wait, it does not drop the peer's events.
     let mut seen = 0;
     while let Ok(Some(ev)) = api.pump(Some(Duration::from_millis(50))) {
         if matches!(ev, ApiEvent::CollectionUpdate { .. }) {
@@ -1171,15 +1062,12 @@ fn a_blocking_wait_will_not_buffer_without_bound() {
     mock.join();
 }
 
-/// A wait refused by `max_waiting_events` must not be refused again on the
-/// events the refusal itself put back.
+/// A wait refused by `max_waiting_events` must not be refused again on the events the refusal itself put back.
 ///
-/// `wait_for` restores its set-aside to the front of `self.out`, and `pump`
-/// drains `self.out` before it touches the transport. Counting a restored
-/// event made the refusal self-sustaining: every later `call` tripped the
-/// cap on the previous one's stash without doing any I/O, so a healthy
-/// server answering every request could not get an answer through, and the
-/// frames those calls had just handed the transport were never flushed.
+/// `wait_for` restores its set-aside to the front of `self.out`, and `pump` drains `self.out` before it touches the
+/// transport. Counting a restored event made the refusal self-sustaining: every later `call` tripped the cap on the
+/// previous one's stash without doing any I/O, so a healthy server answering every request could not get an answer
+/// through, and the frames those calls had just handed the transport were never flushed.
 #[test]
 fn a_refused_wait_does_not_refuse_the_calls_that_follow_it() {
     use std::sync::Arc;
@@ -1199,8 +1087,7 @@ fn a_refused_wait_does_not_refuse_the_calls_that_follow_it() {
             );
         }
         // Answer nothing; count every further call that arrives.
-        let n =
-            w.count_client_text_frames_until_quiet(Duration::from_millis(900));
+        let n = w.count_client_text_frames_until_quiet(Duration::from_millis(900));
         seen_w.store(n + 1, Ordering::SeqCst);
     });
     let cfg = ApiConfig {
@@ -1215,23 +1102,19 @@ fn a_refused_wait_does_not_refuse_the_calls_that_follow_it() {
     for _ in 0..ISSUED {
         let _ = api.call::<_, String>(sid, "core.ping", &params!());
     }
-    // Let the concurrency budget recycle so the backlog drains: the point
-    // is that the calls reach the wire at all, not how fast.
+    // Let the concurrency budget recycle so the backlog drains: the point is that the calls reach the wire at all, not
+    // how fast.
     for _ in 0..60 {
         let _ = api.pump(Some(Duration::from_millis(20)));
     }
     mock.join();
     let n = seen.load(Ordering::SeqCst);
-    // With the refusal counting its own restored stash, exactly ONE of the
-    // twenty ever reached the wire - the wait short-circuited before any
-    // I/O, so even the frames already handed to the transport were never
-    // flushed.
+    // With the refusal counting its own restored stash, exactly ONE of the twenty ever reached the wire - the wait
+    // short-circuited before any I/O, so even the frames already handed to the transport were never flushed.
     //
-    // The number that should reach it is the concurrency budget, and no
-    // more: this mock answers nothing, and a call the server has not
-    // answered is one it is still running, so its slot does not come back
-    // when the client times out. What the wedge did is bound this by the
-    // *wait* rather than by the budget.
+    // The number that should reach it is the concurrency budget, and no more: this mock answers nothing, and a call the
+    // server has not answered is one it is still running, so its slot does not come back when the client times out.
+    // What the wedge did is bound this by the *wait* rather than by the budget.
     assert_eq!(
         n, CALL_BUDGET,
         "the concurrency budget is what bounds how many of the {ISSUED} \
@@ -1239,9 +1122,8 @@ fn a_refused_wait_does_not_refuse_the_calls_that_follow_it() {
     );
 }
 
-/// The same, from the caller's side: a healthy server that buries one
-/// answer under a flood must still be able to answer the calls that come
-/// after, without the caller dropping to `pump`.
+/// The same, from the caller's side: a healthy server that buries one answer under a flood must still be able to answer
+/// the calls that come after, without the caller dropping to `pump`.
 #[test]
 fn a_flood_does_not_make_call_permanently_unusable() {
     const FLOOD: usize = 64;
@@ -1284,13 +1166,12 @@ fn a_flood_does_not_make_call_permanently_unusable() {
     mock.join();
 }
 
-/// The endpoint reaches the wire inside the request line and decides
-/// which API version answers, so both refusals happen before the dial -
-/// no half-open session, no socket.
+/// The endpoint reaches the wire inside the request line and decides which API version answers, so both refusals happen
+/// before the dial - no half-open session, no socket.
 #[test]
 fn a_refused_endpoint_never_dials() {
-    // Nothing is ever accepted here: a refusal that dialled would show
-    // up as the script blocking on accept, which `join` would surface.
+    // Nothing is ever accepted here: a refusal that dialled would show up as the script blocking on accept, which
+    // `join` would surface.
     let mock = serve(Vec::new());
     let Some(_probe) = client_or_skip(&mock) else {
         return;
@@ -1312,10 +1193,7 @@ fn a_refused_endpoint_never_dials() {
             other => panic!("{ep:?} must be refused, got {other:?}"),
         }
     }
-    for (ep, want) in [
-        ("/api/v25.04.1", (25u32, 4u32, 1u32)),
-        ("/api/v24.10", (24, 10, 0)),
-    ] {
+    for (ep, want) in [("/api/v25.04.1", (25u32, 4u32, 1u32)), ("/api/v24.10", (24, 10, 0))] {
         let mut api = ApiClient::new(with(ep)).expect("client");
         match api.connect_start(SessionOpts::default()) {
             Err(ApiError::UnsupportedApiVersion { pinned, minimum }) => {
@@ -1334,15 +1212,13 @@ fn a_refused_endpoint_never_dials() {
 
 // --- The deferred core.bulk queue --------------------------------------
 
-/// A flush sends one core.bulk per method carrying every queued item's
-/// args in order, and each item's result fans back to its ticket. The
-/// mock asserts the core.bulk parameter shape it received.
+/// A flush sends one core.bulk per method carrying every queued item's args in order, and each item's result fans back
+/// to its ticket. The mock asserts the core.bulk parameter shape it received.
 #[test]
 fn bulk_flush_groups_by_method() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
-        // Two methods queued; BTreeMap flush order is alphabetical, so
-        // "a.method" before "z.method".
+        // Two methods queued; BTreeMap flush order is alphabetical, so "a.method" before "z.method".
         let (id, params) = w.expect_call("core.bulk");
         assert_eq!(
             params,
@@ -1369,8 +1245,7 @@ fn bulk_flush_groups_by_method() {
     api.flush_bulk();
 
     // Collect events until all three tickets have answered.
-    let mut done: std::collections::HashMap<_, i64> =
-        std::collections::HashMap::new();
+    let mut done: std::collections::HashMap<_, i64> = std::collections::HashMap::new();
     let mut flushed = 0;
     while done.len() < 3 {
         match api.pump(Some(Duration::from_secs(10))).expect("pump") {
@@ -1392,22 +1267,18 @@ fn bulk_flush_groups_by_method() {
 
 /// A session still dialing is not a dead one.
 ///
-/// `queue_bulk` admits an item against any session the client knows, and
-/// the tick clock starts due (`last_tick` is `None`), so the first `pump`
-/// after a `connect_start` reaches the flush loop while the session is
-/// still in `AwaitingHead`. The flush could not send anything there --
-/// `call_start` refuses a session that is not `Open` - but `take_chunk`
-/// had already removed the items, so every one of them was failed
-/// `ApiError::Closed` against a session that was about to be healthy.
+/// `queue_bulk` admits an item against any session the client knows, and the tick clock starts due (`last_tick` is
+/// `None`), so the first `pump` after a `connect_start` reaches the flush loop while the session is still in
+/// `AwaitingHead`. The flush could not send anything there -- `call_start` refuses a session that is not `Open` - but
+/// `take_chunk` had already removed the items, so every one of them was failed `ApiError::Closed` against a session
+/// that was about to be healthy.
 ///
-/// The mock holds the upgrade back so the window is wide enough to pump
-/// through; the assertion is that no ticket answers before the session is
-/// ready, and that the item then flushes and succeeds.
+/// The mock holds the upgrade back so the window is wide enough to pump through; the assertion is that no ticket
+/// answers before the session is ready, and that the item then flushes and succeeds.
 #[test]
 fn bulk_items_survive_a_dialing_session() {
     let mock = serve_one(|mut w: Wire| {
-        // Wide enough for the client to pump several times while the
-        // session sits in `AwaitingHead`.
+        // Wide enough for the client to pump several times while the session sits in `AwaitingHead`.
         std::thread::sleep(Duration::from_millis(200));
         w.accept_session("/api/current");
         let (id, params) = w.expect_call("core.bulk");
@@ -1438,8 +1309,8 @@ fn bulk_items_survive_a_dialing_session() {
     }
     assert!(ready, "the session never came up");
 
-    // And the item the queue held is still there to send. (The default
-    // `bulk_tick` is 10s, so force the flush rather than wait it out.)
+    // And the item the queue held is still there to send. (The default `bulk_tick` is 10s, so force the flush rather
+    // than wait it out.)
     api.flush_bulk();
     let mut got = None;
     while got.is_none() {
@@ -1460,10 +1331,9 @@ fn bulk_items_survive_a_dialing_session() {
     mock.join();
 }
 
-/// Each queued item flushes on the session it was queued against.
-/// core.bulk runs its items under the calling session's credentials, so a
-/// second `queue_bulk` naming a different session must not re-aim the
-/// items already queued for the first.
+/// Each queued item flushes on the session it was queued against. core.bulk runs its items under the calling session's
+/// credentials, so a second `queue_bulk` naming a different session must not re-aim the items already queued for the
+/// first.
 #[test]
 fn bulk_flushes_each_item_on_its_own_session() {
     let scripts: Vec<Box<dyn FnOnce(Wire) + Send>> = vec![
@@ -1488,16 +1358,11 @@ fn bulk_flushes_each_item_on_its_own_session() {
     };
     let s1 = api.connect(SessionOpts::default()).expect("s1");
     let s2 = api.connect(SessionOpts::default()).expect("s2");
-    let t1 = api
-        .queue_bulk(s1, "s1.method", &params!("one"))
-        .expect("q1");
-    let t2 = api
-        .queue_bulk(s2, "s2.method", &params!("two"))
-        .expect("q2");
+    let t1 = api.queue_bulk(s1, "s1.method", &params!("one")).expect("q1");
+    let t2 = api.queue_bulk(s2, "s2.method", &params!("two")).expect("q2");
     api.flush_bulk();
 
-    let mut done: std::collections::HashMap<_, i64> =
-        std::collections::HashMap::new();
+    let mut done: std::collections::HashMap<_, i64> = std::collections::HashMap::new();
     while done.len() < 2 {
         match api.pump(Some(Duration::from_secs(10))).expect("pump") {
             Some(ApiEvent::BulkFlushed { .. }) => {}
@@ -1515,8 +1380,7 @@ fn bulk_flushes_each_item_on_its_own_session() {
     mock.join();
 }
 
-/// A per-item error in the core.bulk result maps to that ticket's
-/// failure, while its siblings succeed.
+/// A per-item error in the core.bulk result maps to that ticket's failure, while its siblings succeed.
 #[test]
 fn bulk_per_item_error_maps_to_ticket() {
     let mock = serve_one(|mut w: Wire| {
@@ -1538,17 +1402,14 @@ fn bulk_per_item_error_maps_to_ticket() {
     let good = api.queue_bulk(sid, "m", &params!(2)).expect("q2");
     api.flush_bulk();
 
-    let mut results: std::collections::HashMap<_, Result<String, String>> =
-        std::collections::HashMap::new();
+    let mut results: std::collections::HashMap<_, Result<String, String>> = std::collections::HashMap::new();
     while results.len() < 2 {
         match api.pump(Some(Duration::from_secs(10))).expect("pump") {
             Some(ApiEvent::BulkFlushed { .. }) => {}
             Some(ApiEvent::BulkItemDone { ticket, result }) => {
                 let r = match result {
                     Ok(v) => Ok(v.decode::<String>().expect("str")),
-                    Err(ApiError::Call(e)) => {
-                        Err(e.reason.clone().unwrap_or_default())
-                    }
+                    Err(ApiError::Call(e)) => Err(e.reason.clone().unwrap_or_default()),
                     Err(other) => panic!("unexpected item error: {other:?}"),
                 };
                 results.insert(ticket, r);
@@ -1562,23 +1423,20 @@ fn bulk_per_item_error_maps_to_ticket() {
     mock.join();
 }
 
-/// Items too numerous for one frame split into more than one core.bulk
-/// call for the same method; every ticket still answers.
+/// Items too numerous for one frame split into more than one core.bulk call for the same method; every ticket still
+/// answers.
 #[test]
 fn bulk_chunks_under_the_outbound_cap() {
     // A small outbound cap forces chunking: each item is a ~1 KiB string.
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
         let mut seen = 0;
-        // Two chunks expected; answer each core.bulk it reads until both
-        // items are covered.
+        // Two chunks expected; answer each core.bulk it reads until both items are covered.
         while seen < 3 {
             let (id, params) = w.expect_call("core.bulk");
             let count = params[1].as_array().unwrap().len();
             seen += count;
-            let items: Vec<Value> = (0..count)
-                .map(|_| json!({ "result": "ok", "error": null }))
-                .collect();
+            let items: Vec<Value> = (0..count).map(|_| json!({ "result": "ok", "error": null })).collect();
             w.respond_ok(&id, Value::Array(items));
         }
         assert_eq!(seen, 3, "all three items arrived across chunks");
@@ -1587,8 +1445,7 @@ fn bulk_chunks_under_the_outbound_cap() {
     let Some(mut api) = client_or_skip_cfg(cfg) else {
         return;
     };
-    // A session whose outbound cap is small enough that ~two 1 KiB items
-    // exceed one frame.
+    // A session whose outbound cap is small enough that ~two 1 KiB items exceed one frame.
     let sid = api
         .connect(SessionOpts {
             max_outbound_bytes: 2500,
@@ -1614,27 +1471,19 @@ fn bulk_chunks_under_the_outbound_cap() {
             other => panic!("unexpected event: {other:?}"),
         }
     }
-    assert!(
-        batches >= 2,
-        "the cap forced more than one batch: {batches}"
-    );
+    assert!(batches >= 2, "the cap forced more than one batch: {batches}");
     shutdown(&mut api, sid);
     mock.join();
 }
 
-/// A single queued item too large for any frame fails its own ticket with
-/// TooLarge and does not block the rest.
+/// A single queued item too large for any frame fails its own ticket with TooLarge and does not block the rest.
 #[test]
 fn bulk_single_item_too_large() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
         // Only the small item should reach the wire.
         let (id, params) = w.expect_call("core.bulk");
-        assert_eq!(
-            params[1].as_array().unwrap().len(),
-            1,
-            "just the small one"
-        );
+        assert_eq!(params[1].as_array().unwrap().len(), 1, "just the small one");
         w.respond_ok(&id, json!([{ "result": "ok", "error": null }]));
     });
     let Some(mut api) = client_or_skip(&mock) else {
@@ -1651,8 +1500,7 @@ fn bulk_single_item_too_large() {
     let small_ticket = api.queue_bulk(sid, "m", &params!(1)).expect("q-small");
     api.flush_bulk();
 
-    let mut outcomes: std::collections::HashMap<_, bool> =
-        std::collections::HashMap::new();
+    let mut outcomes: std::collections::HashMap<_, bool> = std::collections::HashMap::new();
     while outcomes.len() < 2 {
         match api.pump(Some(Duration::from_secs(10))).expect("pump") {
             Some(ApiEvent::BulkFlushed { .. }) => {}
@@ -1673,8 +1521,7 @@ fn bulk_single_item_too_large() {
 fn bulk_queue_full_refuses() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
-        // The one item that fit is flushed at teardown-time pumping; be
-        // ready to answer it so join does not block.
+        // The one item that fit is flushed at teardown-time pumping; be ready to answer it so join does not block.
         let (id, _) = w.expect_call("core.bulk");
         w.respond_ok(&id, json!([{ "result": 1, "error": null }]));
     });
@@ -1741,11 +1588,9 @@ fn bulk_tick_flushes_automatically() {
     mock.join();
 }
 
-/// RFC 6455 §5.5.1 on the wire, not just in the session: nothing with a data
-/// opcode may follow this client's own Close frame. `unsubscribe_start` was
-/// the one public call with no `Phase::Open` guard - its two siblings have
-/// one - and it reaches `Act::Send` through `submit`, so the backlog's own
-/// phase gate never sees it.
+/// RFC 6455 §5.5.1 on the wire, not just in the session: nothing with a data opcode may follow this client's own Close
+/// frame. `unsubscribe_start` was the one public call with no `Phase::Open` guard - its two siblings have one - and it
+/// reaches `Act::Send` through `submit`, so the backlog's own phase gate never sees it.
 #[test]
 fn no_data_frame_follows_our_own_close() {
     let mock = serve_one(|mut w: Wire| {
@@ -1782,30 +1627,22 @@ fn no_data_frame_follows_our_own_close() {
     };
     api.close(sid);
     assert!(
-        matches!(
-            api.unsubscribe_start(sid, sub),
-            Err(ApiError::Closed { .. })
-        ),
+        matches!(api.unsubscribe_start(sid, sub), Err(ApiError::Closed { .. })),
         "unsubscribing a closing session must be refused, not sent"
     );
     let mut guard = 0;
     while api.is_open(sid) && guard < 200 {
         guard += 1;
-        if api
-            .pump(Some(Duration::from_millis(50)))
-            .expect("pump")
-            .is_none()
-        {
+        if api.pump(Some(Duration::from_millis(50))).expect("pump").is_none() {
             break;
         }
     }
     mock.join();
 }
 
-/// The backlog half of the same rule, end to end: a call still queued when
-/// the Close goes out must not be drained onto the wire by a deadline
-/// sweep. `Session::expire` ends in `drain_backlog`, and `pump` runs it
-/// before it reaps any completion, so this is not a race.
+/// The backlog half of the same rule, end to end: a call still queued when the Close goes out must not be drained onto
+/// the wire by a deadline sweep. `Session::expire` ends in `drain_backlog`, and `pump` runs it before it reaps any
+/// completion, so this is not a race.
 #[test]
 fn an_expiry_sweep_after_our_close_sends_nothing() {
     let mock = serve_one(|mut w: Wire| {
@@ -1841,21 +1678,16 @@ fn an_expiry_sweep_after_our_close_sends_nothing() {
     for _ in 0..CALL_BUDGET {
         api.call_start(sid, "core.ping", &params!()).expect("start");
     }
-    // Submitted later, so its own deadline is still ahead when the eight
-    // sent calls have passed theirs and freed the budget it waits on.
+    // Submitted later, so its own deadline is still ahead when the eight sent calls have passed theirs and freed the
+    // budget it waits on.
     std::thread::sleep(Duration::from_millis(150));
-    api.call_start(sid, "queued.call", &params!())
-        .expect("queued");
+    api.call_start(sid, "queued.call", &params!()).expect("queued");
     std::thread::sleep(Duration::from_millis(80));
     api.close(sid);
     let mut guard = 0;
     while api.is_open(sid) && guard < 200 {
         guard += 1;
-        if api
-            .pump(Some(Duration::from_millis(50)))
-            .expect("pump")
-            .is_none()
-        {
+        if api.pump(Some(Duration::from_millis(50))).expect("pump").is_none() {
             break;
         }
     }

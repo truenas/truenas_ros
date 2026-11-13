@@ -17,78 +17,63 @@ const MAX_SEND_COALESCE: usize = 1024;
 pub struct ClientConfig {
     /// Maximum concurrent connections (size of the registered-file pool).
     pub pool_size: u32,
-    /// Maximum bytes accepted for one reply (header + body) - a memory guard
-    /// that also bounds header scanning. Projects to the engine's request cap.
+    /// Maximum bytes accepted for one reply (header + body) - a memory guard that also bounds header scanning. Projects
+    /// to the engine's request cap.
     pub max_reply_bytes: usize,
-    /// Maximum requests in flight per connection before [`send`] returns
-    /// `WouldBlock`. `1` (the default) is strict request/reply: one request is
-    /// answered before the next is sent. `N > 1` pipelines - the connection's
-    /// protocol must then carry ids so replies (delivered in FIFO order) can be
-    /// correlated.
+    /// Maximum requests in flight per connection before [`send`] returns `WouldBlock`. `1` (the default) is strict
+    /// request/reply: one request is answered before the next is sent. `N > 1` pipelines - the connection's protocol
+    /// must then carry ids so replies (delivered in FIFO order) can be correlated.
     ///
     /// [`send`]: super::Client::send
     pub max_in_flight: usize,
-    /// Read reply bodies at least this large into their own allocation, moved
-    /// out zero-copy. `None` disables placement. Default 64 KiB.
+    /// Read reply bodies at least this large into their own allocation, moved out zero-copy. `None` disables placement.
+    /// Default 64 KiB.
     pub body_placement_threshold: Option<usize>,
-    /// Maximum bytes queued to send on one connection before [`send`] returns
-    /// `WouldBlock` (a peer not draining its socket). Default 8 MiB.
+    /// Maximum bytes queued to send on one connection before [`send`] returns `WouldBlock` (a peer not draining its
+    /// socket). Default 8 MiB.
     ///
     /// [`send`]: super::Client::send
     pub max_send_backlog: usize,
-    /// Maximum queued PDUs gathered into one `SENDMSG` (writev coalescing).
-    /// `1` disables coalescing; capped at 1024. Default 8.
+    /// Maximum queued PDUs gathered into one `SENDMSG` (writev coalescing). `1` disables coalescing; capped at 1024.
+    /// Default 8.
     pub max_send_coalesce: usize,
-    /// Set `TCP_NODELAY` on the socket (no Nagle delay on whole framed
-    /// messages). Default `true`. Ignored for unix.
+    /// Set `TCP_NODELAY` on the socket (no Nagle delay on whole framed messages). Default `true`. Ignored for unix.
     pub nodelay: bool,
-    /// Enable `SO_KEEPALIVE` with `TCP_KEEPIDLE` at this duration (rounded up
-    /// to a whole second). `None` (the default) leaves keepalive off. Ignored
-    /// for unix.
+    /// Enable `SO_KEEPALIVE` with `TCP_KEEPIDLE` at this duration (rounded up to a whole second). `None` (the default)
+    /// leaves keepalive off. Ignored for unix.
     pub keepalive: Option<Duration>,
-    /// Set `TCP_USER_TIMEOUT` (unacknowledged-data abort window). `None` (the
-    /// default) uses the system default. Ignored for unix.
+    /// Set `TCP_USER_TIMEOUT` (unacknowledged-data abort window). `None` (the default) uses the system default. Ignored
+    /// for unix.
     pub tcp_user_timeout: Option<Duration>,
     /// Default bound on an `IORING_OP_CONNECT` (a linked timeout);
-    /// per-connect [`ConnectOpts::connect_timeout`](super::ConnectOpts) overrides
-    /// it. `None` (the default) uses the kernel's own connect timeout.
+    /// per-connect [`ConnectOpts::connect_timeout`](super::ConnectOpts) overrides it. `None` (the default) uses the
+    /// kernel's own connect timeout.
     pub connect_timeout: Option<Duration>,
-    /// If set, close a connection whose reply, once it has *begun* arriving, is
-    /// not fully received within this duration. Projects to the engine's
-    /// `request_timeout`. `None` (the default) never times an in-progress reply
-    /// out.
+    /// If set, close a connection whose reply, once it has *begun* arriving, is not fully received within this
+    /// duration. Projects to the engine's `request_timeout`. `None` (the default) never times an in-progress reply out.
     ///
-    /// This bounds a reply that stalls partway through. It does *not* bound a
-    /// server that accepts the request and then sends nothing at all - until the
-    /// first reply byte the read is idle, so that case is bounded by
-    /// [`idle_timeout`](Self::idle_timeout). Set both to fully guard against a
-    /// hostile server (the same two-phase split the server role uses). A framer
-    /// that returns a `SpliceBody` verdict should set this: otherwise a server
-    /// that sends a body header then stalls mid-splice pins the connection's
-    /// pool slot indefinitely (the splice inactivity watchdog is gated on
-    /// `response_timeout`).
+    /// This bounds a reply that stalls partway through. It does *not* bound a server that accepts the request and then
+    /// sends nothing at all - until the first reply byte the read is idle, so that case is bounded by
+    /// [`idle_timeout`](Self::idle_timeout). Set both to fully guard against a hostile server (the same two-phase split
+    /// the server role uses). A framer that returns a `SpliceBody` verdict should set this: otherwise a server that
+    /// sends a body header then stalls mid-splice pins the connection's pool slot indefinitely (the splice inactivity
+    /// watchdog is gated on `response_timeout`).
     pub response_timeout: Option<Duration>,
-    /// If set, close a connection whose in-flight send makes no progress for
-    /// this long (a peer that stopped reading). `None` (the default) never
-    /// times sends out.
+    /// If set, close a connection whose in-flight send makes no progress for this long (a peer that stopped reading).
+    /// `None` (the default) never times sends out.
     pub send_timeout: Option<Duration>,
-    /// If set, close a connection left idle for longer than this, reclaiming its
-    /// slot. "Idle" includes a connection awaiting a reply whose first byte has
-    /// not arrived, so this - not [`response_timeout`](Self::response_timeout),
-    /// which bounds an *in-progress* reply - is what bounds a server that
-    /// accepts a request and then goes silent. `None` (the default) keeps idle
-    /// connections open.
+    /// If set, close a connection left idle for longer than this, reclaiming its slot. "Idle" includes a connection
+    /// awaiting a reply whose first byte has not arrived, so this - not [`response_timeout`](Self::response_timeout),
+    /// which bounds an *in-progress* reply - is what bounds a server that accepts a request and then goes silent.
+    /// `None` (the default) keeps idle connections open.
     pub idle_timeout: Option<Duration>,
-    /// If set, bound a kTLS connect handshake: a connection parked while its
-    /// consumer handshake worker runs `SSL_connect` is shed with `ConnectFailed`
-    /// if the worker does not call back within this duration. `None` (the default)
-    /// never times a handshake out.
+    /// If set, bound a kTLS connect handshake: a connection parked while its consumer handshake worker runs
+    /// `SSL_connect` is shed with `ConnectFailed` if the worker does not call back within this duration. `None` (the
+    /// default) never times a handshake out.
     pub tls_handshake_timeout: Option<Duration>,
-    /// Whether the server may send unsolicited PDUs (pushes) - a reply arriving
-    /// with no request awaiting it. `false` (the default) treats one as a
-    /// protocol violation and closes the connection; `true` surfaces it as an
-    /// [`Event::Reply`](super::Event::Reply) with
-    /// [`RequestId::UNSOLICITED`](super::RequestId::UNSOLICITED).
+    /// Whether the server may send unsolicited PDUs (pushes) - a reply arriving with no request awaiting it. `false`
+    /// (the default) treats one as a protocol violation and closes the connection; `true` surfaces it as an
+    /// [`Event::Reply`](super::Event::Reply) with [`RequestId::UNSOLICITED`](super::RequestId::UNSOLICITED).
     pub expect_server_push: bool,
 }
 
@@ -115,17 +100,13 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
-    /// Construction-time validation, mirroring `ServerConfig::validate`:
-    /// [`Client::new`](super::Client::new) fails with a validation error on the
-    /// first violated bound before any socket or ring is created.
+    /// Construction-time validation, mirroring `ServerConfig::validate`: [`Client::new`](super::Client::new) fails with
+    /// a validation error on the first violated bound before any socket or ring is created.
     pub(super) fn validate(&self) -> crate::Result<()> {
         if self.pool_size == 0 || self.pool_size > MAX_POOL {
-            return Err(Error::Validation(format!(
-                "pool_size must be in 1..={MAX_POOL}"
-            )));
+            return Err(Error::Validation(format!("pool_size must be in 1..={MAX_POOL}")));
         }
-        if self.max_reply_bytes == 0 || self.max_reply_bytes > i32::MAX as usize
-        {
+        if self.max_reply_bytes == 0 || self.max_reply_bytes > i32::MAX as usize {
             return Err(Error::Validation(format!(
                 "max_reply_bytes must be in 1..={}",
                 i32::MAX
@@ -137,13 +118,9 @@ impl ClientConfig {
             )));
         }
         if self.max_send_backlog == 0 {
-            return Err(Error::Validation(
-                "max_send_backlog must be non-zero".into(),
-            ));
+            return Err(Error::Validation("max_send_backlog must be non-zero".into()));
         }
-        if self.max_send_coalesce == 0
-            || self.max_send_coalesce > MAX_SEND_COALESCE
-        {
+        if self.max_send_coalesce == 0 || self.max_send_coalesce > MAX_SEND_COALESCE {
             return Err(Error::Validation(format!(
                 "max_send_coalesce must be in 1..={MAX_SEND_COALESCE}"
             )));
@@ -158,18 +135,15 @@ impl ClientConfig {
             ("tcp_user_timeout", self.tcp_user_timeout),
         ] {
             if matches!(d, Some(d) if d.is_zero()) {
-                return Err(Error::Validation(format!(
-                    "{name} must be non-zero"
-                )));
+                return Err(Error::Validation(format!("{name} must be non-zero")));
             }
         }
         Ok(())
     }
 
-    /// Project the engine-read subset into the reactor core. `response_timeout`
-    /// maps to the engine's `request_timeout` slot (both bound the receipt of a
-    /// framed message that has begun arriving), and `max_reply_bytes` to its
-    /// message cap.
+    /// Project the engine-read subset into the reactor core. `response_timeout` maps to the engine's `request_timeout`
+    /// slot (both bound the receipt of a framed message that has begun arriving), and `max_reply_bytes` to its message
+    /// cap.
     pub(super) fn to_core(self) -> CoreConfig {
         CoreConfig {
             max_request_bytes: self.max_reply_bytes,
@@ -179,19 +153,16 @@ impl ClientConfig {
             max_in_flight_requests: self.max_in_flight,
             idle_timeout: self.idle_timeout,
             request_timeout: self.response_timeout,
-            // Server-only: a client's peer is the server it dialled, not an
-            // untrusted caller holding a pool slot, so there is no slot to
-            // defend.
+            // Server-only: a client's peer is the server it dialled, not an untrusted caller holding a pool slot, so
+            // there is no slot to defend.
             max_receipt_time: None,
             // Server-only, like the budget it renews.
             receipt_window_bytes: usize::MAX,
             send_timeout: self.send_timeout,
             tls_handshake_timeout: self.tls_handshake_timeout,
-            // Server-only: a client never registers a recv pool, so there
-            // is no shortage to park on.
+            // Server-only: a client never registers a recv pool, so there is no shortage to park on.
             recv_shortage_retry: None,
-            // Server-only: the knob is on `ServerConfig`, and a client's
-            // ops are submitted unflagged.
+            // Server-only: the knob is on `ServerConfig`, and a client's ops are submitted unflagged.
             force_async: crate::uring::force_async::ForceAsync::empty(),
         }
     }
@@ -203,9 +174,7 @@ mod tests {
 
     #[test]
     fn default_validates() {
-        ClientConfig::default()
-            .validate()
-            .expect("default is valid");
+        ClientConfig::default().validate().expect("default is valid");
     }
 
     #[test]

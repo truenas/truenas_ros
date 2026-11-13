@@ -1,16 +1,13 @@
-//! Our ws/JSON-RPC client against our ws/JSON-RPC server, in one process:
-//! the real io_uring `ApiClient` dials a std-thread server built on
-//! `JsonRpcServer` + the `truenas_ros::ws` server codec. This is the
-//! loopback that runs in an unprivileged GH runner - no middlewared, no
-//! QEMU - exercising both halves of the crate over a real socket.
+//! Our ws/JSON-RPC client against our ws/JSON-RPC server, in one process: the real io_uring `ApiClient` dials a
+//! std-thread server built on `JsonRpcServer` + the `truenas_ros::ws` server codec. This is the loopback that runs in
+//! an unprivileged GH runner - no middlewared, no QEMU - exercising both halves of the crate over a real socket.
 //!
-//! It is *not* a replacement for `tests/mock.rs`: that mock is a
-//! hand-rolled, independent server, the adversarial oracle that catches a
-//! bug we'd make symmetrically on both sides. This proves the two real
-//! halves interoperate and that the server session is usable.
+//! It is *not* a replacement for `tests/mock.rs`: that mock is a hand-rolled, independent server, the adversarial
+//! oracle that catches a bug we'd make symmetrically on both sides. This proves the two real halves interoperate and
+//! that the server session is usable.
 //!
-//! The client half is io_uring, so the test skips (loudly under
-//! `TRUENAS_ROS_REQUIRE_IO_URING`) where a ring can't be created.
+//! The client half is io_uring, so the test skips (loudly under `TRUENAS_ROS_REQUIRE_IO_URING`) where a ring can't be
+//! created.
 
 #![cfg(target_os = "linux")]
 
@@ -20,25 +17,23 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use truenas_api_client::{
-    ApiClient, ApiConfig, ApiError, ApiEvent, JsonRpcServer, ServerAct,
-    ServerStep, SessionOpts, params,
+    ApiClient, ApiConfig, ApiError, ApiEvent, JsonRpcServer, ServerAct, ServerStep, SessionOpts, params,
 };
 use truenas_jsonrpc::ErrorObject;
 use truenas_ros::ws::{self, HeadVerdict};
 
 // --- the std-thread ws/JSON-RPC server -------------------------------
 
-/// One accepted connection: an incremental frame reader over the server
-/// codec, plus the `JsonRpcServer` session driving it.
+/// One accepted connection: an incremental frame reader over the server codec, plus the `JsonRpcServer` session driving
+/// it.
 struct Conn {
     stream: UnixStream,
     server: JsonRpcServer,
 }
 
 impl Conn {
-    /// Read the client's HTTP upgrade request head, byte by byte through
-    /// its blank line (the client waits for the `101` before sending
-    /// frames, so this never over-reads into frame bytes).
+    /// Read the client's HTTP upgrade request head, byte by byte through its blank line (the client waits for the `101`
+    /// before sending frames, so this never over-reads into frame bytes).
     fn read_head(&mut self) -> Option<Vec<u8>> {
         let mut head = Vec::new();
         let mut b = [0u8; 1];
@@ -50,8 +45,7 @@ impl Conn {
         Some(head)
     }
 
-    /// Read one whole client frame, reading exactly the bytes
-    /// `server_frame_head` asks for, then unmask its payload.
+    /// Read one whole client frame, reading exactly the bytes `server_frame_head` asks for, then unmask its payload.
     fn read_frame(&mut self) -> Option<(ws::FrameHead, Vec<u8>)> {
         let mut hdr = vec![0u8; 2];
         self.stream.read_exact(&mut hdr).ok()?;
@@ -66,13 +60,10 @@ impl Conn {
                 HeadVerdict::Invalid(_) => return None,
             }
         };
-        // The declared length is the peer's, so it is checked against
-        // the session's bound before it sizes an allocation. That bound
-        // is what `JsonRpcServer::max_message_bytes` exists to hand a
-        // driver: the payload is read before `on_frame` ever sees it, so
-        // a driver that trusts `payload_len` aborts on a header alone -
-        // 64 bits of declared length and nothing between it and
-        // `vec![0u8; n]`.
+        // The declared length is the peer's, so it is checked against the session's bound before it sizes an
+        // allocation. That bound is what `JsonRpcServer::max_message_bytes` exists to hand a driver: the payload is
+        // read before `on_frame` ever sees it, so a driver that trusts `payload_len` aborts on a header alone - 64 bits
+        // of declared length and nothing between it and `vec![0u8; n]`.
         if h.payload_len > self.server.max_message_bytes() {
             return None;
         }
@@ -87,8 +78,7 @@ impl Conn {
     }
 }
 
-/// What a handler answers with: a result-or-error, and any events to push
-/// right after the reply.
+/// What a handler answers with: a result-or-error, and any events to push right after the reply.
 struct Answer {
     result: Result<Value, ErrorObject>,
     then_notify: Vec<(String, Value)>,
@@ -101,11 +91,9 @@ fn ok(v: Value) -> Answer {
     }
 }
 
-/// Serve one connection with `handler` on a fresh unix socket. Returns the
-/// socket path, its tempdir (keep it alive), and the server's join handle.
-fn serve<H>(
-    handler: H,
-) -> (std::path::PathBuf, truenas_ros::TempDir, JoinHandle<()>)
+/// Serve one connection with `handler` on a fresh unix socket. Returns the socket path, its tempdir (keep it alive),
+/// and the server's join handle.
+fn serve<H>(handler: H) -> (std::path::PathBuf, truenas_ros::TempDir, JoinHandle<()>)
 where
     H: FnMut(&str, Option<Value>) -> Answer + Send + 'static,
 {
@@ -142,9 +130,7 @@ where
                 ServerAct::Fault(what) => panic!("client fault: {what}"),
                 ServerAct::Notification { .. } => {}
                 ServerAct::Request { id, method, params } => {
-                    let pv = params
-                        .as_ref()
-                        .map(|p| serde_json::from_str(p.get()).unwrap());
+                    let pv = params.as_ref().map(|p| serde_json::from_str(p.get()).unwrap());
                     let ans = handler(&method, pv);
                     let frame = match ans.result {
                         Ok(v) => conn.server.reply(id, &v).expect("encode"),
@@ -152,8 +138,7 @@ where
                     };
                     conn.write(&frame);
                     for (m, p) in ans.then_notify {
-                        let f =
-                            conn.server.notify(&m, Some(&p)).expect("notify");
+                        let f = conn.server.notify(&m, Some(&p)).expect("notify");
                         conn.write(&f);
                     }
                 }
@@ -179,12 +164,7 @@ fn client_or_skip(path: &std::path::Path) -> Option<ApiClient> {
             assert!(
                 matches!(
                     e.raw_os_error(),
-                    Some(
-                        libc::EPERM
-                            | libc::ENOSYS
-                            | libc::EACCES
-                            | libc::ENOMEM
-                    )
+                    Some(libc::EPERM | libc::ENOSYS | libc::EACCES | libc::ENOMEM)
                 ),
                 "non-environmental ring failure: {e}"
             );
@@ -198,8 +178,8 @@ fn client_or_skip(path: &std::path::Path) -> Option<ApiClient> {
     }
 }
 
-/// The whole stack, both halves ours: connect (handshake + set_options),
-/// a call, a subscribe that pushes an event, and a bulk flush.
+/// The whole stack, both halves ours: connect (handshake + set_options), a call, a subscribe that pushes an event, and
+/// a bulk flush.
 #[test]
 fn client_and_server_round_trip() {
     let uuid = "11111111-2222-3333-4444-555555555555";
@@ -230,9 +210,7 @@ fn client_and_server_round_trip() {
                 .and_then(Value::as_array)
                 .map(Vec::len)
                 .unwrap_or(0);
-            let statuses: Vec<Value> = (0..items)
-                .map(|_| json!({ "result": true, "error": null }))
-                .collect();
+            let statuses: Vec<Value> = (0..items).map(|_| json!({ "result": true, "error": null })).collect();
             ok(Value::Array(statuses))
         }
         _ => Answer {
@@ -247,8 +225,7 @@ fn client_and_server_round_trip() {
     let session = api.connect(SessionOpts::default()).expect("connect");
 
     // A direct call round-trips through both real codecs.
-    let pong: String =
-        api.call(session, "core.ping", &params!()).expect("ping");
+    let pong: String = api.call(session, "core.ping", &params!()).expect("ping");
     assert_eq!(pong, "pong");
 
     // A subscription is acknowledged, then the pushed event arrives.
@@ -270,14 +247,9 @@ fn client_and_server_round_trip() {
         }
     }
 
-    // The deferred bulk path: two items flush as one core.bulk, and each
-    // ticket gets its per-item result back.
-    let t1 = api
-        .queue_bulk(session, "pool.snapshot", &params!("a"))
-        .expect("q1");
-    let t2 = api
-        .queue_bulk(session, "pool.snapshot", &params!("b"))
-        .expect("q2");
+    // The deferred bulk path: two items flush as one core.bulk, and each ticket gets its per-item result back.
+    let t1 = api.queue_bulk(session, "pool.snapshot", &params!("a")).expect("q1");
+    let t2 = api.queue_bulk(session, "pool.snapshot", &params!("b")).expect("q2");
     api.flush_bulk();
     let mut done = std::collections::HashSet::new();
     while done.len() < 2 {
@@ -294,11 +266,7 @@ fn client_and_server_round_trip() {
 
     api.close(session);
     while api.is_open(session) {
-        if api
-            .pump(Some(Duration::from_secs(5)))
-            .expect("pump")
-            .is_none()
-        {
+        if api.pump(Some(Duration::from_secs(5))).expect("pump").is_none() {
             break;
         }
     }

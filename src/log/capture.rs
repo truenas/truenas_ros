@@ -21,10 +21,7 @@ pub struct Record {
 impl Record {
     /// The first field of that name, rendered.
     pub fn field(&self, name: &str) -> Option<&str> {
-        self.fields
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, v)| v.as_str())
+        self.fields.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_str())
     }
 }
 
@@ -64,13 +61,10 @@ impl Capture {
         std::mem::take(&mut *self.lock())
     }
 
-    /// The records, locked. A test that panicked while it held the lock
-    /// left records that are still worth reading, so the poison is passed
-    /// over.
+    /// The records, locked. A test that panicked while it held the lock left records that are still worth reading, so
+    /// the poison is passed over.
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Record>> {
-        self.records
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.records.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -84,11 +78,7 @@ impl Sink for Capture {
             level: event.level,
             source: event.source,
             message: event.message.to_string(),
-            fields: event
-                .fields
-                .iter()
-                .map(|f| (f.name(), f.value().to_string()))
-                .collect(),
+            fields: event.fields.iter().map(|f| (f.name(), f.value().to_string())).collect(),
         };
         self.lock().push(record);
     }

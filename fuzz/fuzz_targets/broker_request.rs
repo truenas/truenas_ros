@@ -1,32 +1,24 @@
 #![no_main]
 
-//! Fuzz the credential broker's request decoder — the sharpest privilege
-//! boundary in the crate.
+//! Fuzz the credential broker's request decoder — the sharpest privilege boundary in the crate.
 //!
-//! The broker runs in a forked child holding `CAP_SETUID`, reading fixed-layout
-//! datagrams off a socket and minting io_uring personalities from whatever the
-//! decoder accepts. Everything downstream — `register_as`, the uid/gid it
-//! assumes, the capability set it grants — trusts these fields. If a malformed
-//! datagram can produce a `Req`, it can produce a personality the caller was
-//! never entitled to.
+//! The broker runs in a forked child holding `CAP_SETUID`, reading fixed-layout datagrams off a socket and minting
+//! io_uring personalities from whatever the decoder accepts. Everything downstream — `register_as`, the uid/gid it
+//! assumes, the capability set it grants — trusts these fields. If a malformed datagram can produce a `Req`, it can
+//! produce a personality the caller was never entitled to.
 //!
-//! The four properties an accepted request must satisfy, each of which gates a
-//! separate downstream use:
-//! - `ring < nrings`, because the ring index becomes `RING_FD_BASE + ring`, a
-//!   raw descriptor number in the child,
+//! The four properties an accepted request must satisfy, each of which gates a separate downstream use:
+//! - `ring < nrings`, because the ring index becomes `RING_FD_BASE + ring`, a raw descriptor number in the child,
 //! - `ngroups <= MAX_GROUPS`, the bound on the caller-supplied scratch buffer,
 //! - the datagram is **exactly** `HDR_LEN + 4 * ngroups` — a lower bound would
 //!   let a receive-buffer truncation be read as though the missing tail were
 //!   zeroed groups,
-//! - `caps ⊆ allowed`, the ceiling fixed when the broker was spawned; an
-//!   unknown bit must be refused rather than masked off, or the caller silently
-//!   gets a weaker personality and discovers it as an `EACCES` far away,
-//! - and for a registration of uid 0, `caps ⊆ root` instead, the root limit
-//!   `spawn_with_root` fixed, with no registration of uid 0 accepted at all
-//!   when the broker has none.
+//! - `caps ⊆ allowed`, the ceiling fixed when the broker was spawned; an unknown bit must be refused rather than masked
+//!   off, or the caller silently gets a weaker personality and discovers it as an `EACCES` far away,
+//! - and for a registration of uid 0, `caps ⊆ root` instead, the root limit `spawn_with_root` fixed, with no
+//!   registration of uid 0 accepted at all when the broker has none.
 //!
-//! Rejection must also be honest: the only errnos the loop can reply with are
-//! `EINVAL` and `EPERM`.
+//! Rejection must also be honest: the only errnos the loop can reply with are `EINVAL` and `EPERM`.
 
 use libfuzzer_sys::fuzz_target;
 use truenas_ros::uring_fs::{
@@ -38,28 +30,22 @@ use truenas_ros::uring_fs::{
 const HDR_LEN: usize = 16;
 
 fuzz_target!(|data: &[u8]| {
-    // A broker is spawned with a real ring count and a real ceiling, so model
-    // both rather than letting the fuzzer invent impossible ones. The ceiling
-    // is drawn from a selector byte rather than independently: with a random
-    // ceiling the `caps ⊆ allowed` check would almost always reject, and the
-    // accept path — the one that mints a personality — would go untested.
+    // A broker is spawned with a real ring count and a real ceiling, so model both rather than letting the fuzzer
+    // invent impossible ones. The ceiling is drawn from a selector byte rather than independently: with a random
+    // ceiling the `caps ⊆ allowed` check would almost always reject, and the accept path — the one that mints a
+    // personality — would go untested.
     //
-    // Two selector bytes, because the ring count and the ceiling are
-    // independent axes and one byte cannot carry both:
+    // Two selector bytes, because the ring count and the ceiling are independent axes and one byte cannot carry both:
     //
-    // * `nrings` takes a **whole** byte. A nibble cannot express a ceiling
-    //   above 15, so `usize::from(sel >> 4) % (MAX_RINGS + 1)` was the
-    //   identity once `MAX_RINGS` reached sixteen, and the maximum ring
-    //   count — with it the widest `ring < nrings` accept this target
-    //   exists to explore — was unreachable. A whole byte tracks the
-    //   constant to 255, which is where the `u8` ring index really binds.
-    // * `1 +`, because `spawn_with_caps` refuses an empty slice, so a
-    //   broker serving no rings is not a state worth modelling.
-    // * a **second** byte for the ceiling. Drawing both from one byte
-    //   couples them: `1 + sel % 16` makes `nrings`' parity the exact
-    //   inverse of the `sel & 1` ceiling branch, so `nrings == MAX_RINGS`
-    //   would pair only with the restrictive ceiling that mostly rejects —
-    //   and the accept path is precisely what needs it. Independent bytes
+    // * `nrings` takes a **whole** byte. A nibble cannot express a ceiling above 15, so `usize::from(sel >> 4) %
+    //   (MAX_RINGS + 1)` was the identity once `MAX_RINGS` reached sixteen, and the maximum ring count — with it the
+    //   widest `ring < nrings` accept this target exists to explore — was unreachable. A whole byte tracks the constant
+    //   to 255, which is where the `u8` ring index really binds.
+    // * `1 +`, because `spawn_with_caps` refuses an empty slice, so a broker serving no rings is not a state worth
+    //   modelling.
+    // * a **second** byte for the ceiling. Drawing both from one byte couples them: `1 + sel % 16` makes `nrings`'
+    //   parity the exact inverse of the `sel & 1` ceiling branch, so `nrings == MAX_RINGS` would pair only with the
+    //   restrictive ceiling that mostly rejects — and the accept path is precisely what needs it. Independent bytes
     //   reach the full cross product at every ceiling.
     let Some((&sel, rest)) = data.split_first() else {
         return;
@@ -67,9 +53,8 @@ fuzz_target!(|data: &[u8]| {
     let Some((&cap_sel, rest)) = rest.split_first() else {
         return;
     };
-    // A third byte for the root limit, an axis of its own. It gives none,
-    // every capability, or a ceiling drawn from the byte, so a registration
-    // of uid 0 is tried against each.
+    // A third byte for the root limit, an axis of its own. It gives none, every capability, or a ceiling drawn from the
+    // byte, so a registration of uid 0 is tried against each.
     let Some((&root_sel, req)) = rest.split_first() else {
         return;
     };
@@ -89,8 +74,7 @@ fuzz_target!(|data: &[u8]| {
         Ok(r) => r,
         Err(errno) => {
             assert!(
-                errno == -(libc::EINVAL as i64)
-                    || errno == -(libc::EPERM as i64),
+                errno == -(libc::EINVAL as i64) || errno == -(libc::EPERM as i64),
                 "rejected with an errno the loop cannot reply with: {errno}"
             );
             return;
@@ -112,8 +96,8 @@ fuzz_target!(|data: &[u8]| {
         HDR_LEN + 4 * decoded.ngroups,
         "accepted a datagram whose length does not match its group count"
     );
-    // `OP_REGISTER` is 1. A registration of uid 0 is held to the root limit,
-    // and needs one. Anything else is held to `allowed`.
+    // `OP_REGISTER` is 1. A registration of uid 0 is held to the root limit, and needs one. Anything else is held to
+    // `allowed`.
     let ceiling = if decoded.op == 1 && decoded.uid == 0 {
         root.expect("a registration of uid 0 accepted with no root limit")
     } else {
@@ -124,13 +108,10 @@ fuzz_target!(|data: &[u8]| {
         "accepted caps {:?} outside the ceiling {ceiling:?}",
         decoded.caps
     );
-    // An unknown bit must be refused, not masked off - a caller would
-    // otherwise get a personality weaker than it asked for and discover it
-    // as an `EACCES` far from here. The `contains` above cannot see that
-    // happen: it is true by construction on the accept path
-    // (`decode_request` ends in `Some(c) if allowed.contains(c)`), so it
-    // holds under `from_bits_truncate` just as well. Re-derive the wire
-    // word and require the decode to have been lossless.
+    // An unknown bit must be refused, not masked off - a caller would otherwise get a personality weaker than it asked
+    // for and discover it as an `EACCES` far from here. The `contains` above cannot see that happen: it is true by
+    // construction on the accept path (`decode_request` ends in `Some(c) if allowed.contains(c)`), so it holds under
+    // `from_bits_truncate` just as well. Re-derive the wire word and require the decode to have been lossless.
     let caps_bits = u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
     assert_eq!(
         Caps::from_bits(caps_bits),
@@ -146,29 +127,21 @@ fuzz_target!(|data: &[u8]| {
         "decoding is not deterministic"
     );
 
-    // The group payload is read against the length the header declared, which
-    // the exactness check above has already tied to the datagram. Reading it
-    // must stay inside the buffer for any accepted request.
+    // The group payload is read against the length the header declared, which the exactness check above has already
+    // tied to the datagram. Reading it must stay inside the buffer for any accepted request.
     let mut groups = vec![0u32; MAX_GROUPS];
     decode_groups(&req, decoded.ngroups, &mut groups);
     for (i, g) in groups.iter().take(decoded.ngroups).enumerate() {
         let at = HDR_LEN + 4 * i;
         assert_eq!(
             *g,
-            u32::from_le_bytes([
-                req[at],
-                req[at + 1],
-                req[at + 2],
-                req[at + 3]
-            ]),
+            u32::from_le_bytes([req[at], req[at + 1], req[at + 2], req[at + 3]]),
             "group {i} was not copied verbatim"
         );
     }
-    // A short destination must truncate, never overrun - so the count goes
-    // in unclamped. `MAX_GROUPS` is 4096, so an accepted request really can
-    // declare more groups than this buffer holds; clamping here would
-    // exercise no truncation at all, and an `out[i]` rewrite of
-    // `decode_groups` would go unnoticed.
+    // A short destination must truncate, never overrun - so the count goes in unclamped. `MAX_GROUPS` is 4096, so an
+    // accepted request really can declare more groups than this buffer holds; clamping here would exercise no
+    // truncation at all, and an `out[i]` rewrite of `decode_groups` would go unnoticed.
     let mut small = [0u32; 4];
     decode_groups(&req, decoded.ngroups, &mut small);
 });

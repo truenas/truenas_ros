@@ -5,9 +5,8 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
-/// A directory created by [`tempdir`]. Dropping the handle removes the
-/// directory and everything under it, best-effort: scratch left behind
-/// by a failed removal is not worth a panic mid-drop.
+/// A directory created by [`tempdir`]. Dropping the handle removes the directory and everything under it, best-effort:
+/// scratch left behind by a failed removal is not worth a panic mid-drop.
 #[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,
@@ -32,17 +31,15 @@ impl Drop for TempDir {
     }
 }
 
-/// Create a fresh `truenas-ros.??????` directory, mode 0700, under the
-/// environment's temporary directory (`TMPDIR`, else `/tmp`), named and
-/// created atomically by `mkdtemp(3)`.
+/// Create a fresh `truenas-ros.??????` directory, mode 0700, under the environment's temporary directory (`TMPDIR`,
+/// else `/tmp`), named and created atomically by `mkdtemp(3)`.
 pub fn tempdir() -> errno::Result<TempDir> {
     let mut template = std::env::temp_dir();
     template.push("truenas-ros.XXXXXX");
     let mut buf = template.into_os_string().into_vec();
     buf.push(0);
-    // SAFETY: `buf` is writable, NUL-terminated, and ends in the XXXXXX
-    // placeholder mkdtemp rewrites in place; the returned pointer is
-    // `buf`'s own or null.
+    // SAFETY: `buf` is writable, NUL-terminated, and ends in the XXXXXX placeholder mkdtemp rewrites in place; the
+    // returned pointer is `buf`'s own or null.
     let ret = unsafe { libc::mkdtemp(buf.as_mut_ptr().cast()) };
     if ret.is_null() {
         return Err(Errno::last());
@@ -57,8 +54,8 @@ pub fn tempdir() -> errno::Result<TempDir> {
 mod tests {
     use super::*;
 
-    /// The directory must exist, be a directory, and carry mkdtemp's
-    /// 0700 - scratch readable by other users would leak test content.
+    /// The directory must exist, be a directory, and carry mkdtemp's 0700 - scratch readable by other users would leak
+    /// test content.
     #[test]
     fn creates_a_private_directory() {
         use std::os::unix::fs::PermissionsExt;

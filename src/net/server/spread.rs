@@ -1,29 +1,22 @@
-//! A spread: the servers of one port, a ring each, sharing a count of the
-//! connections each ring holds, so that a ring which accepts a connection
-//! while another holds fewer sends it there.
+//! A spread: the servers of one port, a ring each, sharing a count of the connections each ring holds, so that a ring
+//! which accepts a connection while another holds fewer sends it there.
 //!
-//! The kernel offers no balance of its own. A `SO_REUSEPORT` group picks a
-//! listener by a hash of the connection's addresses
-//! (`reuseport_select_sock_by_hash`, `net/core/sock_reuseport.c`), and a
-//! listener with `SO_INCOMING_CPU` is preferred only when its CPU took the
-//! SYN. Neither sees how many connections a ring already holds, and a
-//! connection never leaves the ring that took it, so one ring can run at
-//! half the load of its neighbours for as long as its clients stay.
+//! The kernel offers no balance of its own. A `SO_REUSEPORT` group picks a listener by a hash of the connection's
+//! addresses (`reuseport_select_sock_by_hash`, `net/core/sock_reuseport.c`), and a listener with `SO_INCOMING_CPU` is
+//! preferred only when its CPU took the SYN. Neither sees how many connections a ring already holds, and a connection
+//! never leaves the ring that took it, so one ring can run at half the load of its neighbours for as long as its
+//! clients stay.
 //!
-//! The move is `IORING_OP_MSG_RING` with `IORING_MSG_SEND_FD`, before the
-//! accepting ring has fetched the peer's address or run the accept handler,
-//! so everything a connection has lives on the ring that serves it. The
-//! kernel installs the file in a free slot of the target's table and posts
-//! the target a completion naming that slot (`io_msg_install_complete`,
-//! `io_uring/msg_ring.c`), which the target takes as it takes its own
-//! accepts. Only a send that worked closes the sender's slot: a failed one,
-//! such as a target whose table is full, leaves the connection where it was
-//! accepted, to be served there.
+//! The move is `IORING_OP_MSG_RING` with `IORING_MSG_SEND_FD`, before the accepting ring has fetched the peer's address
+//! or run the accept handler, so everything a connection has lives on the ring that serves it. The kernel installs the
+//! file in a free slot of the target's table and posts the target a completion naming that slot
+//! (`io_msg_install_complete`, `io_uring/msg_ring.c`), which the target takes as it takes its own accepts. Only a send
+//! that worked closes the sender's slot: a failed one, such as a target whose table is full, leaves the connection
+//! where it was accepted, to be served there.
 //!
-//! Nothing here orders one thread against another. Each ring writes its
-//! own count and others read it with no ordering, so a stale count places a
-//! connection one above the fewest, and never loses it. A place whose
-//! descriptor is not set yet is passed over.
+//! Nothing here orders one thread against another. Each ring writes its own count and others read it with no ordering,
+//! so a stale count places a connection one above the fewest, and never loses it. A place whose descriptor is not set
+//! yet is passed over.
 
 use crate::errno::Errno;
 use crate::net::core::protocol::ServerAddr;
@@ -32,15 +25,14 @@ use crate::sync::{Arc, Mutex, OnceCell};
 use std::collections::HashSet;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-/// What a place reads while no ring serves there: not yet joined, or a
-/// ring that began draining. It is never fewer than any count, so no ring
-/// sends to it.
+/// What a place reads while no ring serves there: not yet joined, or a ring that began draining. It is never fewer than
+/// any count, so no ring sends to it.
 const CLOSED: u32 = u32::MAX;
 
 /// The rings serving one port, for [`Server::join_spread`].
 ///
-/// Built with one place per ring, cloned to each ring's thread, and joined
-/// there once the ring's server exists. Clones share one set.
+/// Built with one place per ring, cloned to each ring's thread, and joined there once the ring's server exists. Clones
+/// share one set.
 ///
 /// [`Server::join_spread`]: super::Server::join_spread
 #[derive(Clone)]
@@ -48,21 +40,18 @@ pub struct Spread(Arc<Places>);
 
 struct Places {
     places: Box<[Place]>,
-    /// The addresses every member listens on, in order. The first to join
-    /// sets them and the rest must match, since a hand-off names its
-    /// listener by index on the ring that receives it.
+    /// The addresses every member listens on, in order. The first to join sets them and the rest must match, since a
+    /// hand-off names its listener by index on the ring that receives it.
     addrs: Mutex<Option<Vec<ServerAddr>>>,
 }
 
-/// One ring's place, on cache lines of its own (two, for the adjacent-line
-/// prefetcher): only its ring writes the count, and every other ring reads
-/// it when it accepts.
+/// One ring's place, on cache lines of its own (two, for the adjacent-line prefetcher): only its ring writes the count,
+/// and every other ring reads it when it accepts.
 #[repr(align(128))]
 struct Place {
     taken: AtomicU32,
-    /// The ring's own descriptor, duplicated, so the number another ring
-    /// sends to names this ring for as long as the set lives, whatever
-    /// becomes of the ring's own copy.
+    /// The ring's own descriptor, duplicated, so the number another ring sends to names this ring for as long as the
+    /// set lives, whatever becomes of the ring's own copy.
     ring: OnceCell<OwnedFd>,
 }
 
@@ -91,15 +80,8 @@ impl Spread {
         self.0.places.is_empty()
     }
 
-    /// Take `place` for the ring `ring`, which listens on `addrs` and holds
-    /// `taken` connections already.
-    pub(crate) fn join(
-        &self,
-        place: usize,
-        ring: RawFd,
-        addrs: Vec<ServerAddr>,
-        taken: u32,
-    ) -> crate::Result<()> {
+    /// Take `place` for the ring `ring`, which listens on `addrs` and holds `taken` connections already.
+    pub(crate) fn join(&self, place: usize, ring: RawFd, addrs: Vec<ServerAddr>, taken: u32) -> crate::Result<()> {
         let Some(at) = self.0.places.get(place) else {
             return Err(crate::Error::Validation(format!(
                 "place {place} of a spread of {}",
@@ -107,8 +89,7 @@ impl Spread {
             )));
         };
         {
-            let mut first =
-                self.0.addrs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut first = self.0.addrs.lock().unwrap_or_else(|e| e.into_inner());
             match first.as_ref() {
                 Some(theirs) if *theirs != addrs => {
                     return Err(crate::Error::Validation(format!(
@@ -120,11 +101,9 @@ impl Spread {
                 None => *first = Some(addrs),
             }
         }
-        // SAFETY: `ring` is the joining server's open ring descriptor, which
-        // it holds across this call; F_DUPFD_CLOEXEC returns a new one or -1.
-        let raw = Errno::result(unsafe {
-            libc::fcntl(ring, libc::F_DUPFD_CLOEXEC, 0)
-        })?;
+        // SAFETY: `ring` is the joining server's open ring descriptor, which it holds across this call; F_DUPFD_CLOEXEC
+        // returns a new one or -1.
+        let raw = Errno::result(unsafe { libc::fcntl(ring, libc::F_DUPFD_CLOEXEC, 0) })?;
         // SAFETY: a descriptor `fcntl` just created, owned by nothing else.
         let own = unsafe { crate::fd::owned_from_raw(raw) };
         if !at.ring.set(own) {
@@ -136,8 +115,8 @@ impl Spread {
         Ok(())
     }
 
-    /// The ring with the fewest connections, when it holds fewer than the
-    /// one at `me`. Ties stay, so an even spread moves nothing.
+    /// The ring with the fewest connections, when it holds fewer than the one at `me`. Ties stay, so an even spread
+    /// moves nothing.
     pub(crate) fn fewer_than(&self, me: usize) -> Option<RawFd> {
         let places = &self.0.places;
         let mine = places.get(me)?.taken.load(Ordering::Relaxed);
@@ -171,9 +150,8 @@ impl std::fmt::Debug for Spread {
     }
 }
 
-/// A server's place in a spread, and the count it publishes there: every
-/// slot it holds a connection in, from the accept it kept to the slot's
-/// release.
+/// A server's place in a spread, and the count it publishes there: every slot it holds a connection in, from the accept
+/// it kept to the slot's release.
 pub(crate) struct Joined {
     set: Spread,
     place: usize,
@@ -191,8 +169,7 @@ impl Joined {
         }
     }
 
-    /// Where a connection this ring accepted should go instead, if
-    /// anywhere.
+    /// Where a connection this ring accepted should go instead, if anywhere.
     pub(crate) fn target(&self) -> Option<RawFd> {
         if self.closed {
             return None;
@@ -212,8 +189,8 @@ impl Joined {
         self.publish();
     }
 
-    /// This ring takes no more connections: no ring sends it any from here
-    /// on, beyond one already chosen, which it sheds.
+    /// This ring takes no more connections: no ring sends it any from here on, beyond one already chosen, which it
+    /// sheds.
     pub(crate) fn close(&mut self) {
         self.closed = true;
         self.publish();
@@ -225,26 +202,17 @@ impl Joined {
     }
 }
 
-/// The physical cores among the CPUs this thread may run on, each core
-/// once however many hardware threads it has.
+/// The physical cores among the CPUs this thread may run on, each core once however many hardware threads it has.
 ///
-/// A sizing for rings: a second ring on a core's other hardware thread
-/// shares that core's caches and pipeline, and adds far less than a ring
-/// on a core of its own. Reads the affinity mask, so a cpuset or a
-/// service's `CPUAffinity` narrows it, and each CPU's
-/// `topology/core_cpus_list` in sysfs. A CPU whose topology cannot be read
-/// counts as a core of its own. At least 1.
+/// A sizing for rings: a second ring on a core's other hardware thread shares that core's caches and pipeline, and adds
+/// far less than a ring on a core of its own. Reads the affinity mask, so a cpuset or a service's `CPUAffinity` narrows
+/// it, and each CPU's `topology/core_cpus_list` in sysfs. A CPU whose topology cannot be read counts as a core of its
+/// own. At least 1.
 pub fn physical_cores() -> std::io::Result<usize> {
     // SAFETY: `cpu_set_t` is a plain bitmask, valid when zeroed.
     let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     // SAFETY: `mask` is a live `cpu_set_t` of the size passed.
-    let r = unsafe {
-        libc::sched_getaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &mut mask,
-        )
-    };
+    let r = unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut mask) };
     if r != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -252,24 +220,14 @@ pub fn physical_cores() -> std::io::Result<usize> {
         // SAFETY: `cpu` is below CPU_SETSIZE, inside `mask`.
         .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &mask) });
     Ok(count_cores(allowed, |cpu| {
-        std::fs::read_to_string(format!(
-            "/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list"
-        ))
-        .ok()
+        std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_cpus_list")).ok()
     }))
 }
 
-/// Count the distinct cores of `cpus`, each named by the list of CPUs it
-/// shares a core with.
-fn count_cores(
-    cpus: impl Iterator<Item = usize>,
-    siblings: impl Fn(usize) -> Option<String>,
-) -> usize {
+/// Count the distinct cores of `cpus`, each named by the list of CPUs it shares a core with.
+fn count_cores(cpus: impl Iterator<Item = usize>, siblings: impl Fn(usize) -> Option<String>) -> usize {
     let cores: HashSet<String> = cpus
-        .map(|cpu| {
-            siblings(cpu)
-                .map_or_else(|| format!("cpu{cpu}"), |s| s.trim().to_owned())
-        })
+        .map(|cpu| siblings(cpu).map_or_else(|| format!("cpu{cpu}"), |s| s.trim().to_owned()))
         .collect();
     cores.len().max(1)
 }
@@ -357,16 +315,7 @@ mod tests {
     #[test]
     fn hyperthreads_of_one_core_count_once() {
         // Four CPUs on two cores, as the kernel lists their siblings.
-        let siblings = |cpu: usize| {
-            Some(
-                if cpu.is_multiple_of(2) {
-                    "0,2\n"
-                } else {
-                    "1,3\n"
-                }
-                .to_owned(),
-            )
-        };
+        let siblings = |cpu: usize| Some(if cpu.is_multiple_of(2) { "0,2\n" } else { "1,3\n" }.to_owned());
         assert_eq!(count_cores(0..4, siblings), 2);
         assert_eq!(count_cores([0, 2].into_iter(), siblings), 1);
         assert_eq!(count_cores([0, 1].into_iter(), siblings), 2);
@@ -391,10 +340,9 @@ mod tests {
         assert!(counted(&cqe(pack(Op::Accept, 0, 0), 0)));
     }
 
-    /// A send the kernel refuses leaves the connection on the ring that
-    /// accepted it, and it is served there. The other place holds a
-    /// descriptor that is no ring, so every send to it answers `EBADFD`
-    /// (`io_msg_ring`, `io_uring/msg_ring.c`).
+    /// A send the kernel refuses leaves the connection on the ring that accepted it, and it is served there. The other
+    /// place holds a descriptor that is no ring, so every send to it answers `EBADFD` (`io_msg_ring`,
+    /// `io_uring/msg_ring.c`).
     #[test]
     fn a_refused_hand_off_is_served_where_it_was_accepted() {
         use crate::net::core::protocol::{ClientAddr, Endian, PrefixWidth};
@@ -414,9 +362,7 @@ mod tests {
         let addr = ServerAddr::Tcp("127.0.0.1:0".parse().unwrap());
         let mut server = match Server::with_config([addr], cfg, proto) {
             Ok(s) => s,
-            Err(crate::Error::Errno(e))
-                if crate::uring::setup_unavailable(e) =>
-            {
+            Err(crate::Error::Errno(e)) if crate::uring::setup_unavailable(e) => {
                 return;
             }
             Err(e) => panic!("Server::with_config: {e}"),
@@ -431,8 +377,8 @@ mod tests {
         };
         let stop = server.shutdown_handle();
         let stats = server.stats_handle();
-        // The server stops however the client ends, so a connection that
-        // is dropped fails the test rather than hanging it.
+        // The server stops however the client ends, so a connection that is dropped fails the test rather than hanging
+        // it.
         let client = std::thread::spawn(move || {
             let served = (|| -> std::io::Result<Vec<[u8; 5]>> {
                 let mut held = Vec::new();
@@ -452,10 +398,7 @@ mod tests {
             served
         });
         server.serve_forever().expect("serve_forever");
-        let replies = client
-            .join()
-            .expect("client")
-            .expect("served where it was accepted");
+        let replies = client.join().expect("client").expect("served where it was accepted");
         for (i, reply) in replies.iter().enumerate() {
             assert_eq!(*reply, [0, 0, 0, 1, i as u8]);
         }

@@ -9,19 +9,15 @@ pub const LSMT_ROOT: u64 = u64::MAX;
 const LISTMOUNT_REVERSE: libc::c_uint = 1;
 const BATCH: usize = 1024;
 
-/// List the mount ids beneath `mnt_id` (use [`LSMT_ROOT`] for the whole
-/// namespace).
+/// List the mount ids beneath `mnt_id` (use [`LSMT_ROOT`] for the whole namespace).
 ///
-/// With `reverse`, later mounts are listed first - later by **creation**,
-/// which is not the same as deeper. `listmnt_next` walks an rbtree keyed on
-/// `mnt_id_unique` (`fs/namespace.c`), and that field is `++mnt_id_ctr`
-/// assigned when the mount is allocated, so the order is by age and says
-/// nothing about the shape of the tree. `fsmount(2)` then `move_mount(2)`
-/// make a child older than its parent routinely.
+/// With `reverse`, later mounts are listed first - later by **creation**, which is not the same as deeper.
+/// `listmnt_next` walks an rbtree keyed on `mnt_id_unique` (`fs/namespace.c`), and that field is `++mnt_id_ctr`
+/// assigned when the mount is allocated, so the order is by age and says nothing about the shape of the tree.
+/// `fsmount(2)` then `move_mount(2)` make a child older than its parent routinely.
 ///
-/// **So this is not the order for a recursive unmount.** Sort by depth
-/// instead - `mnt_parent_id` comes with `MNT_BASIC` - as
-/// [`umount`](super::umount) does.
+/// **So this is not the order for a recursive unmount.** Sort by depth instead - `mnt_parent_id` comes with
+/// `MNT_BASIC` - as [`umount`](super::umount) does.
 ///
 /// See [`listmount(2)`](https://man7.org/linux/man-pages/man2/listmount.2.html).
 pub fn listmount(mnt_id: u64, reverse: bool) -> errno::Result<Vec<u64>> {
@@ -38,13 +34,7 @@ pub fn listmount(mnt_id: u64, reverse: bool) -> errno::Result<Vec<u64>> {
             mnt_ns_id: 0,
         };
         let n = retry_on_eintr(|| unsafe {
-            libc::syscall(
-                SYS_LISTMOUNT,
-                &mut req as *mut MntIdReq,
-                ids.as_mut_ptr(),
-                BATCH,
-                flags,
-            )
+            libc::syscall(SYS_LISTMOUNT, &mut req as *mut MntIdReq, ids.as_mut_ptr(), BATCH, flags)
         })? as usize;
         if n == 0 {
             break;

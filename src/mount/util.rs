@@ -1,8 +1,6 @@
 //! Higher-level mount helpers built on `statmount`/`listmount`/`umount2`.
 
-use super::{
-    MntFlags, Statmount, StatmountMask, listmount, statmount, umount2,
-};
+use super::{MntFlags, Statmount, StatmountMask, listmount, statmount, umount2};
 use crate::AT_FDCWD;
 use crate::errno::{self, Errno};
 use crate::error::{Error, Result};
@@ -12,8 +10,8 @@ use std::collections::BTreeMap;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
-// Fields wanted for mount enumeration. FULL adds the 6.14+ `sb_source` (needed
-// for ZFS-snapshot detection); older kernels reject it, so we fall back to BASE.
+// Fields wanted for mount enumeration. FULL adds the 6.14+ `sb_source` (needed for ZFS-snapshot detection); older
+// kernels reject it, so we fall back to BASE.
 const INFO_FULL: StatmountMask = StatmountMask::MNT_BASIC
     .union(StatmountMask::SB_BASIC)
     .union(StatmountMask::MNT_ROOT)
@@ -36,12 +34,10 @@ fn statmount_info(mnt_id: u64) -> errno::Result<Statmount> {
     }
 }
 
-/// True if `sm` describes a ZFS snapshot mount (`fs_type == "zfs"` and the
-/// mount source contains `@`). Always false on kernels that do not report
-/// `sb_source`.
+/// True if `sm` describes a ZFS snapshot mount (`fs_type == "zfs"` and the mount source contains `@`). Always false on
+/// kernels that do not report `sb_source`.
 pub fn is_zfs_snapshot(sm: &Statmount) -> bool {
-    sm.fs_type.as_deref() == Some("zfs")
-        && sm.sb_source.as_deref().is_some_and(|s| s.contains('@'))
+    sm.fs_type.as_deref() == Some("zfs") && sm.sb_source.as_deref().is_some_and(|s| s.contains('@'))
 }
 
 /// Return the [`Statmount`] for the mount containing `path` (symlink-safe).
@@ -61,27 +57,17 @@ pub fn statmount_path(path: &Path) -> Result<Statmount> {
         }
         Err(e) => return Err(e.into()),
     };
-    let st = statx(
-        fd.as_fd(),
-        "",
-        AtFlags::AT_EMPTY_PATH,
-        StatxMask::MNT_ID_UNIQUE,
-    )?;
+    let st = statx(fd.as_fd(), "", AtFlags::AT_EMPTY_PATH, StatxMask::MNT_ID_UNIQUE)?;
     Ok(statmount_info(st.mnt_id())?)
 }
 
 /// Enumerate the mounts beneath `mnt_id`, each with full `statmount` detail.
 ///
-/// `reverse` is [`listmount`]'s flag and orders by descending mount id, which
-/// is creation order and **not** children-before-parents; see that function.
-/// For unmount ordering, sort by depth over `mnt_parent_id`, as
-/// [`umount`] does. ZFS snapshot mounts are omitted unless
-/// `include_snapshots` is set. Mounts that vanish mid-enumeration are skipped.
-pub fn iter_mountinfo(
-    mnt_id: u64,
-    reverse: bool,
-    include_snapshots: bool,
-) -> Result<Vec<Statmount>> {
+/// `reverse` is [`listmount`]'s flag and orders by descending mount id, which is creation order and **not**
+/// children-before-parents; see that function. For unmount ordering, sort by depth over `mnt_parent_id`, as [`umount`]
+/// does. ZFS snapshot mounts are omitted unless `include_snapshots` is set. Mounts that vanish mid-enumeration are
+/// skipped.
+pub fn iter_mountinfo(mnt_id: u64, reverse: bool, include_snapshots: bool) -> Result<Vec<Statmount>> {
     let ids = listmount(mnt_id, reverse)?;
     let mut out = Vec::new();
     for id in ids {
@@ -100,27 +86,21 @@ pub fn iter_mountinfo(
 
 /// Mount points beneath `mnt_id`, children before their parents.
 ///
-/// **`listmount`'s reverse order is not this order.** `listmnt_next` walks an
-/// rbtree keyed on `mnt_id_unique` (`fs/namespace.c`, the insert comparison),
-/// and that field is `++mnt_id_ctr` assigned when the mount is *allocated* -
-/// so reverse is descending creation order. It coincides with
-/// children-before-parents only when every child's mount was created after
-/// its parent's, and `fsmount(2)` plus `move_mount(2)` - both exported from
-/// this module - make the opposite ordinary: build the filesystem, build the
-/// one it will live under, then attach. Measured with a three-level tree
-/// whose ids descend with depth, the reverse listing unmounts the middle
-/// mount first, `umount2` answers `EBUSY`, and the caller is told the
-/// unmount failed with the whole tree still mounted.
+/// **`listmount`'s reverse order is not this order.** `listmnt_next` walks an rbtree keyed on `mnt_id_unique`
+/// (`fs/namespace.c`, the insert comparison), and that field is `++mnt_id_ctr` assigned when the mount is *allocated* -
+/// so reverse is descending creation order. It coincides with children-before-parents only when every child's mount was
+/// created after its parent's, and `fsmount(2)` plus `move_mount(2)` - both exported from this module - make the
+/// opposite ordinary: build the filesystem, build the one it will live under, then attach. Measured with a three-level
+/// tree whose ids descend with depth, the reverse listing unmounts the middle mount first, `umount2` answers `EBUSY`,
+/// and the caller is told the unmount failed with the whole tree still mounted.
 ///
-/// Depth is what matters, so it is computed rather than assumed. `MNT_BASIC`
-/// is already requested, so `mnt_parent_id` is in hand; depth is the number
-/// of parent links back to `mnt_id`, and sorting by it descending puts every
-/// child before its parent - a child's depth always exceeds its parent's.
+/// Depth is what matters, so it is computed rather than assumed. `MNT_BASIC` is already requested, so `mnt_parent_id`
+/// is in hand; depth is the number of parent links back to `mnt_id`, and sorting by it descending puts every child
+/// before its parent - a child's depth always exceeds its parent's.
 ///
-/// A mount whose parent chain does not reach `mnt_id` - it vanished
-/// mid-enumeration, or the listing raced - stops at the depth it reached,
-/// which orders it no later than its own descendants. The walk is bounded by
-/// the number of mounts, so a cycle cannot hang it.
+/// A mount whose parent chain does not reach `mnt_id` - it vanished mid-enumeration, or the listing raced - stops at
+/// the depth it reached, which orders it no later than its own descendants. The walk is bounded by the number of
+/// mounts, so a cycle cannot hang it.
 fn descendants_deepest_first(mnt_id: u64) -> Result<Vec<PathBuf>> {
     let mounts = iter_mountinfo(mnt_id, false, true)?;
     let parent_of: BTreeMap<u64, u64> = mounts
@@ -166,11 +146,9 @@ pub struct UmountOptions {
 
 /// Unmount the filesystem at `path`.
 ///
-/// With [`UmountOptions::recursive`], all child mounts (including transient ZFS
-/// snapshot mounts) are unmounted first; `path` must be a mountpoint under the
-/// same symlink rules as the unmount itself, so unless
-/// [`UmountOptions::follow_symlinks`] is set a symlinked `path` is rejected and
-/// nothing is unmounted.
+/// With [`UmountOptions::recursive`], all child mounts (including transient ZFS snapshot mounts) are unmounted first;
+/// `path` must be a mountpoint under the same symlink rules as the unmount itself, so unless
+/// [`UmountOptions::follow_symlinks`] is set a symlinked `path` is rejected and nothing is unmounted.
 pub fn umount(path: &Path, opts: UmountOptions) -> Result<()> {
     let mut flags = MntFlags::empty();
     if opts.force {
@@ -187,25 +165,16 @@ pub fn umount(path: &Path, opts: UmountOptions) -> Result<()> {
     }
 
     if opts.recursive {
-        // Resolve the target exactly as the unmount below will: under
-        // UMOUNT_NOFOLLOW a symlinked path is no mountpoint of its own, so it
-        // fails the check here.
+        // Resolve the target exactly as the unmount below will: under UMOUNT_NOFOLLOW a symlinked path is no mountpoint
+        // of its own, so it fails the check here.
         let at = if opts.follow_symlinks {
             AtFlags::empty()
         } else {
             AtFlags::AT_SYMLINK_NOFOLLOW
         };
-        let st = statx(
-            AT_FDCWD,
-            path,
-            at,
-            StatxMask::MNT_ID_UNIQUE | StatxMask::BASIC_STATS,
-        )?;
+        let st = statx(AT_FDCWD, path, at, StatxMask::MNT_ID_UNIQUE | StatxMask::BASIC_STATS)?;
         if !st.attributes().contains(StatxAttr::MOUNT_ROOT) {
-            return Err(Error::Validation(format!(
-                "{}: not a mountpoint",
-                path.display()
-            )));
+            return Err(Error::Validation(format!("{}: not a mountpoint", path.display())));
         }
         for point in descendants_deepest_first(st.mnt_id())? {
             // Unmount the exact bytes the kernel reported for the child.
