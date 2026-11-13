@@ -1,19 +1,15 @@
-//! The journal transport. A record goes as one datagram in the journal's
-//! own form, sent without blocking, and is counted when it cannot be.
+//! The journal transport. A record goes as one datagram in the journal's own form, sent without blocking, and is
+//! counted when it cannot be.
 //!
-//! Under systemd a daemon's stderr is a stream to journald, and a write to
-//! it blocks for as long as the journal is behind. The journal's own socket
-//! takes datagrams instead, and a send lands whole or fails at once, so the
-//! thread that logs never waits. A record that fails is not queued, since a
-//! queue is a thread and a lock, and a daemon may fork after it starts
-//! logging, as one with a credential broker does. It is counted, and the
-//! count is said in the next record that lands, so the gap shows where it
-//! was.
+//! Under systemd a daemon's stderr is a stream to journald, and a write to it blocks for as long as the journal is
+//! behind. The journal's own socket takes datagrams instead, and a send lands whole or fails at once, so the thread
+//! that logs never waits. A record that fails is not queued, since a queue is a thread and a lock, and a daemon may
+//! fork after it starts logging, as one with a credential broker does. It is counted, and the count is said in the next
+//! record that lands, so the gap shows where it was.
 //!
-//! systemd says whether stderr is the journal with `JOURNAL_STREAM`. When it
-//! is not, records go to stderr as lines, for a terminal or for a harness
-//! that runs the daemon, and a failed write is ignored, since a closed or
-//! broken stderr is no reason to stop serving.
+//! systemd says whether stderr is the journal with `JOURNAL_STREAM`. When it is not, records go to stderr as lines, for
+//! a terminal or for a harness that runs the daemon, and a failed write is ignored, since a closed or broken stderr is
+//! no reason to stop serving.
 
 use std::ffi::OsStr;
 use std::fmt::{self, Write as _};
@@ -30,9 +26,8 @@ pub const SOCKET: &str = "/run/systemd/journal/socket";
 /// The variable systemd sets when stderr is the journal.
 pub const STREAM_VAR: &str = "JOURNAL_STREAM";
 
-/// The most of one value that is kept. A record is one datagram, sized
-/// against the send buffer of the socket, so a longer value is cut at a
-/// character boundary and ends in [`CUT`].
+/// The most of one value that is kept. A record is one datagram, sized against the send buffer of the socket, so a
+/// longer value is cut at a character boundary and ends in [`CUT`].
 pub const MAX_VALUE: usize = 4096;
 
 /// What a cut value ends in.
@@ -54,9 +49,8 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// The journal's own socket when stderr is the journal, and stderr
-    /// otherwise. `identifier` is the `SYSLOG_IDENTIFIER=` of each record
-    /// and the start of each stderr line.
+    /// The journal's own socket when stderr is the journal, and stderr otherwise. `identifier` is the
+    /// `SYSLOG_IDENTIFIER=` of each record and the start of each stderr line.
     pub fn open(identifier: &'static str, level: Level) -> Self {
         let stream = std::env::var_os(STREAM_VAR);
         let transport = match choose(stream.as_deref()) {
@@ -66,13 +60,8 @@ impl Journal {
         Self::with(identifier, level, transport)
     }
 
-    /// The journal's protocol to a socket at `path`, for a test's own
-    /// listener.
-    pub fn native(
-        identifier: &'static str,
-        level: Level,
-        path: impl Into<PathBuf>,
-    ) -> io::Result<Self> {
+    /// The journal's protocol to a socket at `path`, for a test's own listener.
+    pub fn native(identifier: &'static str, level: Level, path: impl Into<PathBuf>) -> io::Result<Self> {
         Ok(Self::with(identifier, level, native(&path.into())?))
     }
 
@@ -81,11 +70,7 @@ impl Journal {
         Self::with(identifier, level, Transport::Stderr)
     }
 
-    fn with(
-        identifier: &'static str,
-        level: Level,
-        transport: Transport,
-    ) -> Self {
+    fn with(identifier: &'static str, level: Level, transport: Transport) -> Self {
         Self {
             identifier,
             level: AtomicU8::new(level.priority()),
@@ -109,16 +94,14 @@ impl Journal {
         self.level.store(level.priority(), Ordering::Relaxed);
     }
 
-    /// The records that could not be sent and are not yet counted in one
-    /// that was.
+    /// The records that could not be sent and are not yet counted in one that was.
     pub fn lost(&self) -> u64 {
         self.lost.load(Ordering::Relaxed)
     }
 
     fn send(&self, socket: &UnixDatagram, path: &Path, event: &Event<'_>) {
-        // The gap is said before the record after it, so the count sits
-        // where the records are missing. If that notice fails too, the
-        // count goes back and the next record that lands says it.
+        // The gap is said before the record after it, so the count sits where the records are missing. If that notice
+        // fails too, the count goes back and the next record that lands says it.
         let lost = self.lost.swap(0, Ordering::Relaxed);
         if lost > 0 {
             let mut notice = Vec::with_capacity(128);
@@ -168,9 +151,8 @@ fn choose(stream: Option<&OsStr>) -> Option<&'static Path> {
     stream.map(|_| Path::new(SOCKET))
 }
 
-/// An unbound datagram socket that does not block, aimed at `path`. It is
-/// addressed at each send rather than connected, so a journal that restarts
-/// and binds again is reached with nothing here noticing.
+/// An unbound datagram socket that does not block, aimed at `path`. It is addressed at each send rather than connected,
+/// so a journal that restarts and binds again is reached with nothing here noticing.
 fn native(path: &Path) -> io::Result<Transport> {
     let socket = UnixDatagram::unbound()?;
     socket.set_nonblocking(true)?;
@@ -180,9 +162,8 @@ fn native(path: &Path) -> io::Result<Transport> {
     })
 }
 
-/// One record in the journal's own form. A value with no newline is
-/// `NAME=value` and a newline. One with a newline is `NAME`, a newline, its
-/// length in 64 bits little endian, the value and a newline.
+/// One record in the journal's own form. A value with no newline is `NAME=value` and a newline. One with a newline is
+/// `NAME`, a newline, its length in 64 bits little endian, the value and a newline.
 pub(crate) fn encode(buf: &mut Vec<u8>, identifier: &str, event: &Event<'_>) {
     push(buf, "PRIORITY", &event.level.priority());
     push(buf, "SYSLOG_IDENTIFIER", &identifier);
@@ -209,8 +190,7 @@ fn push(buf: &mut Vec<u8>, name: &str, value: &dyn fmt::Display) {
     buf.push(b'\n');
 }
 
-/// A `fmt::Write` over the end of a buffer that stops at a limit, keeping
-/// whole every character it keeps.
+/// A `fmt::Write` over the end of a buffer that stops at a limit, keeping whole every character it keeps.
 struct Bounded<'a> {
     buf: &'a mut Vec<u8>,
     end: usize,
@@ -239,25 +219,16 @@ impl fmt::Write for Bounded<'_> {
 
 fn write_bounded(buf: &mut Vec<u8>, value: &dyn fmt::Display) {
     let end = buf.len() + MAX_VALUE;
-    let mut bounded = Bounded {
-        buf,
-        end,
-        cut: false,
-    };
+    let mut bounded = Bounded { buf, end, cut: false };
     let _ = write!(bounded, "{value}");
     if bounded.cut {
         bounded.buf.extend_from_slice(CUT.as_bytes());
     }
 }
 
-/// One record as a stderr line. It is the identifier, the level when it is
-/// not notice or info, the message, and then the fields as `NAME=value`,
-/// with a value quoted when it would not read as one word.
-pub(crate) fn render_line(
-    line: &mut String,
-    identifier: &str,
-    event: &Event<'_>,
-) {
+/// One record as a stderr line. It is the identifier, the level when it is not notice or info, the message, and then
+/// the fields as `NAME=value`, with a value quoted when it would not read as one word.
+pub(crate) fn render_line(line: &mut String, identifier: &str, event: &Event<'_>) {
     let _ = write!(line, "{identifier}: ");
     match event.level {
         Level::Notice | Level::Info => {}
@@ -268,8 +239,7 @@ pub(crate) fn render_line(
     let _ = write!(line, "{}", event.message);
     for field in event.fields {
         let value = field.value().to_string();
-        let one_word = !value.is_empty()
-            && value.chars().all(|c| !c.is_whitespace() && !c.is_control());
+        let one_word = !value.is_empty() && value.chars().all(|c| !c.is_whitespace() && !c.is_control());
         if one_word {
             let _ = write!(line, " {}={value}", field.name());
         } else {
@@ -285,11 +255,7 @@ mod tests {
     use crate::log::{Logger, Source};
     use crate::{TempDir, tempdir};
 
-    fn event<'a>(
-        level: Level,
-        message: fmt::Arguments<'a>,
-        fields: &'a [Field<'a>],
-    ) -> Event<'a> {
+    fn event<'a>(level: Level, message: fmt::Arguments<'a>, fields: &'a [Field<'a>]) -> Event<'a> {
         Event {
             level,
             source: None,
@@ -312,10 +278,7 @@ mod tests {
             format_args!("served"),
             &[Field::new("PATH", &path)],
         ));
-        assert_eq!(
-            buf,
-            b"PRIORITY=6\nSYSLOG_IDENTIFIER=d\nMESSAGE=served\nPATH=/mnt/a\n"
-        );
+        assert_eq!(buf, b"PRIORITY=6\nSYSLOG_IDENTIFIER=d\nMESSAGE=served\nPATH=/mnt/a\n");
     }
 
     #[test]
@@ -335,8 +298,7 @@ mod tests {
         );
     }
 
-    /// A value with a newline takes the form with a length, and the fields
-    /// around it keep the plain one.
+    /// A value with a newline takes the form with a length, and the fields around it keep the plain one.
     #[test]
     fn a_value_with_a_newline_carries_its_length() {
         let name = "a\nb";
@@ -345,8 +307,7 @@ mod tests {
             format_args!("served"),
             &[Field::new("NAME", &name), Field::new("AFTER", &1)],
         ));
-        let mut want =
-            b"PRIORITY=6\nSYSLOG_IDENTIFIER=d\nMESSAGE=served\nNAME\n".to_vec();
+        let mut want = b"PRIORITY=6\nSYSLOG_IDENTIFIER=d\nMESSAGE=served\nNAME\n".to_vec();
         want.extend_from_slice(&3u64.to_le_bytes());
         want.extend_from_slice(b"a\nb\nAFTER=1\n");
         assert_eq!(buf, want);
@@ -361,21 +322,14 @@ mod tests {
         assert_eq!(buf, want);
     }
 
-    /// A cut lands on a character boundary, so a value of two byte
-    /// characters is cut after the last whole one that fits.
+    /// A cut lands on a character boundary, so a value of two byte characters is cut after the last whole one that
+    /// fits.
     #[test]
     fn a_long_value_is_cut_whole() {
         let long = "é".repeat(MAX_VALUE);
-        let buf = encoded(&event(
-            Level::Info,
-            format_args!("m"),
-            &[Field::new("V", &long)],
-        ));
+        let buf = encoded(&event(Level::Info, format_args!("m"), &[Field::new("V", &long)]));
         let text = std::str::from_utf8(&buf).expect("still UTF-8");
-        let value = text
-            .lines()
-            .find_map(|l| l.strip_prefix("V="))
-            .expect("the field");
+        let value = text.lines().find_map(|l| l.strip_prefix("V=")).expect("the field");
         assert!(value.ends_with(CUT));
         let kept = value.strip_suffix(CUT).unwrap();
         assert_eq!(kept.len(), MAX_VALUE);
@@ -383,28 +337,20 @@ mod tests {
         assert!(kept.chars().all(|c| c == 'é'));
     }
 
-    /// One ASCII byte ahead of two byte characters puts the limit inside a
-    /// character, which is then left out whole.
+    /// One ASCII byte ahead of two byte characters puts the limit inside a character, which is then left out whole.
     #[test]
     fn a_cut_inside_a_character_keeps_it_whole() {
         let long = format!("a{}", "é".repeat(MAX_VALUE));
-        let buf = encoded(&event(
-            Level::Info,
-            format_args!("m"),
-            &[Field::new("V", &long)],
-        ));
+        let buf = encoded(&event(Level::Info, format_args!("m"), &[Field::new("V", &long)]));
         let text = std::str::from_utf8(&buf).expect("still UTF-8");
-        let value = text
-            .lines()
-            .find_map(|l| l.strip_prefix("V="))
-            .expect("the field");
+        let value = text.lines().find_map(|l| l.strip_prefix("V=")).expect("the field");
         let kept = value.strip_suffix(CUT).expect("cut");
         assert_eq!(kept.len(), MAX_VALUE - 1);
         assert!(kept.starts_with('a'));
     }
 
-    /// A value that arrives in pieces, from a `Display` that writes several
-    /// times, is cut across the pieces and not in each.
+    /// A value that arrives in pieces, from a `Display` that writes several times, is cut across the pieces and not in
+    /// each.
     #[test]
     fn a_cut_holds_across_pieces() {
         struct Pieces;
@@ -416,11 +362,7 @@ mod tests {
                 Ok(())
             }
         }
-        let buf = encoded(&event(
-            Level::Info,
-            format_args!("m"),
-            &[Field::new("V", &Pieces)],
-        ));
+        let buf = encoded(&event(Level::Info, format_args!("m"), &[Field::new("V", &Pieces)]));
         let text = std::str::from_utf8(&buf).unwrap();
         let value = text.lines().find_map(|l| l.strip_prefix("V=")).unwrap();
         assert_eq!(value.len(), MAX_VALUE + CUT.len());
@@ -429,11 +371,7 @@ mod tests {
     #[test]
     fn an_exact_fit_is_not_cut() {
         let exact = "a".repeat(MAX_VALUE);
-        let buf = encoded(&event(
-            Level::Info,
-            format_args!("m"),
-            &[Field::new("V", &exact)],
-        ));
+        let buf = encoded(&event(Level::Info, format_args!("m"), &[Field::new("V", &exact)]));
         let text = std::str::from_utf8(&buf).unwrap();
         let value = text.lines().find_map(|l| l.strip_prefix("V=")).unwrap();
         assert_eq!(value, exact);
@@ -454,18 +392,10 @@ mod tests {
         );
         assert_eq!(line, "d: served /a SHARE=a NAME=\"two words\"\n");
         line.clear();
-        render_line(
-            &mut line,
-            "d",
-            &event(Level::Notice, format_args!("listening"), &[]),
-        );
+        render_line(&mut line, "d", &event(Level::Notice, format_args!("listening"), &[]));
         assert_eq!(line, "d: listening\n");
         line.clear();
-        render_line(
-            &mut line,
-            "d",
-            &event(Level::Warning, format_args!("degraded"), &[]),
-        );
+        render_line(&mut line, "d", &event(Level::Warning, format_args!("degraded"), &[]));
         assert_eq!(line, "d: warning: degraded\n");
         line.clear();
         render_line(
@@ -493,10 +423,7 @@ mod tests {
     #[test]
     fn without_the_stream_variable_stderr_is_chosen() {
         assert_eq!(choose(None), None);
-        assert_eq!(
-            choose(Some(OsStr::new("8:12345"))),
-            Some(Path::new(SOCKET))
-        );
+        assert_eq!(choose(Some(OsStr::new("8:12345"))), Some(Path::new(SOCKET)));
     }
 
     /// A listener in a directory of its own, standing in for journald.
@@ -535,8 +462,7 @@ mod tests {
     #[test]
     fn a_record_reaches_the_socket_whole() {
         let listener = Listener::bind();
-        let journal =
-            Journal::native("d", Level::Info, &listener.path).unwrap();
+        let journal = Journal::native("d", Level::Info, &listener.path).unwrap();
         assert!(journal.is_native());
         journal.emit(&event(
             Level::Notice,
@@ -551,15 +477,12 @@ mod tests {
         assert_eq!(journal.lost(), 0);
     }
 
-    /// The listener's queue fills, a send then fails at once rather than
-    /// waiting, and once the queue drains the gap is said before the next
-    /// record.
+    /// The listener's queue fills, a send then fails at once rather than waiting, and once the queue drains the gap is
+    /// said before the next record.
     #[test]
     fn a_full_queue_loses_records_and_the_gap_is_said_first() {
         let listener = Listener::bind();
-        let journal = std::sync::Arc::new(
-            Journal::native("d", Level::Info, &listener.path).unwrap(),
-        );
+        let journal = std::sync::Arc::new(Journal::native("d", Level::Info, &listener.path).unwrap());
         let logger = Logger::new(journal.clone());
         let mut sent = 0u64;
         while journal.lost() == 0 {
@@ -588,8 +511,8 @@ mod tests {
         assert_eq!(listener.recv(), None);
     }
 
-    /// With no listener at the path nothing waits and nothing panics, and
-    /// the loss is counted for a listener that comes later.
+    /// With no listener at the path nothing waits and nothing panics, and the loss is counted for a listener that comes
+    /// later.
     #[test]
     fn a_missing_listener_is_a_counted_loss() {
         let listener = Listener::bind();
@@ -603,8 +526,7 @@ mod tests {
     #[test]
     fn a_level_below_the_threshold_costs_no_send() {
         let listener = Listener::bind();
-        let journal =
-            Journal::native("d", Level::Warning, &listener.path).unwrap();
+        let journal = Journal::native("d", Level::Warning, &listener.path).unwrap();
         let logger = Logger::new(std::sync::Arc::new(journal));
         crate::log!(logger, Level::Info, "quiet");
         assert_eq!(listener.recv(), None);

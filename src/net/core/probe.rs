@@ -1,8 +1,6 @@
-//! Kernel capability probes: the construction-time ones (and the getsockopt
-//! `URING_CMD` filler they share), which fail fast with a clear validation
-//! error instead of mysteriously shedding every connection at accept time,
-//! and the per-handshake kTLS key readback a `ready()` runs before a
-//! connection is served as encrypted.
+//! Kernel capability probes: the construction-time ones (and the getsockopt `URING_CMD` filler they share), which fail
+//! fast with a clear validation error instead of mysteriously shedding every connection at accept time, and the
+//! per-handshake kTLS key readback a `ready()` runs before a connection is served as encrypted.
 
 use crate::errno::Errno;
 use crate::error::Error;
@@ -14,56 +12,33 @@ use std::os::fd::AsRawFd;
 
 /// Do the kernel's TLS TX **and** RX directions both hold keys on `fd`?
 ///
-/// The per-direction oracle is `getsockopt(SOL_TLS, TLS_TX/TLS_RX)` with
-/// the 4-byte `tls_crypto_info` header: it answers 0 only once that
-/// direction's keys are installed, `-EBUSY` for a ULP with no keys, and
-/// `-ENOPROTOOPT` with no ULP at all (`do_tls_getsockopt_conf`,
-/// `net/tls/tls_main.c` - `TLS_CRYPTO_INFO_READY` gates the copy-out).
-///
-/// This is what stands between a worker's `ready()` word and the wire: a
-/// socket the kernel never keyed - or keyed in one direction - passes
-/// bytes through in the clear, so serving it as encrypted publishes
-/// plaintext. Measured on this kernel: ULP with no keys and RX-only both
-/// leave TX in the clear.
+/// `getsockopt(SOL_TLS, TLS_TX/TLS_RX)` with the 4-byte `tls_crypto_info` header answers 0 only once that direction's
+/// keys are installed, `-EBUSY` for a ULP with no keys, and `-ENOPROTOOPT` with no ULP at all (`do_tls_getsockopt_conf`
+/// in `net/tls/tls_main.c`). A socket keyed in neither or one direction passes bytes through in the clear, so serving
+/// it as encrypted publishes plaintext.
 pub(crate) fn ktls_keyed_both_ways(fd: std::os::fd::RawFd) -> bool {
     let keyed = |dir: i32| {
-        // The 4-byte header form (version + cipher_type): the kernel
-        // refuses anything shorter and fills exactly this much when asked,
-        // so the probe needs no per-cipher sizing.
+        // The 4-byte header form (version + cipher_type): the kernel refuses anything shorter and fills exactly this
+        // much when asked, so the probe needs no per-cipher sizing.
         let mut info = [0u8; 4];
         let mut len = info.len() as libc::socklen_t;
         // SAFETY: writes at most `len` bytes into `info`.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                SOL_TLS,
-                dir,
-                info.as_mut_ptr().cast(),
-                &mut len,
-            )
-        };
+        let rc = unsafe { libc::getsockopt(fd, SOL_TLS, dir, info.as_mut_ptr().cast(), &mut len) };
         rc == 0
     };
     keyed(TLS_TX) && keyed(TLS_RX)
 }
 
-/// Fill `sqe` as a `SOCKET_URING_OP_GETSOCKOPT(SOL_SOCKET, optname)` command
-/// reading `optlen` bytes into `optval` (which must be a stable address until
-/// the CQE reaps). See `SOCKET_URING_OP_GETSOCKOPT` in `sys.rs` for the SQE
-/// field overlay. The caller sets `fd` (plus `IOSQE_FIXED_FILE` for a pool
-/// slot) and `user_data`; the CQE `res` is the written optlen or `-errno`.
-pub(crate) fn fill_getsockopt_cmd(
-    sqe: &mut IoUringSqe,
-    optname: i32,
-    optval: u64,
-    optlen: u32,
-) {
+/// Fill `sqe` as a `SOCKET_URING_OP_GETSOCKOPT(SOL_SOCKET, optname)` command reading `optlen` bytes into `optval`
+/// (which must be a stable address until the CQE reaps). See `SOCKET_URING_OP_GETSOCKOPT` in `sys.rs` for the SQE field
+/// overlay. The caller sets `fd` (plus `IOSQE_FIXED_FILE` for a pool slot) and `user_data`; the CQE `res` is the
+/// written optlen or `-errno`.
+pub(crate) fn fill_getsockopt_cmd(sqe: &mut IoUringSqe, optname: i32, optval: u64, optlen: u32) {
     sqe.opcode = IORING_OP_URING_CMD;
     // cmd_op lives in the low half of off/addr2.
     sqe.off_addr2 = u64::from(SOCKET_URING_OP_GETSOCKOPT);
     // level (low) and optname (high) overlay the addr field (LE).
-    sqe.addr =
-        (libc::SOL_SOCKET as u32 as u64) | ((optname as u32 as u64) << 32);
+    sqe.addr = (libc::SOL_SOCKET as u32 as u64) | ((optname as u32 as u64) << 32);
     // optlen overlays file_index; optval overlays addr3.
     sqe.file_index = optlen;
     sqe.addr3 = optval;
@@ -71,11 +46,9 @@ pub(crate) fn fill_getsockopt_cmd(
 
 /// Probe whether this kernel accepts socket `URING_CMD`s on `AF_UNIX`.
 ///
-/// The getsockopt command exists since Linux 6.7, but a too-strict
-/// `prot->ioctl` guard rejected every socket command on `AF_UNIX` (whose
-/// `struct proto` has no ioctl) with `EOPNOTSUPP` until the cmd_net fix
-/// (6.18.16 in the 6.18 series). Probing a throwaway socketpair through the
-/// just-created - and otherwise idle - ring turns "every unix connection
+/// The getsockopt command exists since Linux 6.7, but a too-strict `prot->ioctl` guard rejected every socket command on
+/// `AF_UNIX` (whose `struct proto` has no ioctl) with `EOPNOTSUPP` until the cmd_net fix (6.18.16 in the 6.18 series).
+/// Probing a throwaway socketpair through the just-created - and otherwise idle - ring turns "every unix connection
 /// mysteriously shed" into an immediate, actionable construction error.
 pub(crate) fn probe_unix_peercred(ring: &mut Ring) -> crate::Result<()> {
     let mut fds = [0i32; 2];
@@ -91,30 +64,25 @@ pub(crate) fn probe_unix_peercred(ring: &mut Ring) -> crate::Result<()> {
     // SAFETY: socketpair returned two fresh owned fds (closed on all paths).
     let pair = unsafe { (owned_from_raw(fds[0]), owned_from_raw(fds[1])) };
 
-    // Boxed so the kernel's landing pad can outlive an (unreachable) error
-    // path below without ever pointing at a dead stack frame.
+    // Boxed so the kernel's landing pad can outlive an (unreachable) error path below without ever pointing at a dead
+    // stack frame.
     // SAFETY: ucred is plain data; zeroed is a valid initial value.
     let mut cred: Box<libc::ucred> = Box::new(unsafe { std::mem::zeroed() });
     let optval = std::ptr::addr_of_mut!(*cred) as u64;
     ring.push_sqe(|sqe| {
-        fill_getsockopt_cmd(
-            sqe,
-            libc::SO_PEERCRED,
-            optval,
-            size_of::<libc::ucred>() as u32,
-        );
+        fill_getsockopt_cmd(sqe, libc::SO_PEERCRED, optval, size_of::<libc::ucred>() as u32);
         sqe.fd = pair.0.as_raw_fd();
         sqe.user_data = u64::MAX; // reaped below; never reaches the loop
     })?;
     let res = loop {
         if let Err(e) = ring.submit_and_wait(1) {
-            // Enter failed with the op state unknowable: keep the landing pad
-            // alive rather than risk a kernel write into freed memory.
+            // Enter failed with the op state unknowable: keep the landing pad alive rather than risk a kernel write
+            // into freed memory.
             std::mem::forget(cred);
             return Err(e.into());
         }
-        // `submit_and_wait` returns without a completion only on CQ
-        // backpressure - impossible on this idle ring - so this cannot spin.
+        // `submit_and_wait` returns without a completion only on CQ backpressure - impossible on this idle ring - so
+        // this cannot spin.
         if let Some(cqe) = ring.reap() {
             break cqe.res;
         }
@@ -133,44 +101,33 @@ pub(crate) fn probe_unix_peercred(ring: &mut Ring) -> crate::Result<()> {
     )))
 }
 
-/// Probe whether this kernel serves the socket `GETSOCKOPT` `URING_CMD`
-/// (Linux >= 6.8) - the exact command every TCP accept's per-connection
-/// `SO_PEERNAME` fetch issues. Probing the real command (not the older
-/// `SIOCOUTQ`, which landed a release earlier) is what makes this guarantee
-/// hold: a `SO_TYPE` getsockopt on a fresh, unconnected TCP socket needs no
-/// bind/connect and returns the 4-byte type where supported, completing with
-/// `-EOPNOTSUPP` where not - turning "every TCP connection mysteriously shed"
-/// into an immediate, actionable construction error.
+/// Probe whether this kernel serves the socket `GETSOCKOPT` `URING_CMD` (Linux >= 6.8), the exact command every TCP
+/// accept's `SO_PEERNAME` fetch issues. It probes that command and not the older `SIOCOUTQ`, which landed a release
+/// earlier. A `SO_TYPE` getsockopt on a fresh unconnected TCP socket returns the 4-byte type where supported and
+/// `-EOPNOTSUPP` where not.
 pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
     // SAFETY: standard socket() call; result checked against the sentinel.
-    let raw = Errno::result(unsafe {
-        libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
-    })?;
+    let raw = Errno::result(unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) })?;
     // SAFETY: socket() returned a fresh owned fd.
     let sock = unsafe { owned_from_raw(raw) };
-    // The kernel writes the 4-byte option value into `val` while the command is
-    // in flight; the Box keeps its address stable and it outlives the reap.
+    // The kernel writes the 4-byte option value into `val` while the command is in flight; the Box keeps its address
+    // stable and it outlives the reap.
     let mut val: Box<i32> = Box::new(0);
     let optval = std::ptr::addr_of_mut!(*val) as u64;
     ring.push_sqe(|sqe| {
-        fill_getsockopt_cmd(
-            sqe,
-            libc::SO_TYPE,
-            optval,
-            size_of::<i32>() as u32,
-        );
+        fill_getsockopt_cmd(sqe, libc::SO_TYPE, optval, size_of::<i32>() as u32);
         sqe.fd = sock.as_raw_fd();
         sqe.user_data = u64::MAX; // reaped below; never reaches the loop
     })?;
     let res = loop {
         if let Err(e) = ring.submit_and_wait(1) {
-            // Enter failed with the op state unknowable: keep the landing pad
-            // alive rather than risk a kernel write into freed memory.
+            // Enter failed with the op state unknowable: keep the landing pad alive rather than risk a kernel write
+            // into freed memory.
             std::mem::forget(val);
             return Err(e.into());
         }
-        // `submit_and_wait` returns without a completion only on CQ
-        // backpressure - impossible on this idle ring - so this cannot spin.
+        // `submit_and_wait` returns without a completion only on CQ backpressure - impossible on this idle ring - so
+        // this cannot spin.
         if let Some(cqe) = ring.reap() {
             break cqe.res;
         }
@@ -187,17 +144,12 @@ pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
     )))
 }
 
-/// Probe whether this kernel has the TLS ULP (the `tls` module / `CONFIG_TLS`)
-/// that kernel-TLS listeners require. Attaching `TCP_ULP="tls"` to a fresh,
-/// unconnected TCP socket returns `ENOPROTOOPT` when the ULP is absent and
-/// something else (`ENOTCONN` - the ULP init wants an established socket) when
-/// present, so it distinguishes availability without a handshake. Turns "every
-/// kTLS connection mysteriously shed" into a clear construction error.
+/// Probe whether this kernel has the TLS ULP (the `tls` module or `CONFIG_TLS`) that kernel-TLS listeners require.
+/// Attaching `TCP_ULP="tls"` to a fresh unconnected TCP socket fails `ENOTCONN` when the ULP is present, since its init
+/// wants an established socket, so it shows availability without a handshake.
 pub(crate) fn probe_ktls() -> crate::Result<()> {
     // SAFETY: standard socket() call; result checked against the -1 sentinel.
-    let raw = Errno::result(unsafe {
-        libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
-    })?;
+    let raw = Errno::result(unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) })?;
     // SAFETY: socket() returned a fresh owned fd (closed on drop).
     let sock = unsafe { owned_from_raw(raw) };
     let tls = b"tls\0";
@@ -215,16 +167,9 @@ pub(crate) fn probe_ktls() -> crate::Result<()> {
         return Ok(()); // attached (unusual on an unconnected socket, but fine)
     }
     let err = Errno::last();
-    // Fail CLOSED, like `probe_tcp_cmd`. On an unconnected socket the only
-    // signal the ULP is actually present is the TLS ULP's own init refusing a
-    // non-established socket with `ENOTCONN` (net/tls: `tls_init` checks
-    // `sk_state == TCP_ESTABLISHED`). Every other result means it is absent:
-    // an unregistered ULP name (`CONFIG_TLS=n`, or the `tls` module isn't
-    // loaded - the common case) reports `ENOENT` from
-    // `__tcp_ulp_find_autoload`, not `ENOPROTOOPT`; a kernel with no TCP_ULP
-    // support at all reports `ENOPROTOOPT`. Treating `ENOENT` as success would
-    // defeat this gate - every kTLS connection would then be silently shed at
-    // its first recv.
+    // Fail closed. Only `ENOTCONN` from `tls_init`, which refuses a socket not in `TCP_ESTABLISHED`, shows the ULP is
+    // present. A ULP name that is not registered reports `ENOENT` from `__tcp_ulp_find_autoload` and a kernel with no
+    // TCP_ULP support `ENOPROTOOPT`, so treating `ENOENT` as success would quietly shed every kTLS connection.
     if err == Errno::ENOTCONN {
         return Ok(());
     }

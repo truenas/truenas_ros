@@ -1,11 +1,6 @@
-//! The client's request/reply data plane: the reply-framer pump skeleton, the
-//! recv/send/splice completion wrappers (their heavy bookkeeping is core - see
-//! [`Reactor`](crate::net::core::reactor)), reply delivery into the event queue,
-//! and the caller-facing `send`/`request`/`next_event` pump.
-//!
-//! These mirror the server's `io.rs` wrappers exactly, except the framer is the
-//! client's `self.framer` (not a handler bundle) and a delivered message becomes
-//! an [`Event::Reply`] via `deliver_reply` rather than a body-handler call.
+//! The client's request/reply data plane. It holds the reply-framer pump, the recv, send and splice completion wrappers
+//! over the [`Reactor`](crate::net::core::reactor) core, reply delivery into the event queue, and the caller-facing
+//! `send`, `request` and `next_event`.
 
 use super::Client;
 use super::connect::ts_of;
@@ -13,19 +8,14 @@ use super::event::{ConnId, Event, RequestId};
 use crate::errno;
 use crate::net::core::conn::{Op, pack, unpack};
 use crate::net::core::protocol::{Body, CloseReason, Framing};
-use crate::net::core::reactor::{
-    Enacted, Gate, RecvStep, SendStep, SpliceStep,
-};
+use crate::net::core::reactor::{Enacted, Gate, RecvStep, SendStep, SpliceStep};
 use crate::uring::sys::*;
 use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
-/// An in-flight body splice's delivery context, snapshotted when the splice is
-/// armed and emitted as [`Event::Splice`] once the body finishes moving to the
-/// sink fd - the header would otherwise be gone (the core `consume`s it on
-/// completion). One per splicing connection (the pump gates the recv side while
-/// splicing).
+/// An in-flight body splice's delivery context, snapshotted when the splice is armed because the core `consume`s the
+/// header on completion. Emitted as [`Event::Splice`] once the body has moved.
 pub(super) struct PendingSplice {
     /// The request this spliced reply answers (FIFO-correlated).
     id: RequestId,
@@ -39,46 +29,30 @@ impl<U, F> Client<U, F>
 where
     F: FnMut(&[u8], &mut U) -> Framing,
 {
-    /// The per-connection read/deliver pump: consult the reply framer on the
-    /// accumulated bytes and either read more, deliver a buffered reply, or
-    /// close. A thin skeleton over the core: [`Reactor::pump_gate`] runs the
-    /// loop-top guards and [`Reactor::enact_frame_step`] enacts the framer's
-    /// verdict; only the framer call (via the disjoint `self.core.table` +
-    /// `self.framer` borrows) and the `Deliver` seam stay here.
+    /// The per-connection read/deliver pump: consult the reply framer on the accumulated bytes and either read more,
+    /// deliver a buffered reply, or close. [`Reactor::pump_gate`] runs the loop-top guards and
+    /// [`Reactor::enact_frame_step`] enacts the framer's verdict.
     ///
     /// [`Reactor::pump_gate`]: crate::net::core::reactor
     /// [`Reactor::enact_frame_step`]: crate::net::core::reactor
-    pub(super) fn pump(
-        &mut self,
-        slot: u32,
-        generation: u32,
-    ) -> errno::Result<()> {
+    pub(super) fn pump(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         loop {
             match self.core.pump_gate(slot, generation)? {
                 Gate::Stop => return Ok(()),
                 Gate::Proceed => {}
             }
             let verdict = {
-                // `self.core.table` and `self.framer` are disjoint fields, so
-                // the framer can run while the connection is borrowed.
+                // `self.core.table` and `self.framer` are disjoint fields, so the framer can run while the connection
+                // is borrowed.
                 let conn = self.core.table.conn_mut(slot);
                 let (buf, state) = conn.frame_parts();
                 (self.framer)(buf, state)
             };
             match self.core.enact_frame_step(slot, generation, verdict)? {
                 Enacted::Done => {
-                    // If this iteration armed a body splice
-                    // (`Framing::SpliceBody`), correlate it and snapshot its
-                    // header now - the `Event::Splice` emitted when the body
-                    // finishes moving needs them, but the core `consume`s the
-                    // header then. The pump gate stops on `splicing`, so a
-                    // `splicing` connection here was armed this iteration.
-                    if self
-                        .core
-                        .table
-                        .get_conn(slot)
-                        .is_some_and(|c| c.splicing)
-                    {
+                    // The pump gate stops on `splicing`, so a splicing connection here was armed this iteration. Its
+                    // header must be snapshotted now, before the core `consume`s it.
+                    if self.core.table.get_conn(slot).is_some_and(|c| c.splicing) {
                         self.begin_splice(slot, generation)?;
                     }
                     return Ok(());
@@ -88,55 +62,28 @@ where
         }
     }
 
-    /// A body splice was just armed (`Framing::SpliceBody`): correlate it to the
-    /// oldest request awaiting a reply on this connection (FIFO) and snapshot the
-    /// buffered header + body length, stashed until the body finishes moving
-    /// (`deliver_splice` then emits [`Event::Splice`]). A splice with no request
-    /// awaiting it is an unsolicited push - stashed with
-    /// [`RequestId::UNSOLICITED`] when the caller opted in, otherwise a protocol
-    /// violation that closes the connection (the in-flight splice is cancelled).
-    fn begin_splice(
-        &mut self,
-        slot: u32,
-        generation: u32,
-    ) -> errno::Result<()> {
-        let id =
-            match self.awaiting.get_mut(&slot).and_then(VecDeque::pop_front) {
-                Some(id) => id,
-                None if self.cfg.expect_server_push => RequestId::UNSOLICITED,
-                None => {
-                    return self.core.close_conn(
-                        slot,
-                        generation,
-                        CloseReason::Malformed,
-                    );
-                }
-            };
+    /// A body splice was just armed. Correlate it to the oldest request awaiting a reply and stash the header and body
+    /// length for `deliver_splice`. With no request awaiting, it is an unsolicited push, stashed with
+    /// [`RequestId::UNSOLICITED`] when the caller opted in and otherwise closing the connection.
+    fn begin_splice(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
+        let id = match self.awaiting.get_mut(&slot).and_then(VecDeque::pop_front) {
+            Some(id) => id,
+            None if self.cfg.expect_server_push => RequestId::UNSOLICITED,
+            None => {
+                return self.core.close_conn(slot, generation, CloseReason::Malformed);
+            }
+        };
         let (header, body_len) = {
             let (h, bl) = self.core.table.conn(slot).splice_frame_parts();
             (h.to_vec(), bl)
         };
-        self.splicing_frames.insert(
-            slot,
-            PendingSplice {
-                id,
-                header,
-                body_len,
-            },
-        );
+        self.splicing_frames
+            .insert(slot, PendingSplice { id, header, body_len });
         Ok(())
     }
 
-    /// A reply recv completed (`RecvHeader`/`RecvBody`). All the completion
-    /// bookkeeping is core; the returned [`RecvStep`] drives the delivery/pump
-    /// tail - a completed body delivers then pumps, a completed header re-pumps.
-    pub(super) fn on_recv(
-        &mut self,
-        slot: u32,
-        generation: u32,
-        res: i32,
-        op: Op,
-    ) -> errno::Result<()> {
+    /// A reply recv completed. The core does the bookkeeping, and the returned [`RecvStep`] says whether to deliver.
+    pub(super) fn on_recv(&mut self, slot: u32, generation: u32, res: i32, op: Op) -> errno::Result<()> {
         match self.core.on_recv_complete(slot, generation, res, op)? {
             RecvStep::Deliver => {
                 self.deliver_reply(slot, generation)?;
@@ -147,32 +94,17 @@ where
         }
     }
 
-    /// A request send completed (`Op::Send`). All the completion bookkeeping is
-    /// core; a fully flushed gather resumes the pump.
-    pub(super) fn on_send(
-        &mut self,
-        slot: u32,
-        generation: u32,
-        res: i32,
-    ) -> errno::Result<()> {
+    /// A request send completed. A fully flushed gather resumes the pump.
+    pub(super) fn on_send(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
         match self.core.on_send_complete(slot, generation, res)? {
             SendStep::Pump => self.pump(slot, generation),
             SendStep::Done => Ok(()),
         }
     }
 
-    /// A reply-body splice completed (`Op::SpliceRecv`) - for a framer that
-    /// returned [`Framing::SpliceBody`]. The body never entered the buffer (it
-    /// went straight to the caller's sink fd), so a fully moved body emits an
-    /// [`Event::Splice`] (the header stayed buffered/snapshotted; only the body
-    /// length is reported) and pumps the next frame. Error/EOF/deadline paths
-    /// close through the core and surface as [`Event::Closed`].
-    pub(super) fn on_splice_recv(
-        &mut self,
-        slot: u32,
-        generation: u32,
-        res: i32,
-    ) -> errno::Result<()> {
+    /// A reply-body splice completed. A fully moved body emits an [`Event::Splice`] and pumps the next frame. Error,
+    /// EOF and deadline paths close through the core and surface as [`Event::Closed`].
+    pub(super) fn on_splice_recv(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
         match self.core.on_splice_recv_complete(slot, generation, res)? {
             SpliceStep::Pump => {
                 self.deliver_splice(slot);
@@ -182,11 +114,8 @@ where
         }
     }
 
-    /// Emit the [`Event::Splice`] for a fully-moved body: pop the stash
-    /// `begin_splice` recorded (the correlated request id + the header snapshot +
-    /// the body length) and queue the event. The body already went to the sink
-    /// fd. A missing stash (the splice was cancelled before it ever moved a full
-    /// body) emits nothing.
+    /// Emit the [`Event::Splice`] for a fully moved body from the stash `begin_splice` recorded. A missing stash emits
+    /// nothing.
     fn deliver_splice(&mut self, slot: u32) {
         let Some(pending) = self.splicing_frames.remove(&slot) else {
             return;
@@ -200,34 +129,20 @@ where
         });
     }
 
-    /// Turn a fully-buffered reply into an [`Event::Reply`]: correlate it to the
-    /// oldest request awaiting a reply on this connection (FIFO), copy out the
-    /// header and move out the (owned) body, drop the frame from the buffer, and
-    /// queue the event. A reply with no request awaiting it is an unsolicited
-    /// push - surfaced with [`RequestId::UNSOLICITED`] when the caller opted in,
-    /// otherwise a protocol violation that closes the connection.
-    fn deliver_reply(
-        &mut self,
-        slot: u32,
-        generation: u32,
-    ) -> errno::Result<()> {
+    /// Turn a fully buffered reply into an [`Event::Reply`] correlated to the oldest request awaiting a reply. With no
+    /// request awaiting, it is an unsolicited push, surfaced with [`RequestId::UNSOLICITED`] when the caller opted in
+    /// and otherwise closing the connection.
+    fn deliver_reply(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         let gen64 = self.core.table.generation(slot);
         let conn = ConnId::new(slot, gen64);
-        let id =
-            match self.awaiting.get_mut(&slot).and_then(VecDeque::pop_front) {
-                Some(id) => id,
-                None if self.cfg.expect_server_push => RequestId::UNSOLICITED,
-                None => {
-                    return self.core.close_conn(
-                        slot,
-                        generation,
-                        CloseReason::Malformed,
-                    );
-                }
-            };
-        // Own the reply bytes (the connection buffer is reused for the next
-        // frame): the header is copied, the body is moved (zero-copy when it was
-        // placed, a copy when inline).
+        let id = match self.awaiting.get_mut(&slot).and_then(VecDeque::pop_front) {
+            Some(id) => id,
+            None if self.cfg.expect_server_push => RequestId::UNSOLICITED,
+            None => {
+                return self.core.close_conn(slot, generation, CloseReason::Malformed);
+            }
+        };
+        // The connection buffer is reused for the next frame, so the header is copied and the body moved out.
         let (header, body) = {
             let c = self.core.table.conn_mut(slot);
             let (h, mut b, _peer, _state, _ticket) = c.deliver_parts(None);
@@ -243,25 +158,17 @@ where
         Ok(())
     }
 
-    /// Queue `pdu` as a request on `conn` and start sending, returning its
-    /// [`RequestId`] (the reply is FIFO-correlated to it). `WouldBlock` when the
-    /// per-connection in-flight cap (`max_in_flight`) or the send backlog
-    /// (`max_send_backlog`) is reached; `NotConnected` for a stale/unconnected
-    /// handle; `InvalidInput` for an empty `pdu` - a request holds a correlation
-    /// slot until its reply arrives, so (unlike a server reply, where empty means
-    /// "answered, nothing to send") there is no "send nothing" request. The `pdu`
-    /// is sent verbatim - frame it yourself.
-    pub fn send(
-        &mut self,
-        conn: ConnId,
-        pdu: Vec<u8>,
-    ) -> io::Result<RequestId> {
+    /// Queue `pdu` as a request on `conn` and start sending, returning the [`RequestId`] its reply will carry. The
+    /// `pdu` is sent verbatim, so frame it yourself.
+    ///
+    /// # Errors
+    ///
+    /// `WouldBlock` at `max_in_flight` or `max_send_backlog`, `NotConnected` for a stale or unconnected handle, and
+    /// `InvalidInput` for an empty `pdu`, since a request holds a correlation slot until its reply arrives.
+    pub fn send(&mut self, conn: ConnId, pdu: Vec<u8>) -> io::Result<RequestId> {
         let (slot, generation) = conn.parts();
         if !self.core.table.slot_matches(slot, generation) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "not a live connection",
-            ));
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "not a live connection"));
         }
         if pdu.is_empty() {
             return Err(io::Error::new(
@@ -276,13 +183,8 @@ where
                 "max_in_flight requests already outstanding",
             ));
         }
-        if self.core.table.conn(slot).queued_bytes() + pdu.len()
-            > self.cfg.max_send_backlog
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "send backlog is full",
-            ));
+        if self.core.table.conn(slot).queued_bytes() + pdu.len() > self.cfg.max_send_backlog {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "send backlog is full"));
         }
         let id = RequestId(self.next_req);
         self.next_req = self.next_req.wrapping_add(1);
@@ -292,34 +194,20 @@ where
         Ok(id)
     }
 
-    /// Send `pdu` on `conn` and pump until its matching reply arrives, returning
-    /// the reply body. Events for other connections/requests seen while waiting
-    /// are buffered back for later [`next_event`](Client::next_event) calls. The
-    /// connection closing before the reply (or all connections ending) is an
-    /// error.
+    /// Send `pdu` on `conn` and pump until its matching reply arrives, returning the reply body. Events for other
+    /// connections/requests seen while waiting are buffered back for later [`next_event`](Client::next_event) calls.
+    /// The connection closing before the reply (or all connections ending) is an error.
     ///
-    /// Because this blocks until *this* connection replies, other connections'
-    /// events accumulate in memory meanwhile. With untrusted peers - especially
-    /// `expect_server_push` connections, which may stream unsolicited PDUs - a
-    /// peer that withholds this reply while another floods events can grow that
-    /// buffer without bound. Drive such workloads with
-    /// [`next_event`](Client::next_event) /
-    /// [`next_event_timeout`](Client::next_event_timeout) and your own
-    /// backpressure rather than the blocking helpers.
-    pub fn request(
-        &mut self,
-        conn: ConnId,
-        pdu: Vec<u8>,
-    ) -> io::Result<Body<'static>> {
+    /// Other connections' events accumulate in memory meanwhile, so with untrusted peers, `expect_server_push` ones
+    /// above all, that buffer has no bound. Drive such workloads with [`next_event`](Client::next_event) or
+    /// [`next_event_timeout`](Client::next_event_timeout) and your own backpressure.
+    pub fn request(&mut self, conn: ConnId, pdu: Vec<u8>) -> io::Result<Body<'static>> {
         let id = self.send(conn, pdu)?;
         let mut stash: VecDeque<Event> = VecDeque::new();
         let out = loop {
             match self.next_event()? {
                 Some(Event::Reply {
-                    conn: c,
-                    id: rid,
-                    body,
-                    ..
+                    conn: c, id: rid, body, ..
                 }) if c == conn && rid == id => break Ok(body),
                 Some(Event::Closed { conn: c, reason }) if c == conn => {
                     break Err(io::Error::new(
@@ -345,10 +233,8 @@ where
         out
     }
 
-    /// Pump the ring and return the next [`Event`]: drain a ready event, else
-    /// block for completions and dispatch them until one is produced. `None`
-    /// exactly when no connections remain (nothing in flight and no ready
-    /// events).
+    /// Pump the ring and return the next [`Event`]: drain a ready event, else block for completions and dispatch them
+    /// until one is produced. `None` exactly when no connections remain (nothing in flight and no ready events).
     pub fn next_event(&mut self) -> io::Result<Option<Event>> {
         loop {
             if let Some(ev) = self.events.pop_front() {
@@ -361,49 +247,27 @@ where
             while let Some(cqe) = self.core.engine.ring.reap() {
                 self.dispatch(cqe)?;
             }
-            // The client has no listener to re-arm on a freed slot; clear the
-            // core's flag so slot reclamation stays fully accounted.
+            // The client has no listener to re-arm on a freed slot, so the flag is only cleared.
             let _ = self.core.take_pool_freed();
         }
     }
 
-    /// Like [`next_event`](Client::next_event) but bounded: return the next
-    /// [`Event`] if one becomes ready within `dur`, else `Ok(None)` - "no event
-    /// within `dur`". A `None` here does **not** mean "no connections left" (as
-    /// it does for `next_event`); the connections stay open and untouched, so
-    /// call again to keep waiting.
-    ///
-    /// Buffered events are drained first (an immediate return). Otherwise a
-    /// standalone `IORING_OP_TIMEOUT` is armed over the client's own deadline
-    /// pad - never a shared core pad, so a repeated call can't alias one still
-    /// in flight - and the ring is pumped until either an event is produced or
-    /// the deadline fires. If an event wins the race, the still-pending deadline
-    /// is cancelled and reaped before returning, so it never leaks into a later
-    /// call.
-    pub fn next_event_timeout(
-        &mut self,
-        dur: Duration,
-    ) -> io::Result<Option<Event>> {
-        // Ready events return at once - no deadline, no blocking.
+    /// Like [`next_event`](Client::next_event) but bounded: return the next [`Event`] if one becomes ready within
+    /// `dur`, else `Ok(None)` - "no event within `dur`". A `None` here does **not** mean "no connections left" (as it
+    /// does for `next_event`). The connections stay open and untouched, so call again to keep waiting.
+    pub fn next_event_timeout(&mut self, dur: Duration) -> io::Result<Option<Event>> {
         if let Some(ev) = self.events.pop_front() {
             return Ok(Some(ev));
         }
-        // No live work, so nothing can complete: no event to wait for.
         if self.no_live_work() {
             return Ok(None);
         }
-        // A prior call that unwound on a fatal ring error (a `?` below) returns
-        // with its deadline still in flight - the `deadline_pad` is durable for
-        // exactly this reason. Reap it before staging a new one so two
-        // identical-`user_data` deadlines never coexist: a stale one reaped by
-        // this call would be counted as ours and return a premature `None`.
+        // Reap the deadline of a call that unwound (see `deadline_inflight`).
         if self.deadline_inflight {
             self.cancel_and_reap_deadline(pack(Op::Deadline, 0, 0))?;
             self.deadline_inflight = false;
         }
-        // Arm the deadline over the durable `deadline_pad` (see its field doc for
-        // why it outlives a fatal-error `Drop`). `Op::Deadline` with slot/gen 0
-        // is unique on the client ring (it arms no other timer).
+        // `Op::Deadline` with slot and generation 0 is unique on the client ring, which arms no other such timer.
         *self.deadline_pad = ts_of(dur);
         let ts_ptr = std::ptr::addr_of!(*self.deadline_pad) as u64;
         let deadline_ud = pack(Op::Deadline, 0, 0);
@@ -413,10 +277,7 @@ where
             sqe.len = 1; // exactly one timespec, per the kernel
         })?;
         self.deadline_inflight = true;
-        // Pump until an event is queued or the deadline fires. The deadline CQE
-        // is reaped inline here (not via `dispatch`) so its firing is
-        // observable; every other completion routes through `dispatch`, which
-        // may queue an event.
+        // The deadline CQE is reaped here rather than in `dispatch`, so its firing is observable.
         let mut fired = false;
         let out = loop {
             self.core.engine.ring.submit_and_wait(1)?;
@@ -424,8 +285,7 @@ where
                 let (op, _, _) = unpack(cqe.user_data);
                 if matches!(op, Some(Op::Deadline)) {
                     // Not multishot - count it off exactly as `dispatch` would.
-                    self.core.engine.inflight =
-                        self.core.engine.inflight.saturating_sub(1);
+                    self.core.engine.inflight = self.core.engine.inflight.saturating_sub(1);
                     fired = true;
                 } else {
                     self.dispatch(cqe)?;
@@ -438,11 +298,8 @@ where
             if fired {
                 break None;
             }
-            // A completion that produced no event (e.g. a send finishing) and
-            // no deadline yet: wait again - the deadline still bounds the wait.
         };
-        // An event won the race: the deadline is still in flight. Cancel and
-        // reap it so it can't fire on a later call (its pad is rewritten then).
+        // An event won the race, so the deadline is still in flight and must not fire on a later call.
         if !fired {
             self.cancel_and_reap_deadline(deadline_ud)?;
         }
@@ -450,16 +307,10 @@ where
         Ok(out)
     }
 
-    /// Cancel the still-pending `next_event_timeout` deadline (identified by its
-    /// `user_data`) and reap until its terminal completion is seen - so the pad
-    /// is free to rewrite next call and `inflight` stays exact. Any real events
-    /// reaped meanwhile are dispatched (queued for a later `next_event`). A
-    /// cancel completing `-ENOENT` matched nothing, so the deadline is already
-    /// reaped and no `Op::Deadline` completion is owed: stop waiting for one.
-    fn cancel_and_reap_deadline(
-        &mut self,
-        deadline_ud: u64,
-    ) -> errno::Result<()> {
+    /// Cancel the pending `next_event_timeout` deadline and reap until its terminal completion, so the pad is free to
+    /// rewrite and `inflight` stays exact. Other completions reaped meanwhile are dispatched. A cancel completing
+    /// `-ENOENT` matched nothing, so no `Op::Deadline` completion is owed.
+    fn cancel_and_reap_deadline(&mut self, deadline_ud: u64) -> errno::Result<()> {
         self.core.stage(pack(Op::Cancel, 0, 0), move |sqe| {
             sqe.opcode = IORING_OP_ASYNC_CANCEL;
             sqe.fd = -1;
@@ -471,17 +322,12 @@ where
             while let Some(cqe) = self.core.engine.ring.reap() {
                 let (op, _, _) = unpack(cqe.user_data);
                 if matches!(op, Some(Op::Deadline)) {
-                    // The cancelled deadline's own completion (`-ECANCELED`, or
-                    // `-ETIME` if it fired concurrently). Count it off inline.
-                    self.core.engine.inflight =
-                        self.core.engine.inflight.saturating_sub(1);
+                    // `-ECANCELED`, or `-ETIME` if it fired concurrently.
+                    self.core.engine.inflight = self.core.engine.inflight.saturating_sub(1);
                     done = true;
                 } else {
-                    // Includes the `Cancel` control op's completion, which
-                    // `dispatch` counts off and ignores. `-ENOENT` on it means
-                    // the cancel found no target: the deadline is gone.
-                    let gone = matches!(op, Some(Op::Cancel))
-                        && cqe.res == -libc::ENOENT;
+                    // `-ENOENT` on the cancel means it found no target, so the deadline is gone.
+                    let gone = matches!(op, Some(Op::Cancel)) && cqe.res == -libc::ENOENT;
                     self.dispatch(cqe)?;
                     done |= gone;
                 }
@@ -495,8 +341,8 @@ where
     }
 }
 
-// `not(loom)`: this module builds a real ring and drives real threads,
-// neither of which a model run has. See `src/sync.rs`.
+// `not(loom)`: this module builds a real ring and drives real threads, neither of which a model run has. See
+// `src/sync.rs`.
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
@@ -510,8 +356,8 @@ mod tests {
     /// A stateless framer type the test client is generic over.
     type Framer = fn(&[u8], &mut ()) -> Framing;
 
-    /// A client for a white-box deadline test, or `None` where io_uring is
-    /// unavailable - the environment skip the integration suites also take.
+    /// A client for a white-box deadline test, or `None` where io_uring is unavailable - the environment skip the
+    /// integration suites also take.
     fn client() -> Option<Client<(), Framer>> {
         fn framer(_buf: &[u8], _state: &mut ()) -> Framing {
             Framing::More
@@ -519,11 +365,7 @@ mod tests {
         let framer: Framer = framer;
         match Client::new(ClientConfig::default(), framer) {
             Ok(c) => Some(c),
-            Err(crate::Error::Errno(e))
-                if crate::uring::setup_unavailable(e) =>
-            {
-                None
-            }
+            Err(crate::Error::Errno(e)) if crate::uring::setup_unavailable(e) => None,
             Err(e) => panic!("client new: {e}"),
         }
     }
@@ -531,8 +373,8 @@ mod tests {
     #[test]
     fn dispatch_of_a_stray_deadline_retires_the_flag() {
         let Some(mut client) = client() else { return };
-        // The state a `next_event_timeout` that unwound leaves behind: the flag
-        // set, its `Op::Deadline` still counted in flight.
+        // The state a `next_event_timeout` that unwound leaves behind: the flag set, its `Op::Deadline` still counted
+        // in flight.
         client.deadline_inflight = true;
         client.core.engine.inflight = 1;
         client
@@ -542,21 +384,17 @@ mod tests {
                 flags: 0,
             })
             .expect("dispatch the deadline");
-        assert!(
-            !client.deadline_inflight,
-            "consuming the deadline retires the flag"
-        );
+        assert!(!client.deadline_inflight, "consuming the deadline retires the flag");
         assert_eq!(client.core.engine.inflight, 0, "counted off exactly once");
     }
 
     #[test]
     fn bounded_wait_recovers_from_an_unarmed_deadline_flag() {
         let Some(mut client) = client() else { return };
-        // A peer that accepts and then sits idle, so the client has live work
-        // (an armed reply recv) and no completion of its own to reap.
+        // A peer that accepts and then sits idle, so the client has live work (an armed reply recv) and no completion
+        // of its own to reap.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let SocketAddr::V4(v4) = listener.local_addr().expect("local_addr")
-        else {
+        let SocketAddr::V4(v4) = listener.local_addr().expect("local_addr") else {
             unreachable!("bound v4");
         };
         let peer = thread::spawn(move || {
@@ -568,9 +406,8 @@ mod tests {
             .connect(ServerAddr::Tcp(v4), ConnectOpts::default())
             .expect("connect to the idle peer");
 
-        // The flag set with no `Op::Deadline` armed: the reap-side cancel
-        // matches nothing (`-ENOENT`), which is the whole of what is owed, so
-        // the call goes on to arm its own deadline and time out normally.
+        // The flag set with no `Op::Deadline` armed: the reap-side cancel matches nothing (`-ENOENT`), which is the
+        // whole of what is owed, so the call goes on to arm its own deadline and time out normally.
         client.deadline_inflight = true;
         let t0 = Instant::now();
         let ev = client

@@ -1,15 +1,12 @@
-//! The volatile zeroing burn shared by [`secrets`](crate::secrets) (which
-//! re-exports it) and `configfile`'s scrub-on-release mode.
+//! The volatile zeroing burn shared by [`secrets`](crate::secrets) (which re-exports it) and `configfile`'s
+//! scrub-on-release mode.
 
 use std::sync::atomic::{Ordering, compiler_fence};
 
 /// Overwrite `len` bytes at `p` with zeroes so the optimizer cannot elide it.
 ///
-/// A per-byte `write_volatile` plus a compiler fence - the same primitives
-/// `zeroize` uses internally, and what `truenas_pam::Secret` uses. A plain
-/// store to soon-dead memory is a dead store the compiler will drop; a
-/// volatile one it must keep. Use it on a transient buffer a secret passed
-/// through.
+/// Use it on a transient buffer a secret passed through. A plain store to soon-dead memory is a dead store the compiler
+/// drops, so keep the volatile writes.
 ///
 /// # Safety
 ///

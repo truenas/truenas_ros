@@ -1,39 +1,16 @@
 //! Whole-directory name reads over an already-open descriptor.
 //!
-//! The base layer's answer to "what does this directory hold": one
-//! call, one `Vec` of raw names with the type `readdir` reported for
-//! each. There is no io_uring `getdents` opcode, so an async consumer
-//! runs [`read_names`] inside an offload job over a descriptor its
-//! credential-checked step already opened. The traversal built on the
-//! same stream is [`iter`](crate::sync_fs::iter) (feature `fsiter`),
-//! which owns descent, resume and mount pinning; this module is
-//! deliberately smaller — names out, nothing followed, nothing opened.
+//! [`read_names`] gives one `Vec` of raw names with the type `readdir` reported for each, and [`Listing`] reads one
+//! entry at a time from a cookie, for a listing a peer resumes, as NFS READDIR does. There is no io_uring `getdents`
+//! opcode, so an async consumer runs these in an offload job over a descriptor its credential-checked step already
+//! opened. Names out, nothing followed, nothing opened. The traversal is [`iter`](crate::sync_fs::iter) (feature
+//! `fsiter`).
 //!
-//! **The descriptor contract.** Everything here reads through a descriptor
-//! the caller supplies, and two properties travel with one.
-//!
-//! A `dup` - `F_DUPFD_CLOEXEC` included - shares the *open file
-//! description*, and a directory's read position lives there rather than in
-//! the descriptor. Two readers over dups of one description therefore
-//! consume each other's entries, and `readdir` reports nothing when they do:
-//! the loss is a short listing, not an error. **A shared description is
-//! single-reader.** That is not a lock this module can take, because the
-//! sharing is invisible from the descriptor number;
-//! [`iter::Entry::fd`](crate::sync_fs::iter::Entry::fd) states the same rule
-//! for the descriptor a walk hands out.
-//!
-//! Reopening would buy a private position, and would pay for it in
-//! authority: a fresh open is checked against the process that opens it,
-//! not against whoever obtained the descriptor it starts from - which in a
-//! process running as root is no check at all. So this module dups and
-//! spends the position rather than reopening and widening the right, and
-//! the position is the caller's to protect.
-//!
-//! A listing a peer resumes, as NFS READDIR does from a cookie, is
-//! [`Listing`]. It reads one entry at a time with the cookie that goes on
-//! after it, and starts from any cookie an entry gave, on the same dup and
-//! under the same contract. It takes `getdents64` straight, into room its
-//! caller sizes, since a stream's buffer is lost at every seek.
+//! **A shared description is single-reader.** Both read on a `dup`, which shares the open file description, and a
+//! directory's read position lives there, so two readers over dups of one description consume each other's entries, and
+//! the loss is a short listing, not an error. Reopening would buy a private position, but a fresh open is checked
+//! against the process that opens it, which as root is no check at all. So this module dups, and the position is the
+//! caller's to protect.
 
 use std::ffi::CStr;
 use std::fmt;
@@ -48,10 +25,8 @@ use crate::errno::{self, Errno};
 
 /// The type `readdir` reported for one name, straight from `d_type`.
 ///
-/// A hint, not a verdict: a filesystem may decline to fill it
-/// ([`Unknown`](NameKind::Unknown)), and an entry can change type
-/// between the read and any later open — a consumer acting on the kind
-/// confirms it against the file it opens, as
+/// A hint, not a verdict: a filesystem may decline to fill it ([`Unknown`](NameKind::Unknown)), and an entry can change
+/// type between the read and any later open — a consumer acting on the kind confirms it against the file it opens, as
 /// [`iter`](crate::sync_fs::iter) does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NameKind {
@@ -79,8 +54,8 @@ impl NameKind {
     }
 }
 
-/// One name from [`read_names`]: bytes exactly as the directory holds
-/// them — no UTF-8 assumption — with `.` and `..` already dropped.
+/// One name from [`read_names`]: bytes exactly as the directory holds them — no UTF-8 assumption — with `.` and `..`
+/// already dropped.
 #[derive(Debug)]
 pub struct DirEntryName {
     /// The entry's name bytes.
@@ -91,55 +66,17 @@ pub struct DirEntryName {
 
 /// Read every name in the directory open at `fd`, in filesystem order.
 ///
-/// One full drain per call: the stream is rewound first, so the result is
-/// the whole directory wherever the descriptor's offset sat. The stream
-/// runs on a `dup`, which shares the original's open file description, so
-/// **the caller's position is spent by the read** - a consuming read of the
-/// position, not a peek. A caller that is itself reading `fd`, or that has
-/// handed it to a traversal, reopens for a position of its own
-/// (`openat(fd, ".", O_RDONLY | O_DIRECTORY)`, as `shutil::reopen_dir`
-/// does) before calling here.
+/// One full drain per call. The stream is rewound first and runs on a `dup`, which shares `fd`'s open file description,
+/// so **the caller's position is spent by the read**. A caller that is itself reading `fd`, or has handed it to a
+/// traversal, reopens for a position of its own (`openat(fd, ".", O_RDONLY | O_DIRECTORY)`) first.
 ///
-/// **A `dup` cannot serve, and is not cheaper.** `fdopendir` rejects it
-/// for the same `O_PATH` reason, since a dup carries the original's
-/// access mode; and it *shares* the original's file description, so
-/// rewinding it to read from the start rewinds the caller's stream and
-/// the drain then leaves that at EOF - which makes a traversal that calls
-/// this on a directory it is walking
-/// ([`iter::Entry::fd`](crate::sync_fs::iter::Entry::fd), whose frame
-/// descends on a dup of that same fd) lose the rest of that directory
-/// with no error to say so. The dup also costs one syscall *more*: it
-/// needs a `rewinddir`, and the reopen does not.
+/// The dup keeps the read on the descriptor's own authority, where a fresh open would be checked against whoever calls.
+/// An `O_PATH` handle, such as an [`Anchor`](crate::uring_fs::Anchor), is refused by `fdopendir` with `EBADF`, where an
+/// `openat2` through it would succeed and manufacture the read it was opened without.
 ///
-/// **The dup is what keeps the read on the descriptor's own authority.** A
-/// dup carries the access `fd` was opened with and re-checks nothing, so
-/// what may be read here is what the opener was already entitled to read.
-/// A fresh open would instead be authorized against whoever calls this, and
-/// would need a right a dup does not - search (`x`) on the directory - so
-/// it would both widen and narrow the wrong way.
-///
-/// An `O_PATH` handle is a reference carrying no read, and `fdopendir`
-/// refuses one with `EBADF`. That refusal is the kernel's, not a check this
-/// module makes, and it is why the dup matters:
-/// `openat2` through an `O_PATH` descriptor *succeeds*, manufacturing the
-/// access it was deliberately opened without.
-/// [`Anchor`](crate::uring_fs::Anchor) is such a handle.
-///
-/// **Unbounded by construction.** One call, one `Vec`, every name: there is
-/// no limit, cursor or streaming variant, so a caller holds the whole
-/// directory at roughly 46-54 bytes and one allocation per entry. That is
-/// the shape a whole-drain wants and it is fine for a directory whose size
-/// the caller controls; a listing that a peer can grow belongs on
-/// [`uring_fs::query_dir`](crate::uring_fs::query_dir), which pages and
-/// enriches. No bounded twin is offered here rather than one being invented
-/// for a caller that does not exist - this function has none outside its own
-/// tests.
-///
-/// Order is the filesystem's own (ZAP hash order on ZFS); a sorted view is
-/// the caller's sort. The result is a snapshot, not an atomic one: an entry
-/// renamed while the drain runs moves relative to the cursor and can be
-/// missed or reported twice, which is `readdir`'s contract and not
-/// something this layer can close.
+/// **Unbounded.** Every name is held at once, so a listing a peer can grow belongs on
+/// [`uring_fs::query_dir`](crate::uring_fs::query_dir), which pages. Order is the filesystem's own (ZAP hash order on
+/// ZFS), and an entry renamed during the drain can be missed or reported twice, which is `readdir`'s contract.
 pub fn read_names(fd: impl AsFd) -> errno::Result<Vec<DirEntryName>> {
     let dup = fd
         .as_fd()
@@ -161,25 +98,16 @@ pub fn read_names(fd: impl AsFd) -> errno::Result<Vec<DirEntryName>> {
     Ok(names)
 }
 
-/// A directory read one entry at a time from a cookie, for a listing that
-/// a peer resumes, as NFS READDIR does.
+/// A directory read one entry at a time from a cookie, for a listing that a peer resumes, as NFS READDIR does.
 ///
-/// It reads on a dup of the descriptor it opens over, as [`read_names`]
-/// does and under the same contract, so the caller's position is spent.
-/// A cookie is what the kernel gives as `d_off`, the position of the entry
-/// after the one it came with, and [`seek`](Listing::seek) goes on from
-/// there, as `seekdir` does with what `telldir` gave. The cookie 0 is the
-/// beginning. On ZFS a cookie is a serialized ZAP cursor, which holds
-/// while the folder changes, and the kernel gives the last entry the
-/// cursor's end. `.` and `..` are left out, as [`read_names`] leaves them
-/// out, and their cookies are never given.
+/// It reads on a dup, as [`read_names`] does and under the same contract, so the caller's position is spent. A cookie
+/// is the kernel's `d_off`, the position after the entry it came with, and [`seek`](Listing::seek) goes on from there.
+/// The cookie 0 is the beginning. On ZFS a cookie is a serialized ZAP cursor, which holds while the folder changes. `.`
+/// and `..` are left out.
 ///
-/// It reads through `getdents64` and not glibc's `readdir`, whose buffer
-/// follows `st_blksize`, 128 KiB on a dataset's folder, and which a seek
-/// throws away. A caller that resumes for each request of a peer and
-/// wants a few hundred names would then read thousands each time and
-/// read the same ones again the next. So the caller says how much to
-/// read at a time, about what it means to take, as `room`.
+/// It reads through `getdents64` into `room` bytes the caller sizes, and not through glibc's `readdir`, whose buffer is
+/// 128 KiB on a dataset and is thrown away at every seek, so a peer resuming for a few hundred names would read
+/// thousands each time.
 pub struct Listing {
     file: File,
     /// Where `getdents64` writes, which is the room asked for.
@@ -199,9 +127,8 @@ impl fmt::Debug for Listing {
     }
 }
 
-/// The least a [`Listing`] reads at a time. `getdents64` answers `EINVAL`
-/// when the next record does not fit, and a page holds the longest name
-/// any file system gives.
+/// The least a [`Listing`] reads at a time. `getdents64` answers `EINVAL` when the next record does not fit, and a page
+/// holds the longest name any file system gives.
 const LEAST_ROOM: usize = 4096;
 
 /// The most a [`Listing`] reads at a time, where glibc stops too.
@@ -225,12 +152,9 @@ struct Record<'a> {
 }
 
 impl<'a> Record<'a> {
-    /// The record `bytes` begin with, or `None` for one that does not lie
-    /// within them with its name ended.
+    /// The record `bytes` begin with, or `None` for one that does not lie within them with its name ended.
     fn read(bytes: &'a [u8]) -> Option<Record<'a>> {
-        let word = |at: usize| -> Option<[u8; 8]> {
-            bytes.get(at..at + 8)?.try_into().ok()
-        };
+        let word = |at: usize| -> Option<[u8; 8]> { bytes.get(at..at + 8)?.try_into().ok() };
         let len = bytes.get(RECORD_LEN..RECORD_LEN + 2)?;
         let len = u16::from_ne_bytes(len.try_into().ok()?) as usize;
         let name = bytes.get(RECORD_NAME..len)?;
@@ -259,22 +183,19 @@ pub struct Entry<'a> {
     pub kind: NameKind,
     /// Its inode number, as the directory gives it.
     pub ino: u64,
-    /// The cookie of the position after it, which [`Listing::seek`] goes
-    /// on from.
+    /// The cookie of the position after it, which [`Listing::seek`] goes on from.
     pub cookie: u64,
 }
 
 impl Listing {
-    /// Open a listing over `fd`, from the beginning, on a dup of it, that
-    /// reads about `room` bytes of records at a time. A record takes 19
-    /// bytes and its name and its NUL, rounded up to 8. It reads at least
-    /// a page and at most a MiB at a time, however little or much is asked.
+    /// Open a listing over `fd`, from the beginning, on a dup of it, that reads about `room` bytes of records at a
+    /// time. A record takes 19 bytes and its name and its NUL, rounded up to 8. It reads at least a page and at most a
+    /// MiB at a time, however little or much is asked.
     ///
-    /// An `O_PATH` descriptor is refused with `EBADF`, as [`read_names`]
-    /// says, and what is not a directory with `ENOTDIR`.
+    /// An `O_PATH` descriptor is refused with `EBADF`, as [`read_names`] says, and what is not a directory with
+    /// `ENOTDIR`.
     pub fn open(fd: impl AsFd, room: usize) -> errno::Result<Listing> {
-        let file =
-            File::from(fd.as_fd().try_clone_to_owned().map_err(errno_of)?);
+        let file = File::from(fd.as_fd().try_clone_to_owned().map_err(errno_of)?);
         if !file.metadata().map_err(errno_of)?.is_dir() {
             return Err(Errno::ENOTDIR);
         }
@@ -288,18 +209,14 @@ impl Listing {
         Ok(listing)
     }
 
-    /// Go on from `cookie`, which an entry gave, or from the beginning
-    /// for 0. A cookie the file system takes for no position is an error
-    /// here, where `seekdir` could not say so and would have gone on from
-    /// wherever the stream stood.
+    /// Go on from `cookie`, which an entry gave, or from the beginning for 0. A cookie the file system takes for no
+    /// position is an error here, where `seekdir` could not say so and would have gone on from wherever the stream
+    /// stood.
     pub fn seek(&mut self, cookie: u64) -> errno::Result<()> {
         self.filled = 0;
         self.at = 0;
         // The cookie goes through as the kernel gave it.
-        self.file
-            .seek(SeekFrom::Start(cookie))
-            .map_err(errno_of)
-            .map(|_| ())
+        self.file.seek(SeekFrom::Start(cookie)).map_err(errno_of).map(|_| ())
     }
 
     /// The next entry, or `None` at the end.
@@ -325,18 +242,15 @@ impl Listing {
         }))
     }
 
-    /// The record at `at`. The kernel lays them out, so `EIO` is for one
-    /// that lies outside what it filled.
+    /// The record at `at`. The kernel lays them out, so `EIO` is for one that lies outside what it filled.
     fn record(&self, at: usize) -> errno::Result<Record<'_>> {
         Record::read(&self.buffer[at..self.filled]).ok_or(Errno::EIO)
     }
 
-    /// Read the next records, and say whether there were any. A directory
-    /// removed since it opened answers `ENOENT` (`iterate_dir`), which is
-    /// the end, as glibc takes it and POSIX has it.
+    /// Read the next records, and say whether there were any. A directory removed since it opened answers `ENOENT`
+    /// (`iterate_dir`), which is the end, as glibc takes it and POSIX has it.
     fn fill(&mut self) -> errno::Result<bool> {
-        // SAFETY: a live descriptor, and a buffer of the length given,
-        // which the kernel writes no more than.
+        // SAFETY: a live descriptor, and a buffer of the length given, which the kernel writes no more than.
         let got = unsafe {
             libc::syscall(
                 libc::SYS_getdents64,
@@ -366,18 +280,12 @@ fn errno_of(error: std::io::Error) -> Errno {
 ///
 /// # Safety
 ///
-/// `ent` points at a record `readdir` gave on a stream that has not been
-/// read since, and the name is valid for `'a` only until that stream is
-/// read again.
+/// `ent` points at a record `readdir` gave on a stream that has not been read since, and the name is valid for `'a`
+/// only until that stream is read again.
 ///
-/// A `&libc::dirent` must NOT be formed here. The reference would claim all
-/// 280 bytes of the struct, `d_name` being a `[c_char; 256]`, over a record
-/// only `d_reclen` bytes long. A short-named entry's record is 24 to 40
-/// bytes, and the last record in a filled buffer ends where the buffer's
-/// valid data does. Measured on ZFS, over 5002 entries the tightest record
-/// left 32 valid bytes. The same idiom, with the same reason, is at
-/// `uring_fs/core.rs` and `uring_fs/query_dir.rs`. `d_ino`, `d_off` and
-/// `d_type` are inside every record's fixed head, before the name.
+/// A `&libc::dirent` must NOT be formed here. It would claim all 280 bytes of the struct over a record only `d_reclen`
+/// bytes long, and the last record in a filled buffer ends where the valid data does. `d_ino`, `d_off` and `d_type` are
+/// inside every record's fixed head, before the name.
 unsafe fn fields_of<'a>(ent: *mut libc::dirent) -> (u8, u64, u64, &'a [u8]) {
     // SAFETY: the caller's, and every field is read through `addr_of!`.
     unsafe {
@@ -385,10 +293,7 @@ unsafe fn fields_of<'a>(ent: *mut libc::dirent) -> (u8, u64, u64, &'a [u8]) {
             std::ptr::addr_of!((*ent).d_type).read(),
             std::ptr::addr_of!((*ent).d_ino).read(),
             std::ptr::addr_of!((*ent).d_off).read() as u64,
-            CStr::from_ptr(
-                std::ptr::addr_of!((*ent).d_name).cast::<libc::c_char>(),
-            )
-            .to_bytes(),
+            CStr::from_ptr(std::ptr::addr_of!((*ent).d_name).cast::<libc::c_char>()).to_bytes(),
         )
     }
 }
@@ -406,9 +311,8 @@ pub(crate) struct DirEntry {
 #[derive(Debug)]
 pub(crate) struct Dir(NonNull<libc::DIR>);
 
-// SAFETY: a `Dir` owns its `DIR` exclusively and is never shared, so it may be
-// moved between threads. It is deliberately not `Sync`: concurrent `readdir`
-// on one stream is unsafe.
+// SAFETY: a `Dir` owns its `DIR` exclusively and is never shared, so it may be moved between threads. It is
+// deliberately not `Sync`: concurrent `readdir` on one stream is unsafe.
 unsafe impl Send for Dir {}
 
 impl Dir {
@@ -428,8 +332,7 @@ impl Dir {
         }
     }
 
-    /// The stream's descriptor, which the traversal opens entries
-    /// relative to.
+    /// The stream's descriptor, which the traversal opens entries relative to.
     #[cfg(feature = "fsiter")]
     pub(crate) fn fd(&self) -> std::os::fd::RawFd {
         // SAFETY: `self.0` is a live DIR stream.
@@ -438,8 +341,8 @@ impl Dir {
 
     /// Reset the stream to the directory's start.
     ///
-    /// Shared with whatever else holds this open file description, which is
-    /// the consuming half of [`read_names`]' contract.
+    /// Shared with whatever else holds this open file description, which is the consuming half of [`read_names`]'
+    /// contract.
     fn rewind(&mut self) {
         // SAFETY: `self.0` is a live DIR stream we own exclusively.
         unsafe { libc::rewinddir(self.0.as_ptr()) };
@@ -450,8 +353,8 @@ impl Dir {
         if ent.is_null() {
             return Ok(None);
         }
-        // SAFETY: `ent` is the record `readdir` just gave, valid until the
-        // next read, and every field is copied out before that.
+        // SAFETY: `ent` is the record `readdir` just gave, valid until the next read, and every field is copied out
+        // before that.
         let (d_type, d_ino, _, name) = unsafe { fields_of(ent) };
         #[cfg(not(feature = "fsiter"))]
         let _ = d_ino;
@@ -465,8 +368,7 @@ impl Dir {
 
     /// The next record, or null at the end.
     fn read_record(&mut self) -> errno::Result<*mut libc::dirent> {
-        // readdir signals end-of-directory and error both with NULL; clear
-        // errno first to tell them apart.
+        // readdir signals end-of-directory and error both with NULL; clear errno first to tell them apart.
         Errno::clear();
         // SAFETY: `self.0` is a live DIR stream we own exclusively.
         let ent = unsafe { libc::readdir(self.0.as_ptr()) };
@@ -493,19 +395,15 @@ mod tests {
 
     use super::*;
 
-    /// The one caller shape this exists for: a directory holding every
-    /// kind `readdir` can report, read whole through an fd.
+    /// The one caller shape this exists for: a directory holding every kind `readdir` can report, read whole through an
+    /// fd.
     #[test]
     fn every_name_comes_back_with_its_kind() {
         let tmp = crate::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("plain"), b"x").expect("file");
         std::fs::create_dir(tmp.path().join("sub")).expect("dir");
-        std::os::unix::fs::symlink("plain", tmp.path().join("link"))
-            .expect("symlink");
-        let fifo = std::ffi::CString::new(
-            tmp.path().join("pipe").into_os_string().into_vec(),
-        )
-        .expect("path");
+        std::os::unix::fs::symlink("plain", tmp.path().join("link")).expect("symlink");
+        let fifo = std::ffi::CString::new(tmp.path().join("pipe").into_os_string().into_vec()).expect("path");
         // SAFETY: `fifo` is a NUL-terminated path we own.
         let rc = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
         assert_eq!(rc, 0, "mkfifo: {}", Errno::last());
@@ -513,8 +411,7 @@ mod tests {
         let dirf = std::fs::File::open(tmp.path()).expect("open dir");
         let mut got = read_names(dirf.as_fd()).expect("read_names");
         got.sort_by(|a, b| a.name.cmp(&b.name));
-        let view: Vec<(&[u8], NameKind)> =
-            got.iter().map(|e| (&e.name[..], e.kind)).collect();
+        let view: Vec<(&[u8], NameKind)> = got.iter().map(|e| (&e.name[..], e.kind)).collect();
         assert_eq!(
             view,
             vec![
@@ -538,32 +435,24 @@ mod tests {
         std::fs::create_dir(tmp.path().join("sub")).expect("dir");
         let dirf = std::fs::File::open(tmp.path()).expect("open dir");
 
-        // Every entry once, with its inode and its kind, and the cookie of
-        // each is neither 0 nor 1 nor 2, which NFS reserves.
+        // Every entry once, with its inode and its kind, and the cookie of each is neither 0 nor 1 nor 2, which NFS
+        // reserves.
         let mut listing = Listing::open(dirf.as_fd(), 0).expect("listing");
         let mut seen = Vec::new();
         while let Some(entry) = listing.read().expect("read") {
             let path = tmp.path().join(std::ffi::OsStr::from_bytes(entry.name));
             let meta = std::fs::symlink_metadata(&path).expect("metadata");
             assert_eq!(entry.ino, meta.ino(), "{path:?}");
-            let kind = if meta.is_dir() {
-                NameKind::Dir
-            } else {
-                NameKind::File
-            };
+            let kind = if meta.is_dir() { NameKind::Dir } else { NameKind::File };
             let hinted = entry.kind;
             assert!(hinted == NameKind::Unknown || hinted == kind, "{path:?}");
-            assert!(
-                entry.cookie > 2,
-                "{path:?} has the cookie {}",
-                entry.cookie
-            );
+            assert!(entry.cookie > 2, "{path:?} has the cookie {}", entry.cookie);
             seen.push((entry.name.to_vec(), entry.cookie));
         }
         assert_eq!(seen.len(), 6, "dot and dot-dot never among them");
 
-        // From the cookie of the second entry, a fresh listing gives what
-        // came after it, and from the cookie of the last, nothing.
+        // From the cookie of the second entry, a fresh listing gives what came after it, and from the cookie of the
+        // last, nothing.
         let after_second = seen[1].1;
         let mut rest = Listing::open(dirf.as_fd(), 0).expect("listing");
         rest.seek(after_second).expect("seek");
@@ -571,8 +460,7 @@ mod tests {
         while let Some(entry) = rest.read().expect("read") {
             names.push(entry.name.to_vec());
         }
-        let want: Vec<Vec<u8>> =
-            seen[2..].iter().map(|(n, _)| n.clone()).collect();
+        let want: Vec<Vec<u8>> = seen[2..].iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(names, want);
         let after_last = seen[5].1;
         rest.seek(after_last).expect("seek");
@@ -592,8 +480,8 @@ mod tests {
         }
     }
 
-    /// A listing takes no more than its room from the kernel at a time, so
-    /// a caller that wants a window of names does not read past it.
+    /// A listing takes no more than its room from the kernel at a time, so a caller that wants a window of names does
+    /// not read past it.
     #[test]
     fn a_listing_reads_no_more_than_its_room() {
         let tmp = crate::tempdir().expect("tempdir");
@@ -605,8 +493,8 @@ mod tests {
         assert!(listing.filled <= 8192, "it read {}", listing.filled);
     }
 
-    /// A seek drops what the last read left unread, so what comes next is
-    /// what the cookie names and not the next record in the buffer.
+    /// A seek drops what the last read left unread, so what comes next is what the cookie names and not the next record
+    /// in the buffer.
     #[test]
     fn a_seek_among_what_was_read_goes_where_it_says() {
         let tmp = crate::tempdir().expect("tempdir");
@@ -621,8 +509,8 @@ mod tests {
         assert_eq!(again.name, second);
     }
 
-    /// However little room is asked for, the longest name a file system
-    /// here gives fits, where `getdents64` would answer `EINVAL`.
+    /// However little room is asked for, the longest name a file system here gives fits, where `getdents64` would
+    /// answer `EINVAL`.
     #[test]
     fn a_room_too_small_for_a_name_still_reads_it() {
         let tmp = crate::tempdir().expect("tempdir");
@@ -634,25 +522,22 @@ mod tests {
         assert_eq!(entry.name, name.as_bytes());
     }
 
-    /// A listing read a window at a time, each from a fresh listing and the
-    /// cookie before it, gives every name once, across the reads of its
-    /// room, on a dataset when the gate names one, whose cookies are
-    /// serialized ZAP cursors (`zfs_readdir`), and on the temporary folder.
+    /// A listing read a window at a time, each from a fresh listing and the cookie before it, gives every name once,
+    /// across the reads of its room, on a dataset when the gate names one, whose cookies are serialized ZAP cursors
+    /// (`zfs_readdir`), and on the temporary folder.
     #[test]
     fn windows_from_cookies_give_every_name_once() {
         let tmp = crate::tempdir().expect("tempdir");
         let dataset = std::env::var_os("TRUENAS_ROS_POSIX_DATASET");
         let dataset = dataset.map(std::path::PathBuf::from);
-        let inside = dataset
-            .map(|base| base.join(format!("listing-{}", std::process::id())));
+        let inside = dataset.map(|base| base.join(format!("listing-{}", std::process::id())));
         for path in [Some(tmp.path().join("many")), inside].iter().flatten() {
             std::fs::create_dir(path).expect("folder");
             names_in(path);
             let dirf = std::fs::File::open(path).expect("open dir");
             let (mut names, mut cookie) = (Vec::new(), 0);
             'windows: loop {
-                let mut window =
-                    Listing::open(dirf.as_fd(), 4096).expect("listing");
+                let mut window = Listing::open(dirf.as_fd(), 4096).expect("listing");
                 window.seek(cookie).expect("seek");
                 for _ in 0..70 {
                     let Some(entry) = window.read().expect("read") else {
@@ -670,8 +555,8 @@ mod tests {
         }
     }
 
-    /// A folder removed while a listing is open reads as ended, as it does
-    /// through `readdir`, and not as a failure of the caller's.
+    /// A folder removed while a listing is open reads as ended, as it does through `readdir`, and not as a failure of
+    /// the caller's.
     #[test]
     fn a_listing_of_a_folder_removed_ends() {
         let tmp = crate::tempdir().expect("tempdir");
@@ -683,8 +568,8 @@ mod tests {
         assert!(listing.read().expect("read").is_none());
     }
 
-    /// A cookie that is no position is said to be one, where `seekdir`
-    /// would have gone on from wherever the stream stood.
+    /// A cookie that is no position is said to be one, where `seekdir` would have gone on from wherever the stream
+    /// stood.
     #[test]
     fn a_cookie_that_is_no_position_is_refused() {
         let tmp = crate::tempdir().expect("tempdir");
@@ -712,14 +597,13 @@ mod tests {
         assert_eq!(refused, Errno::EBADF);
     }
 
-    /// A record that does not lie within what the kernel filled, or whose
-    /// name does not end, is refused rather than read past.
+    /// A record that does not lie within what the kernel filled, or whose name does not end, is refused rather than
+    /// read past.
     #[test]
     fn a_record_that_does_not_fit_is_refused() {
         let mut bytes = vec![0u8; RECORD_NAME + 8];
         let set_len = |bytes: &mut Vec<u8>, len: u16| {
-            bytes[RECORD_LEN..RECORD_LEN + 2]
-                .copy_from_slice(&len.to_ne_bytes());
+            bytes[RECORD_LEN..RECORD_LEN + 2].copy_from_slice(&len.to_ne_bytes());
         };
         bytes[RECORD_NAME] = b'a';
         set_len(&mut bytes, (RECORD_NAME + 8) as u16);
@@ -744,8 +628,7 @@ mod tests {
         assert!(got.is_empty());
     }
 
-    /// A descriptor that is not a directory is refused with the
-    /// kernel's own answer rather than an empty read.
+    /// A descriptor that is not a directory is refused with the kernel's own answer rather than an empty read.
     #[test]
     fn a_non_directory_is_refused() {
         let tmp = crate::tempdir().expect("tempdir");
@@ -756,9 +639,8 @@ mod tests {
         assert_eq!(err, Errno::ENOTDIR);
     }
 
-    /// A consumed offset does not hide entries: the stream is rewound,
-    /// so a second read over the same descriptor is the whole directory
-    /// again.
+    /// A consumed offset does not hide entries: the stream is rewound, so a second read over the same descriptor is the
+    /// whole directory again.
     #[test]
     fn a_second_read_is_still_the_whole_directory() {
         let tmp = crate::tempdir().expect("tempdir");
@@ -771,42 +653,26 @@ mod tests {
         assert_eq!(second.len(), 2);
     }
 
-    /// The record `readdir` hands back is `d_reclen` bytes, which is far
-    /// less than `size_of::<libc::dirent>()` - the invariant that makes
-    /// `next_entry`'s `addr_of!` reads necessary rather than stylistic.
-    ///
-    /// Forming a `&libc::dirent` requires all 280 bytes to be
-    /// dereferenceable; a short-named entry's record is a tenth of that, and
-    /// the last record in a filled buffer ends exactly where the valid data
-    /// does. Driven over raw `getdents64` so the valid region is known
-    /// precisely; glibc's `readdir` hands out pointers into a buffer filled
-    /// the same way.
+    /// The record `readdir` hands back is `d_reclen` bytes, far less than `size_of::<libc::dirent>()`, which is why
+    /// `next_entry` reads through `addr_of!`. Driven over raw `getdents64` so the valid region is known precisely.
     #[test]
     fn a_directory_record_is_shorter_than_the_struct_that_describes_it() {
         use std::os::fd::AsRawFd;
         let tmp = crate::tempdir().expect("tempdir");
         for i in 0..64 {
-            std::fs::write(tmp.path().join(format!("n{i:02}")), b"")
-                .expect("file");
+            std::fs::write(tmp.path().join(format!("n{i:02}")), b"").expect("file");
         }
         let f = std::fs::File::open(tmp.path()).expect("open dir");
         let mut buf = [0u8; 512];
         // SAFETY: a live directory fd and a buffer of its own length.
-        let n = unsafe {
-            libc::syscall(
-                libc::SYS_getdents64,
-                f.as_raw_fd(),
-                buf.as_mut_ptr(),
-                buf.len(),
-            )
-        };
+        let n = unsafe { libc::syscall(libc::SYS_getdents64, f.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
         assert!(n > 0, "getdents64: {}", Errno::last());
         let n = n as usize;
         let (mut shortest, mut tightest) = (usize::MAX, usize::MAX);
         let mut off = 0usize;
         while off < n {
-            // SAFETY: `off` is inside the filled region and each record's
-            // fixed head is within it; `d_reclen` walks to the next.
+            // SAFETY: `off` is inside the filled region and each record's fixed head is within it; `d_reclen` walks to
+            // the next.
             let reclen = unsafe {
                 let ent = buf.as_ptr().add(off).cast::<libc::dirent64>();
                 std::ptr::addr_of!((*ent).d_reclen).read() as usize
@@ -828,29 +694,16 @@ mod tests {
         );
     }
 
-    /// An `O_PATH` handle is refused, and the refusal is the kernel's.
-    ///
-    /// `O_PATH` is a reference carrying no read, and `fdopendir` answers one
-    /// with `EBADF`. Reading through a dup is what keeps that enforcement:
-    /// `openat2` through an `O_PATH` descriptor *succeeds*, manufacturing the
-    /// access it was opened without and checking it against this process
-    /// rather than whoever obtained the handle - which where this runs as
-    /// root is no check at all. [`Anchor::open`](crate::uring_fs::Anchor)
-    /// mints exactly this shape and takes `impl AsFd` to get here.
+    /// An `O_PATH` handle is refused, and the refusal is the kernel's `EBADF` from `fdopendir`, which reading through a
+    /// dup keeps, where an `openat2` through the handle would succeed.
     #[test]
     fn an_o_path_descriptor_is_refused() {
         use std::os::fd::{FromRawFd, OwnedFd};
         let tmp = crate::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("a"), b"").expect("file");
-        let c = std::ffi::CString::new(tmp.path().as_os_str().as_bytes())
-            .expect("path");
+        let c = std::ffi::CString::new(tmp.path().as_os_str().as_bytes()).expect("path");
         // SAFETY: a NUL-terminated path we own; O_PATH takes no rights.
-        let raw = unsafe {
-            libc::open(
-                c.as_ptr(),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
+        let raw = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
         assert!(raw >= 0, "open O_PATH: {}", Errno::last());
         // SAFETY: `raw` is a fresh owned descriptor.
         let anchor = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -859,32 +712,21 @@ mod tests {
             Errno::EBADF,
         );
 
-        // The same directory, opened for read, still drains - so the refusal
-        // is about the descriptor's access and not about the directory.
+        // The same directory, opened for read, still drains - so the refusal is about the descriptor's access and not
+        // about the directory.
         let ok = std::fs::File::open(tmp.path()).expect("open O_RDONLY");
         assert_eq!(read_names(ok.as_fd()).expect("readable").len(), 1);
     }
 
-    /// The drain spends the caller's position, and the reopen the docs
-    /// prescribe is what protects it.
+    /// The drain spends the caller's position, and the reopen the docs prescribe is what protects it.
     ///
-    /// `read_names` rewinds a dup, and a dup shares the open file
-    /// description, so a walk holding that same description is left at
-    /// end-of-directory and reports an empty remainder with no error. That
-    /// is the contract: the alternative - reopening for a private position -
-    /// re-authorizes the read against whoever calls, and an `O_PATH` handle
-    /// reopens just fine. Callers that care reopen first, as
-    /// `shutil::reopen_dir` does.
-    ///
-    /// The frame is deliberately unread before the drain: glibc buffers a
-    /// whole `getdents64` at the first `readdir`, which would hide the moved
-    /// offset on a small directory.
+    /// The frame is deliberately unread before the drain, since glibc buffers a whole `getdents64` at the first
+    /// `readdir`, which would hide the moved offset on a small directory.
     #[test]
     fn a_drain_spends_the_position_and_a_reopen_protects_it() {
         let tmp = crate::tempdir().expect("tempdir");
         for i in 0..50 {
-            std::fs::write(tmp.path().join(format!("f{i:03}")), b"x")
-                .expect("file");
+            std::fs::write(tmp.path().join(format!("f{i:03}")), b"x").expect("file");
         }
 
         // Sharing the description: the walk loses its remainder.
@@ -896,20 +738,14 @@ mod tests {
         while walk.next_entry().expect("walk").is_some() {
             seen += 1;
         }
-        assert!(
-            seen < 52,
-            "a shared description is single-reader: the drain spends it"
-        );
+        assert!(seen < 52, "a shared description is single-reader: the drain spends it");
 
         // A description of its own: untouched.
         let dirf2 = std::fs::File::open(tmp.path()).expect("open dir");
         let own = crate::sync_fs::openat2(
             dirf2.as_fd(),
             ".",
-            crate::sync_fs::OpenHow::new().flags(
-                crate::sync_fs::OFlag::O_RDONLY
-                    | crate::sync_fs::OFlag::O_DIRECTORY,
-            ),
+            crate::sync_fs::OpenHow::new().flags(crate::sync_fs::OFlag::O_RDONLY | crate::sync_fs::OFlag::O_DIRECTORY),
         )
         .expect("reopen");
         let mut walk2 = Dir::from_fd(own).expect("fdopendir");
@@ -921,8 +757,8 @@ mod tests {
         assert_eq!(seen2, 52, "50 files plus . and .., all still there");
     }
 
-    /// The `d_type` mapping, pinned over the raw constants because no
-    /// mountable filesystem produces `DT_UNKNOWN` on demand.
+    /// The `d_type` mapping, pinned over the raw constants because no mountable filesystem produces `DT_UNKNOWN` on
+    /// demand.
     #[test]
     fn the_d_type_mapping_is_total() {
         assert_eq!(NameKind::from_d_type(libc::DT_DIR), NameKind::Dir);

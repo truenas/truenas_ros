@@ -1,15 +1,14 @@
-//! The wake eventfd and the cross-thread loop flags it serves: the one block
-//! of state shared (`Arc`) between a loop thread and every cross-thread
-//! handle a domain mints (shutdown handles, deferred replies, pushes, ...),
-//! and the bytes of the replies those handles have handed to the loop.
+//! The wake eventfd and the cross-thread loop flags it serves: the one block of state shared (`Arc`) between a loop
+//! thread and every cross-thread handle a domain mints (shutdown handles, deferred replies, pushes, ...), and the bytes
+//! of the replies those handles have handed to the loop.
 
 use crate::errno;
 #[cfg(not(loom))]
 use crate::errno::Errno;
 #[cfg(not(loom))]
 use crate::fd::owned_from_raw;
-// `LoopShared`'s flags are loom-modelled (`loom_graceful_publication`), so the
-// atomics come from `crate::sync` - std's outside `--cfg loom`.
+// `LoopShared`'s flags are loom-modelled (`loom_graceful_publication`), so the atomics come from `crate::sync` - std's
+// outside `--cfg loom`.
 #[cfg(feature = "net-server")]
 use crate::sync::atomic::AtomicUsize;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,9 +19,8 @@ use std::mem::size_of;
 #[cfg(not(loom))]
 use std::os::fd::{AsRawFd, OwnedFd};
 
-/// The stop/graceful-drain flags and the wake eventfd cross-thread pokes ride
-/// on. Domains wrap it in their own public handles; the engine arms the
-/// eventfd `READ` ([`super::engine::Engine::arm_wake`]).
+/// The stop/graceful-drain flags and the wake eventfd cross-thread pokes ride on. Domains wrap it in their own public
+/// handles; the engine arms the eventfd `READ` ([`super::engine::Engine::arm_wake`]).
 #[derive(Debug)]
 pub(crate) struct LoopShared {
     /// Hard-stop flag (`Release` store, `Acquire` load in the loop).
@@ -31,11 +29,9 @@ pub(crate) struct LoopShared {
     pub(crate) graceful: AtomicBool,
     pub(crate) grace_ms: AtomicU64,
     pub(crate) wake: WakeHandle,
-    /// Bytes of body pool storage in replies a `Deferred` handed to the
-    /// loop with `reply_recycled` that the loop has not yet queued or sent
-    /// home, by capacity. The ring's count of held bytes adds them, since
-    /// the hand-off is where the consumer lets them go. Added before the
-    /// reply is sent and taken off once the loop has it, so the reply
+    /// Bytes of body pool storage in replies a `Deferred` handed to the loop with `reply_recycled` that the loop has
+    /// not yet queued or sent home, by capacity. The ring's count of held bytes adds them, since the hand-off is where
+    /// the consumer lets them go. Added before the reply is sent and taken off once the loop has it, so the reply
     /// orders the two and no ordering rides this.
     #[cfg(feature = "net-server")]
     pub(crate) handed: AtomicUsize,
@@ -44,39 +40,28 @@ pub(crate) struct LoopShared {
 impl LoopShared {
     /// Request a hard stop.
     ///
-    /// A function, and one spelling of the ordering, so a model drives *this*
-    /// store rather than its own copy of the pairing - a model with its own
-    /// copy checks the memory model rather than the code, and stays green
-    /// with the shipping ordering weakened (`bufring::publish_tail` states
-    /// the same rule).
+    /// A function, and one spelling of the ordering, so a model drives this store rather than its own copy, which would
+    /// stay green with the shipping ordering weakened.
     #[inline]
     pub(crate) fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
 
-    /// Whether a hard stop was requested. Paired with
-    /// [`request_stop`](Self::request_stop).
+    /// Whether a hard stop was requested. Paired with [`request_stop`](Self::request_stop).
     #[inline]
     pub(crate) fn stop_requested(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
 
-    /// Request a graceful drain of `grace_ms`: the period first, then the
-    /// flag whose **Release** store is what makes it readable.
+    /// Request a graceful drain of `grace_ms`: the period first, then the flag whose **Release** store is what makes it
+    /// readable.
     ///
-    /// `grace_ms` is a Relaxed payload published by this pair - message
-    /// passing, and the Release/Acquire is the only thing making it visible.
-    /// Weaken the store and a loop that sees `graceful` may still read
-    /// `grace_ms == 0`, arming a zero-length grace period and hard-killing
-    /// connections it promised to drain.
+    /// `grace_ms` is a Relaxed payload, made visible only by this Release pairing with the Acquire in
+    /// [`graceful_requested`](Self::graceful_requested). Weaken the store and a loop that sees `graceful` may still
+    /// read `grace_ms == 0` and hard-kill connections it promised to drain.
     ///
-    /// **The loom lane owns this edge** (`loom_graceful_publication`):
-    /// this module's concurrency tests compile only under `--cfg loom`,
-    /// so Miri interprets nothing that crosses it and every Miri arm
-    /// stays green with the store weakened - measured, against loom
-    /// going red in seconds. The mirror-image edge is the wake dedup's
-    /// (`task::poll_window`), which only Miri catches; retire either
-    /// lane and its edge goes unwatched.
+    /// **The loom lane owns this edge** (`loom_graceful_publication`), since Miri runs nothing that crosses it. The
+    /// wake dedup's edge (`task::poll_window`) is caught only by Miri, so neither lane can be retired.
     #[inline]
     pub(crate) fn request_graceful(&self, grace_ms: u64) {
         self.grace_ms.store(grace_ms, Ordering::Relaxed);
@@ -92,18 +77,12 @@ impl LoopShared {
     }
 }
 
-/// The wake eventfd. Poking it adds 1 to the counter, completing the loop's
-/// armed `READ` so it drains pending work.
+/// The wake eventfd. Poking it adds 1 to the counter, completing the loop's armed `READ` so it drains pending work.
 ///
-/// Under `--cfg loom` the fd is replaced by a counter plus a condvar. A real
-/// eventfd cannot be used in a model: `loom::model` re-runs its closure once
-/// per interleaving - thousands of times - and each run would open another
-/// descriptor. The stand-in reproduces the two properties the no-lost-wakeup
-/// argument actually rests on: pokes **accumulate**, and a drain takes the
-/// whole count at once. Anything a model proves is therefore conditional on
-/// the kernel's eventfd behaving that way, which
-/// [`Engine::arm_wake`](super::engine::Engine::arm_wake) documents but nothing
-/// here verifies.
+/// Under `--cfg loom` the fd is replaced by a counter plus a condvar, since `loom::model` re-runs its closure once per
+/// interleaving and each run would open another descriptor. The stand-in keeps the two properties the no-lost-wakeup
+/// argument rests on, that pokes **accumulate** and a drain takes the whole count, which the kernel's eventfd is
+/// assumed to share.
 #[derive(Debug)]
 pub(crate) struct WakeHandle {
     #[cfg(not(loom))]
@@ -112,25 +91,21 @@ pub(crate) struct WakeHandle {
     count: crate::sync::Mutex<u64>,
     #[cfg(loom)]
     ready: crate::sync::Condvar,
-    /// Whether the loop is asleep in `io_uring_enter`, as tokio's `Parker`
-    /// tracks it.
+    /// Whether the loop is asleep in `io_uring_enter`.
     ///
-    /// A poke writes the eventfd only when the loop is [`PARKED`]. An
-    /// [`ACTIVE`] loop drains every wake source before it parks
-    /// ([`Self::park`]), so a poke that only sets [`NOTIFIED`] is seen
-    /// there, without the syscall and the completion.
+    /// A poke writes the eventfd only when the loop is [`PARKED`]. An [`ACTIVE`] loop drains every wake source before
+    /// it parks ([`Self::park`]), so a poke that only sets [`NOTIFIED`] is seen there, without the syscall and the
+    /// completion.
     ///
-    /// Opt-in per loop: a handle starts [`LEGACY`], where every poke
-    /// writes, because a site that blocks without calling [`Self::park`]
-    /// (the ring tests, the teardown drain) would sleep through a skipped
-    /// write. A loop opts in with [`Self::activate`].
+    /// Opt-in per loop. A handle starts [`LEGACY`], where every poke writes, because a site that blocks without calling
+    /// [`Self::park`] (the ring tests, the teardown drain) would sleep through a skipped write. A loop opts in with
+    /// [`Self::activate`].
     state: AtomicU64,
 }
 
 /// No loop has claimed the protocol: every poke writes.
 const LEGACY: u64 = 0;
-/// The loop is running, or between two waits, and will drain before
-/// it blocks.
+/// The loop is running, or between two waits, and will drain before it blocks.
 const ACTIVE: u64 = 1;
 /// The loop is about to block, or is blocked, in `io_uring_enter`.
 const PARKED: u64 = 2;
@@ -152,9 +127,7 @@ impl WakeHandle {
         #[cfg(not(loom))]
         {
             // SAFETY: eventfd() returns a fresh owned fd or -1.
-            let fd = Errno::result(unsafe {
-                libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)
-            })?;
+            let fd = Errno::result(unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) })?;
             // SAFETY: fresh owned fd from eventfd().
             Ok(WakeHandle {
                 fd: unsafe { owned_from_raw(fd) },
@@ -171,53 +144,39 @@ impl WakeHandle {
         }
     }
 
-    /// Opt in: the calling loop blocks on this handle's ring and drains
-    /// every wake source before it blocks. Called once, after the wake
-    /// `READ` is armed.
+    /// Opt in: the calling loop blocks on this handle's ring and drains every wake source before it blocks. Called
+    /// once, after the wake `READ` is armed.
     pub(crate) fn activate(&self) {
-        // `LEGACY -> ACTIVE` only. A plain store could overwrite
-        // `NOTIFIED`, which a poke sets instead of writing the eventfd, and
-        // the loop would park with that wake lost.
-        let _ = self.state.compare_exchange(
-            LEGACY,
-            ACTIVE,
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
+        // `LEGACY -> ACTIVE` only. A plain store could overwrite `NOTIFIED`, which a poke sets instead of writing the
+        // eventfd, and the loop would park with that wake lost.
+        let _ = self
+            .state
+            .compare_exchange(LEGACY, ACTIVE, Ordering::Release, Ordering::Relaxed);
     }
 
-    /// Called by the loop right before it blocks, after it has drained
-    /// every wake source.
+    /// Called by the loop right before it blocks, after it has drained every wake source.
     ///
-    /// `ACTIVE -> PARKED`: from here a poke writes the eventfd. `NOTIFIED`
-    /// means a poke landed since the drain without writing, so the loop
-    /// drains again instead of blocking. The check and the transition are
-    /// one compare-exchange, so no poke falls between them. A [`LEGACY`]
-    /// handle always blocks; every poke to it writes.
+    /// `ACTIVE -> PARKED`: from here a poke writes the eventfd. `NOTIFIED` means a poke landed since the drain without
+    /// writing, so the loop drains again instead of blocking. The check and the transition are one compare-exchange, so
+    /// no poke falls between them. A [`LEGACY`] handle always blocks; every poke to it writes.
     pub(crate) fn park(&self) -> Park {
-        match self.state.compare_exchange(
-            ACTIVE,
-            PARKED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match self
+            .state
+            .compare_exchange(ACTIVE, PARKED, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) | Err(LEGACY) => Park::Block,
             Err(seen) => {
-                // `NOTIFIED`: a poke landed while the loop was awake.
-                // `PARKED` would be a second park without an `unpark`,
-                // which both callers rule out; `Drain` is safe either way.
-                debug_assert_ne!(
-                    seen, PARKED,
-                    "park() re-entered without an unpark"
-                );
+                // `NOTIFIED`: a poke landed while the loop was awake. `PARKED` would be a second park without an
+                // `unpark`, which both callers rule out; `Drain` is safe either way.
+                debug_assert_ne!(seen, PARKED, "park() re-entered without an unpark");
                 self.state.store(ACTIVE, Ordering::Release);
                 Park::Drain
             }
         }
     }
 
-    /// The loop is awake again. A poke that arrived while it was parked
-    /// wrote the eventfd, and the armed `READ` completes for it.
+    /// The loop is awake again. A poke that arrived while it was parked wrote the eventfd, and the armed `READ`
+    /// completes for it.
     pub(crate) fn unpark(&self) {
         if self.state.load(Ordering::Acquire) != LEGACY {
             self.state.store(ACTIVE, Ordering::Release);
@@ -229,16 +188,14 @@ impl WakeHandle {
         self.fd.as_raw_fd()
     }
 
-    /// The descriptor the loop arms its `READ` on. Models never reach the
-    /// ring, so there is nothing to arm.
+    /// The descriptor the loop arms its `READ` on. Models never reach the ring, so there is nothing to arm.
     #[cfg(loom)]
     pub(crate) fn as_raw_fd(&self) -> i32 {
         -1
     }
 
     pub(crate) fn poke(&self) {
-        // Release: the pusher's item is visible to the loop that reads this
-        // state. A `LEGACY` handle is always written.
+        // Release: the pusher's item is visible to the loop that reads this state. A `LEGACY` handle is always written.
         let mut cur = self.state.load(Ordering::Acquire);
         loop {
             match cur {
@@ -246,14 +203,11 @@ impl WakeHandle {
                 NOTIFIED => return,
                 _ => {}
             }
-            match self.state.compare_exchange_weak(
-                cur,
-                NOTIFIED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                // Awake: the loop drains before it blocks, so skip the
-                // write.
+            match self
+                .state
+                .compare_exchange_weak(cur, NOTIFIED, Ordering::AcqRel, Ordering::Acquire)
+            {
+                // Awake: the loop drains before it blocks, so skip the write.
                 Ok(ACTIVE) => return,
                 Ok(_) => break,
                 Err(seen) => cur = seen,
@@ -262,9 +216,8 @@ impl WakeHandle {
         #[cfg(not(loom))]
         {
             let one: u64 = 1;
-            // SAFETY: write 8 bytes from a valid u64 to the eventfd. Errors
-            // are ignored: a full counter has already signalled, and a closed
-            // fd means the loop is gone (so the wake is moot).
+            // SAFETY: write 8 bytes from a valid u64 to the eventfd. Errors are ignored: a full counter has already
+            // signalled, and a closed fd means the loop is gone (so the wake is moot).
             unsafe {
                 libc::write(
                     self.fd.as_raw_fd(),
@@ -281,13 +234,11 @@ impl WakeHandle {
         }
     }
 
-    /// Model-only: what the loop's armed `READ` does when it completes - block
-    /// until the counter is non-zero, then drain it to 0 in one go. Returns
-    /// the count consumed.
+    /// Model-only: what the loop's armed `READ` does when it completes - block until the counter is non-zero, then
+    /// drain it to 0 in one go. Returns the count consumed.
     ///
-    /// This is the half of the protocol that makes a poke arriving between a
-    /// drain and the next arm safe: it is still counted, so the next read
-    /// completes immediately instead of parking.
+    /// A poke arriving between a drain and the next arm is still counted, so the next read completes at once instead
+    /// of parking.
     #[cfg(loom)]
     pub(crate) fn drain(&self) -> u64 {
         let mut n = self.count.lock().unwrap_or_else(|e| e.into_inner());
@@ -297,8 +248,8 @@ impl WakeHandle {
         std::mem::replace(&mut *n, 0)
     }
 
-    /// Model-only: drain without blocking, for a loop checking whether a poke
-    /// is already pending rather than parking on one.
+    /// Model-only: drain without blocking, for a loop checking whether a poke is already pending rather than parking on
+    /// one.
     #[cfg(loom)]
     pub(crate) fn try_drain(&self) -> u64 {
         let mut n = self.count.lock().unwrap_or_else(|e| e.into_inner());
@@ -312,20 +263,8 @@ impl WakeHandle {
 //
 // Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features uring loom_
 //
-// `grace_ms` is a **Relaxed** payload published by a **Release** store of
-// `graceful`, and read after an **Acquire** load of it:
-//
-//   writer (`ShutdownHandle::shutdown_graceful`)   loop (`Server::on_wake`)
-//   LoopShared::request_graceful(ms)              LoopShared::graceful_requested()
-//   wake.poke()
-//
-// That is message passing: the Release/Acquire pair is the only thing making
-// the Relaxed payload visible. Weaken the store to Relaxed and a loop that
-// sees `graceful` may still read `grace_ms == 0`, arming a zero-length grace
-// period and hard-killing connections it promised to drain.
-//
-// The model calls those two functions rather than re-spelling their stores,
-// which is what makes it a test of the code instead of a test of loom.
+// The model calls `request_graceful` and `graceful_requested` rather than re-spelling their stores, which makes it a
+// test of the code instead of a test of loom.
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
@@ -344,9 +283,8 @@ mod loom_tests {
         })
     }
 
-    /// Observing `graceful` must imply observing the grace period it was
-    /// published with - including against a racing hard `shutdown()`, which
-    /// writes a different flag through the same shared block.
+    /// Observing `graceful` must imply observing the grace period it was published with - including against a racing
+    /// hard `shutdown()`, which writes a different flag through the same shared block.
     #[test]
     fn loom_graceful_publication() {
         loom::model(|| {
@@ -364,35 +302,25 @@ mod loom_tests {
                 h.wake.poke();
             });
 
-            // The loop's half. Reading `graceful` as set is a promise that the
-            // period behind it is readable too.
+            // The loop's half. Reading `graceful` as set is a promise that the period behind it is readable too.
             if let Some(ms) = s.graceful_requested() {
-                assert_eq!(
-                    ms, GRACE_MS,
-                    "graceful became visible before its grace period"
-                );
+                assert_eq!(ms, GRACE_MS, "graceful became visible before its grace period");
             }
 
             drain.join().expect("drain writer");
             hard.join().expect("hard writer");
 
             // Both requests landed; neither writer lost to the other.
-            assert_eq!(
-                s.graceful_requested(),
-                Some(GRACE_MS),
-                "drain request lost"
-            );
+            assert_eq!(s.graceful_requested(), Some(GRACE_MS), "drain request lost");
             assert!(s.stop_requested(), "hard stop lost");
         });
     }
 
-    /// A poke that skips the eventfd write still reaches the loop, by a
-    /// `Drain` verdict or an eventfd count, in every interleaving. The loop
-    /// never blocks with a poke unseen.
+    /// A poke that skips the eventfd write still reaches the loop, by a `Drain` verdict or an eventfd count, in every
+    /// interleaving. The loop never blocks with a poke unseen.
     ///
-    /// The item is checked only where `state` carries it (`poke`'s CAS
-    /// releases, `park`'s failed CAS acquires). Production wake sources
-    /// have their own locks, so this models the verdict, not the payload.
+    /// The item is checked only where `state` carries it (`poke`'s CAS releases, `park`'s failed CAS acquires).
+    /// Production wake sources have their own locks, so this models the verdict, not the payload.
     #[test]
     fn loom_an_activated_poke_is_never_lost() {
         loom::model(|| {
@@ -422,17 +350,13 @@ mod loom_tests {
                      visible"
                 );
             }
-            // The poke has certainly happened now. Either the loop already
-            // knew, or the next park must refuse to block.
-            let told = told_now
-                || s.wake.try_drain() > 0
-                || matches!(s.wake.park(), Park::Drain);
+            // The poke has certainly happened now. Either the loop already knew, or the next park must refuse to block.
+            let told = told_now || s.wake.try_drain() > 0 || matches!(s.wake.park(), Park::Drain);
             assert!(told, "a poke left no trace for the loop to find");
         });
     }
 
-    /// A poke that finds the loop awake writes nothing, and the next park
-    /// refuses to block.
+    /// A poke that finds the loop awake writes nothing, and the next park refuses to block.
     #[test]
     fn loom_a_poke_taken_while_awake_refuses_the_next_park() {
         loom::model(|| {
@@ -448,16 +372,12 @@ mod loom_tests {
                 0,
                 "a poke to an awake loop wrote the eventfd after all"
             );
-            assert_eq!(
-                s.wake.park(),
-                Park::Drain,
-                "the loop parked with a poke outstanding"
-            );
+            assert_eq!(s.wake.park(), Park::Drain, "the loop parked with a poke outstanding");
         });
     }
 
-    /// A second `activate` does not overwrite a pending `NOTIFIED`. No
-    /// caller activates twice today; this keeps it safe if one does.
+    /// A second `activate` does not overwrite a pending `NOTIFIED`. No caller activates twice today; this keeps it safe
+    /// if one does.
     #[test]
     fn loom_activate_does_not_clobber_a_pending_poke() {
         loom::model(|| {
@@ -484,8 +404,8 @@ mod loom_tests {
         });
     }
 
-    /// Two pokes and one park: the second poke finds `NOTIFIED` and does
-    /// nothing, which is safe only while the first poke's trace remains.
+    /// Two pokes and one park: the second poke finds `NOTIFIED` and does nothing, which is safe only while the first
+    /// poke's trace remains.
     #[test]
     fn loom_two_pokes_racing_one_park_leave_a_trace() {
         loom::model(|| {
@@ -509,9 +429,8 @@ mod loom_tests {
         });
     }
 
-    /// Pokes accumulate rather than coalescing to a single edge, and a drain
-    /// takes the whole count. This is the eventfd property the "no poke is
-    /// lost" argument rests on - modelled here, assumed of the kernel.
+    /// Pokes accumulate rather than coalescing to a single edge, and a drain takes the whole count. This is the eventfd
+    /// property the "no poke is lost" argument rests on - modelled here, assumed of the kernel.
     #[test]
     fn loom_wake_pokes_accumulate() {
         loom::model(|| {
@@ -520,11 +439,7 @@ mod loom_tests {
             let poker = loom::thread::spawn(move || a.wake.poke());
             s.wake.poke();
             poker.join().expect("poker");
-            assert_eq!(
-                s.wake.try_drain(),
-                2,
-                "a concurrent poke was coalesced away"
-            );
+            assert_eq!(s.wake.try_drain(), 2, "a concurrent poke was coalesced away");
             assert_eq!(s.wake.try_drain(), 0, "drain did not clear the count");
         });
     }

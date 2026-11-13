@@ -9,8 +9,8 @@ use std::os::fd::OwnedFd;
 
 /// Iterator over [`Statmount`] records, produced by [`iter_mount`].
 ///
-/// Each `next` performs a `statmount` and may yield an `Err` (for instance if
-/// a mount disappeared between the `listmount` snapshot and the `statmount`).
+/// Each `next` performs a `statmount` and may yield an `Err` (for instance if a mount disappeared between the
+/// `listmount` snapshot and the `statmount`).
 #[derive(Debug)]
 pub struct MountIter {
     ids: std::vec::IntoIter<u64>,
@@ -26,14 +26,9 @@ impl Iterator for MountIter {
     }
 }
 
-/// Iterate over the mounts beneath `mnt_id` (use
-/// [`LSMT_ROOT`](super::LSMT_ROOT) for the whole namespace), calling
+/// Iterate over the mounts beneath `mnt_id` (use [`LSMT_ROOT`](super::LSMT_ROOT) for the whole namespace), calling
 /// `statmount` with `mask` for each.
-pub fn iter_mount(
-    mnt_id: u64,
-    reverse: bool,
-    mask: StatmountMask,
-) -> errno::Result<MountIter> {
+pub fn iter_mount(mnt_id: u64, reverse: bool, mask: StatmountMask) -> errno::Result<MountIter> {
     let ids = listmount(mnt_id, reverse)?;
     Ok(MountIter {
         ids: ids.into_iter(),
@@ -43,9 +38,8 @@ pub fn iter_mount(
 
 /// Open the mount point of the mount identified by `mnt_id`.
 ///
-/// `flags` are ordinary open flags (typically `OFlag::O_DIRECTORY`). Fails
-/// `ENXIO` if `statmount` reports no mount point - the mount has no path
-/// reachable from the caller's root.
+/// `flags` are ordinary open flags (typically `OFlag::O_DIRECTORY`). Fails `ENXIO` if `statmount` reports no mount
+/// point - the mount has no path reachable from the caller's root.
 pub fn open_mount_by_id(mnt_id: u64, flags: OFlag) -> errno::Result<OwnedFd> {
     let sm = statmount(mnt_id, StatmountMask::MNT_POINT)?;
     let point = sm.mnt_point.ok_or(errno::Errno::ENXIO)?;

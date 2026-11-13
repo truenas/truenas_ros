@@ -48,12 +48,11 @@ tn_bitflags! {
         WRITE_ATOMIC = 0x0001_0000;
         /// Want/got the direct-I/O read alignment info.
         DIO_READ_ALIGN = 0x0002_0000;
-        /// Want/got whether the file has POSIX ACLs
-        /// ([`Statx::posix_access_acl`] and [`Statx::posix_default_acl`]).
+        /// Want/got whether the file has POSIX ACLs ([`Statx::posix_access_acl`] and [`Statx::posix_default_acl`]).
         /// TrueNAS kernels.
         ACL = 0x0800_0000;
-        /// Want/got the ZFS flags (`stx_zfsflags`, [`Statx::zfs_attrs`],
-        /// [`Statx::nfs4_acl_is_trivial`] and [`Statx::nfs4_acl_flags`]).
+        /// Want/got the ZFS flags (`stx_zfsflags`, [`Statx::zfs_attrs`], [`Statx::nfs4_acl_is_trivial`] and
+        /// [`Statx::nfs4_acl_flags`]).
         ZFSFLAGS = 0x1000_0000;
         /// Want/got the inode generation (`stx_gen`, [`Statx::generation`]).
         GEN = 0x2000_0000;
@@ -85,30 +84,26 @@ tn_bitflags! {
         DAX = 0x0020_0000;
         /// The file supports atomic writes.
         WRITE_ATOMIC = 0x0040_0000;
-        /// The file system keeps POSIX ACLs. TrueNAS kernels, see
-        /// [`Statx::acltype`].
+        /// The file system keeps POSIX ACLs. TrueNAS kernels, see [`Statx::acltype`].
         POSIXACL = 0x0100_0000_0000_0000;
-        /// The file system keeps NFSv4 ACLs. TrueNAS kernels, see
-        /// [`Statx::acltype`].
+        /// The file system keeps NFSv4 ACLs. TrueNAS kernels, see [`Statx::acltype`].
         NFSV4ACL = 0x0200_0000_0000_0000;
-        /// The file has a POSIX access ACL. TrueNAS kernels, asked with
-        /// [`StatxMask::ACL`], see [`Statx::posix_access_acl`].
+        /// The file has a POSIX access ACL. TrueNAS kernels, asked with [`StatxMask::ACL`], see
+        /// [`Statx::posix_access_acl`].
         ACL_ACCESS = 0x0400_0000_0000_0000;
-        /// The directory has a POSIX default ACL. TrueNAS kernels, asked
-        /// with [`StatxMask::ACL`], see [`Statx::posix_default_acl`].
+        /// The directory has a POSIX default ACL. TrueNAS kernels, asked with [`StatxMask::ACL`], see
+        /// [`Statx::posix_default_acl`].
         ACL_DEFAULT = 0x0800_0000_0000_0000;
-        /// The file is on a read-only mount, the mount or its superblock
-        /// read only. TrueNAS kernels, see [`Statx::read_only`].
+        /// The file is on a read-only mount, the mount or its superblock read only. TrueNAS kernels, see
+        /// [`Statx::read_only`].
         RDONLY = 0x1000_0000_0000_0000;
     }
 }
 
-/// The ACL type of the file system that holds a file, which the TrueNAS
-/// kernel reports in [`Statx::attributes`] from the flags of the superblock
-/// (`vfs_getattr_nosec` in `fs/stat.c`). ZFS keeps those current as
-/// `acltype` changes, with no remount (`acltype_changed_cb` in
-/// `module/os/linux/zfs/zfs_vfsops.c`), and a snapshot carries the type its
-/// own mount took.
+/// The ACL type of the file system that holds a file, which the TrueNAS kernel reports in [`Statx::attributes`] from
+/// the flags of the superblock (`vfs_getattr_nosec` in `fs/stat.c`). ZFS keeps those current as `acltype` changes, with
+/// no remount (`acltype_changed_cb` in `module/os/linux/zfs/zfs_vfsops.c`), and a snapshot carries the type its own
+/// mount took.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AclType {
     /// The file system keeps no ACL, so the mode is all there is.
@@ -172,10 +167,9 @@ pub struct StatxRaw {
 
 const _: () = assert!(core::mem::size_of::<StatxTimestampRaw>() == 16);
 const _: () = assert!(core::mem::size_of::<StatxRaw>() == 256);
-// The fork's three fields follow the atomic-write words in this order, and
-// `include/uapi/linux/stat.h` marks the spare words behind them at `0xd8`.
-const _: () =
-    assert!(core::mem::offset_of!(StatxRaw, stx_change_cookie) == 0xc0);
+// The fork's three fields follow the atomic-write words in this order, and `include/uapi/linux/stat.h` marks the spare
+// words behind them at `0xd8`.
+const _: () = assert!(core::mem::offset_of!(StatxRaw, stx_change_cookie) == 0xc0);
 const _: () = assert!(core::mem::offset_of!(StatxRaw, stx_gen) == 0xc8);
 const _: () = assert!(core::mem::offset_of!(StatxRaw, stx_zfsflags) == 0xd0);
 
@@ -204,16 +198,10 @@ impl StatxTimestamp {
         let total = self.as_nanos();
         if total >= 0 {
             let n = total as u128;
-            UNIX_EPOCH.checked_add(Duration::new(
-                (n / 1_000_000_000) as u64,
-                (n % 1_000_000_000) as u32,
-            ))
+            UNIX_EPOCH.checked_add(Duration::new((n / 1_000_000_000) as u64, (n % 1_000_000_000) as u32))
         } else {
             let n = total.unsigned_abs();
-            UNIX_EPOCH.checked_sub(Duration::new(
-                (n / 1_000_000_000) as u64,
-                (n % 1_000_000_000) as u32,
-            ))
+            UNIX_EPOCH.checked_sub(Duration::new((n / 1_000_000_000) as u64, (n % 1_000_000_000) as u32))
         }
     }
 }
@@ -222,10 +210,7 @@ impl StatxTimestamp {
 pub fn makedev(major: u32, minor: u32) -> u64 {
     let ma = major as u64;
     let mi = minor as u64;
-    ((ma & 0xffff_f000) << 32)
-        | ((ma & 0x0000_0fff) << 8)
-        | ((mi & 0xffff_ff00) << 12)
-        | (mi & 0x0000_00ff)
+    ((ma & 0xffff_f000) << 32) | ((ma & 0x0000_0fff) << 8) | ((mi & 0xffff_ff00) << 12) | (mi & 0x0000_00ff)
 }
 
 fn ts(raw: StatxTimestampRaw) -> StatxTimestamp {
@@ -237,8 +222,7 @@ fn ts(raw: StatxTimestampRaw) -> StatxTimestamp {
 
 /// Extended file attributes returned by [`statx`].
 ///
-/// Unlike the Python bindings, each timestamp and device id has a single
-/// representation; use [`Statx::raw`] for direct field access.
+/// Use [`Statx::raw`] for direct field access.
 #[derive(Clone, Copy, Debug)]
 pub struct Statx(StatxRaw);
 
@@ -258,9 +242,8 @@ impl Statx {
         StatxAttr::from_bits_retain(self.0.stx_attributes_mask)
     }
 
-    /// The ACL type of the file's file system, or `None` on a kernel that
-    /// reports none, which [`Statx::attributes_mask`] says. The kernel sets
-    /// at most one of the two bits, and NFSv4 is read first.
+    /// The ACL type of the file's file system, or `None` on a kernel that reports none, which
+    /// [`Statx::attributes_mask`] says. The kernel sets at most one of the two bits, and NFSv4 is read first.
     pub fn acltype(&self) -> Option<AclType> {
         let both = StatxAttr::POSIXACL | StatxAttr::NFSV4ACL;
         if !self.attributes_mask().contains(both) {
@@ -276,10 +259,9 @@ impl Statx {
         })
     }
 
-    /// Whether the file is on a read-only mount, as the mount or its
-    /// superblock is read only, such as a ZFS dataset with `readonly=on`,
-    /// which takes effect with no remount, or a snapshot, or `None` on a
-    /// kernel that does not say, which [`Statx::attributes_mask`] tells.
+    /// Whether the file is on a read-only mount, as the mount or its superblock is read only, such as a ZFS dataset
+    /// with `readonly=on`, which takes effect with no remount, or a snapshot, or `None` on a kernel that does not say,
+    /// which [`Statx::attributes_mask`] tells.
     pub fn read_only(&self) -> Option<bool> {
         let bit = StatxAttr::RDONLY;
         self.attributes_mask()
@@ -287,28 +269,22 @@ impl Statx {
             .then(|| self.attributes().contains(bit))
     }
 
-    /// Whether the file has a POSIX access ACL, one that says more than the
-    /// mode, with no read of `system.posix_acl_access` once the inode holds
-    /// its ACLs.
+    /// Whether the file has a POSIX access ACL, one that says more than the mode, with no read of
+    /// `system.posix_acl_access` once the inode holds its ACLs.
     ///
-    /// `None` unless [`StatxMask::ACL`] was requested and the kernel
-    /// answered it. The TrueNAS kernel answers from the ACLs the inode
-    /// caches, through `get_inode_acl` (`statx_posix_acls` in `fs/stat.c`),
-    /// on a file system that keeps POSIX ACLs, and leaves the bit out of
-    /// [`Statx::mask`] on any other, on an error, and on a file system that
-    /// reads its ACLs only through a dentry. A file system keeps no access
-    /// ACL the mode says all of (`posix_acl_update_mode` in
-    /// `fs/posix_acl.c`, `zpl_set_acl_impl` in
-    /// `module/os/linux/zfs/zpl_xattr.c`), so `Some(false)` means the mode
+    /// `None` unless [`StatxMask::ACL`] was requested and the kernel answered it. The TrueNAS kernel answers from the
+    /// ACLs the inode caches, through `get_inode_acl` (`statx_posix_acls` in `fs/stat.c`), on a file system that keeps
+    /// POSIX ACLs, and leaves the bit out of [`Statx::mask`] on any other, on an error, and on a file system that reads
+    /// its ACLs only through a dentry. A file system keeps no access ACL the mode says all of (`posix_acl_update_mode`
+    /// in `fs/posix_acl.c`, `zpl_set_acl_impl` in `module/os/linux/zfs/zpl_xattr.c`), so `Some(false)` means the mode
     /// is all of the file's access control.
     pub fn posix_access_acl(&self) -> Option<bool> {
         self.posix_acl(StatxAttr::ACL_ACCESS)
     }
 
-    /// Whether the directory has a POSIX default ACL, the one its new
-    /// children inherit, answered as for
-    /// [`posix_access_acl`](Self::posix_access_acl). Anything that is not a
-    /// directory keeps none, so it gives `Some(false)`.
+    /// Whether the directory has a POSIX default ACL, the one its new children inherit, answered as for
+    /// [`posix_access_acl`](Self::posix_access_acl). Anything that is not a directory keeps none, so it gives
+    /// `Some(false)`.
     pub fn posix_default_acl(&self) -> Option<bool> {
         self.posix_acl(StatxAttr::ACL_DEFAULT)
     }
@@ -366,42 +342,24 @@ impl Statx {
 
     /// Subvolume identifier - **btrfs only**.
     ///
-    /// A btrfs inode number is unique only within its subvolume, so two files
-    /// in different subvolumes of one filesystem can share an `st_ino`. btrfs
-    /// works around that by giving each subvolume its own *anonymous* device
-    /// number, which restores a unique `(dev, ino)` but costs `st_dev` its
-    /// usual meaning: one mount then reports many devices, and a caller using
-    /// `st_dev` to detect mount boundaries is misled.
-    /// [`StatxMask::SUBVOL`] exposes the subvolume id directly so `(subvol,
-    /// ino)` can be formed without inferring it from a synthetic device.
+    /// btrfs gives each subvolume its own anonymous device number, so `(subvol, ino)` names a file without inferring it
+    /// from a synthetic `st_dev`. **btrfs is the only filesystem that fills this** (`btrfs_getattr`,
+    /// `fs/btrfs/inode.c`), so it does not identify a ZFS dataset. Use the device number, or [`StatxAttr::MOUNT_ROOT`]
+    /// in [`attributes`](Self::attributes) to recognise a mount root.
     ///
-    /// **btrfs is the only filesystem in the kernel that fills this**
-    /// (`fs/btrfs/inode.c`, `btrfs_getattr`). ZFS in particular does not, so
-    /// this is *not* a way to identify a dataset - use the device number, or
-    /// [`StatxAttr::MOUNT_ROOT`] in [`attributes`](Self::attributes) to
-    /// recognise a mount root.
-    ///
-    /// Returns the raw field, so an unreported value reads as `0` rather than
-    /// as absent. Check [`mask`](Self::mask) for [`StatxMask::SUBVOL`] to
-    /// tell the two apart.
+    /// Returns the raw field, so an unreported value reads as `0` rather than as absent. Check [`mask`](Self::mask) for
+    /// [`StatxMask::SUBVOL`] to tell the two apart.
     pub fn subvol(&self) -> u64 {
         self.0.stx_subvol
     }
 
-    /// The inode's change cookie - the NFSv4 change attribute, a per-inode
-    /// counter the kernel bumps on every content or metadata modification.
+    /// The inode's change cookie - the NFSv4 change attribute, a per-inode counter the kernel bumps on every content or
+    /// metadata modification.
     ///
-    /// `None` unless [`StatxMask::CHANGE_COOKIE`] was requested *and* the
-    /// filesystem supplied it (the kernel reports what it actually filled in
-    /// [`mask`](Self::mask), so an unsupported filesystem is distinguishable
-    /// from an unmodified file rather than silently reading as `0`).
+    /// `None` unless [`StatxMask::CHANGE_COOKIE`] was requested *and* the filesystem supplied it.
     ///
-    /// This is the exact validator for anything derived from a file and
-    /// cached elsewhere - a checksum, a parsed ACL, a directory's sorted
-    /// entry list. Comparing it beats comparing `(size, mtime)`, which is a
-    /// timestamp-granularity heuristic. Note the value is only meaningful
-    /// within one filesystem instance: it is not preserved across a
-    /// `send`/`recv` to another pool, so a *persisted* cookie is worth
+    /// It is the exact validator for anything derived from a file and cached elsewhere, better than `(size, mtime)`. It
+    /// holds only within one filesystem instance and is not kept across `send`/`recv`, so a persisted cookie is worth
     /// corroborating with size and mtime.
     pub fn change_cookie(&self) -> Option<u64> {
         self.mask()
@@ -409,54 +367,40 @@ impl Statx {
             .then_some(self.0.stx_change_cookie)
     }
 
-    /// The inode generation, which tells a reused inode number from the
-    /// file that held it before.
+    /// The inode generation, which tells a reused inode number from the file that held it before.
     ///
-    /// `None` unless [`StatxMask::GEN`] was requested *and* the filesystem
-    /// supplied it. Only the TrueNAS fork passes the field through
-    /// `cp_statx` (under `CONFIG_TRUENAS`, fs/stat.c), and only a filesystem
-    /// that sets `kstat->gen` fills it: ZFS does, from `i_generation`
-    /// (`zpl_getattr_impl`, module/os/linux/zfs/zpl_inode.c). That is the
-    /// creation txg truncated to 32 bits - the generation a ZFS file handle
-    /// carries, before `zfs_fid` remaps a zero to one.
+    /// `None` unless [`StatxMask::GEN`] was requested *and* the filesystem supplied it. Only the TrueNAS fork passes
+    /// the field through `cp_statx` (under `CONFIG_TRUENAS`, fs/stat.c), and only a filesystem that sets `kstat->gen`
+    /// fills it: ZFS does, from `i_generation` (`zpl_getattr_impl`, module/os/linux/zfs/zpl_inode.c). That is the
+    /// creation txg truncated to 32 bits - the generation a ZFS file handle carries, before `zfs_fid` remaps a zero to
+    /// one.
     pub fn generation(&self) -> Option<u64> {
-        self.mask()
-            .contains(StatxMask::GEN)
-            .then_some(self.0.stx_gen)
+        self.mask().contains(StatxMask::GEN).then_some(self.0.stx_gen)
     }
 
-    /// The DOS attributes of a ZFS file, the bits
-    /// [`fget_zfs_attrs`](super::fget_zfs_attrs) reads, from the same
-    /// `statx` and through any descriptor, `O_PATH` included, where the ioctl
-    /// needs one opened for I/O.
+    /// The DOS attributes of a ZFS file, the bits [`fget_zfs_attrs`](super::fget_zfs_attrs) reads, from the same
+    /// `statx` and through any descriptor, `O_PATH` included, where the ioctl needs one opened for I/O.
     ///
-    /// `None` unless [`StatxMask::ZFSFLAGS`] was requested *and* the
-    /// filesystem supplied it. Only the TrueNAS fork passes the field through
-    /// `cp_statx` (under `CONFIG_TRUENAS`, fs/stat.c), and only ZFS fills
-    /// it, from `z_pflags` cut to `ZFS_DOS_FL_USER_VISIBLE`
-    /// (`zpl_getattr_impl`, module/os/linux/zfs/zpl_inode.c), the mask
-    /// `zpl_ioctl_getdosflags` answers with too. The field's other bits,
-    /// `ZFS_ACL_TRIVIAL` and the flags of the ACL, are
-    /// [`nfs4_acl_flags`](Self::nfs4_acl_flags)'s and are left out here,
-    /// since the setter refuses them.
+    /// `None` unless [`StatxMask::ZFSFLAGS`] was requested *and* the filesystem supplied it. Only the TrueNAS fork
+    /// passes the field through `cp_statx` (under `CONFIG_TRUENAS`, fs/stat.c), and only ZFS fills it, from `z_pflags`
+    /// cut to `ZFS_DOS_FL_USER_VISIBLE` (`zpl_getattr_impl`, module/os/linux/zfs/zpl_inode.c), the mask
+    /// `zpl_ioctl_getdosflags` answers with too. The field's other bits, `ZFS_ACL_TRIVIAL` and the flags of the ACL,
+    /// are [`nfs4_acl_flags`](Self::nfs4_acl_flags)'s and are left out here, since the setter refuses them.
     pub fn zfs_attrs(&self) -> Option<ZfsAttr> {
         self.mask()
             .contains(StatxMask::ZFSFLAGS)
             .then(|| ZfsAttr::from_bits_truncate(self.0.stx_zfsflags))
     }
 
-    /// Whether ZFS holds the file's NFSv4 ACL as trivial, one the mode
-    /// bits say all of (`ZFS_ACL_TRIVIAL`, include/sys/zfs_znode.h).
+    /// Whether ZFS holds the file's NFSv4 ACL as trivial, one the mode bits say all of (`ZFS_ACL_TRIVIAL`,
+    /// include/sys/zfs_znode.h).
     ///
-    /// `None` unless [`StatxMask::ZFSFLAGS`] was requested and supplied, as
-    /// for [`zfs_attrs`](Self::zfs_attrs). **Meaningful on an `acltype=nfsv4`
-    /// dataset alone.** `zpl_getattr_impl` reports the bit only there, since
-    /// only there does a trivial ACL send the permission check back to the
-    /// mode (`zpl_permission`, module/os/linux/zfs/zpl_xattr.c), so on any
-    /// other acltype this is `Some(false)` whatever the file holds. It is the
-    /// bit `zfs_getacl` turns into `ACL_IS_TRIVIAL` in the flags of
-    /// `system.nfs4_acl_xdr` (module/os/linux/zfs/zfs_acl.c), so it answers
-    /// what reading that attribute would, with no read.
+    /// `None` unless [`StatxMask::ZFSFLAGS`] was requested and supplied, as for [`zfs_attrs`](Self::zfs_attrs).
+    /// **Meaningful on an `acltype=nfsv4` dataset alone.** `zpl_getattr_impl` reports the bit only there, since only
+    /// there does a trivial ACL send the permission check back to the mode (`zpl_permission`,
+    /// module/os/linux/zfs/zpl_xattr.c), so on any other acltype this is `Some(false)` whatever the file holds. It is
+    /// the bit `zfs_getacl` turns into `ACL_IS_TRIVIAL` in the flags of `system.nfs4_acl_xdr`
+    /// (module/os/linux/zfs/zfs_acl.c), so it answers what reading that attribute would, with no read.
     pub fn nfs4_acl_is_trivial(&self) -> Option<bool> {
         // `include/sys/zfs_znode.h`.
         const ZFS_ACL_TRIVIAL: u64 = 0x4;
@@ -465,20 +409,15 @@ impl Statx {
             .then_some(self.0.stx_zfsflags & ZFS_ACL_TRIVIAL != 0)
     }
 
-    /// The flags of the file's NFSv4 ACL, auto-inherit, protected, defaulted
-    /// and `ACL_IS_TRIVIAL`, as `system.nfs4_acl_xdr` gives them, with no read
-    /// of the ACL.
+    /// The flags of the file's NFSv4 ACL, auto-inherit, protected, defaulted and `ACL_IS_TRIVIAL`, as
+    /// `system.nfs4_acl_xdr` gives them, with no read of the ACL.
     ///
-    /// `None` unless [`StatxMask::ZFSFLAGS`] was requested and supplied, as
-    /// for [`zfs_attrs`](Self::zfs_attrs). **Meaningful on an `acltype=nfsv4`
-    /// dataset alone**, as for
-    /// [`nfs4_acl_is_trivial`](Self::nfs4_acl_is_trivial), so on any other
-    /// acltype this is empty. `zpl_getattr_impl` reports `ZFS_ACL_PROTECTED`,
-    /// `ZFS_ACL_DEFAULTED` and `ZFS_ACL_AUTO_INHERIT` beside `ZFS_ACL_TRIVIAL`,
-    /// the four bits of `z_pflags` that `zfs_getsecattr` turns into these
-    /// flags (module/os/linux/zfs/zfs_acl.c). A ZFS module that reports the
-    /// trivial bit alone leaves the other three clear. `ACL_IS_DIR` is left
-    /// out, since the file type says it.
+    /// `None` unless [`StatxMask::ZFSFLAGS`] was requested and supplied, as for [`zfs_attrs`](Self::zfs_attrs).
+    /// **Meaningful on an `acltype=nfsv4` dataset alone**, as for [`nfs4_acl_is_trivial`](Self::nfs4_acl_is_trivial),
+    /// so on any other acltype this is empty. `zpl_getattr_impl` reports `ZFS_ACL_PROTECTED`, `ZFS_ACL_DEFAULTED` and
+    /// `ZFS_ACL_AUTO_INHERIT` beside `ZFS_ACL_TRIVIAL`, the four bits of `z_pflags` that `zfs_getsecattr` turns into
+    /// these flags (module/os/linux/zfs/zfs_acl.c). A ZFS module that reports the trivial bit alone leaves the other
+    /// three clear. `ACL_IS_DIR` is left out, since the file type says it.
     #[cfg(feature = "acl")]
     pub fn nfs4_acl_flags(&self) -> Option<super::acl::Nfs4AclFlag> {
         use super::acl::Nfs4AclFlag;
@@ -562,26 +501,20 @@ impl Statx {
         &self.0
     }
 
-    /// Wrap a kernel-filled `struct statx` (the io_uring `STATX` op writes
-    /// one into a buffer the completion hands back).
+    /// Wrap a kernel-filled `struct statx` (the io_uring `STATX` op writes one into a buffer the completion hands
+    /// back).
     #[cfg_attr(not(feature = "uring-fs"), allow(dead_code))]
     pub(crate) fn from_raw(raw: StatxRaw) -> Statx {
         Statx(raw)
     }
 }
 
-/// Retrieve extended attributes for the file named by `path` relative to
-/// `dirfd`.
+/// Retrieve extended attributes for the file named by `path` relative to `dirfd`.
 ///
 /// Combine `AtFlags::AT_EMPTY_PATH` with an empty path to stat `dirfd` itself.
 ///
 /// See [`statx(2)`](https://man7.org/linux/man-pages/man2/statx.2.html).
-pub fn statx<P, Fd>(
-    dirfd: Fd,
-    path: &P,
-    flags: AtFlags,
-    mask: StatxMask,
-) -> errno::Result<Statx>
+pub fn statx<P, Fd>(dirfd: Fd, path: &P, flags: AtFlags, mask: StatxMask) -> errno::Result<Statx>
 where
     P: ?Sized + TnPath,
     Fd: AsFd,
@@ -610,54 +543,42 @@ where
 mod tests {
     use super::*;
 
-    /// A `struct statx` whose mask is `mask` and whose ZFS flags are `flags`,
-    /// every other field zero.
+    /// A `struct statx` whose mask is `mask` and whose ZFS flags are `flags`, every other field zero.
     fn filled(mask: StatxMask, flags: u64) -> Statx {
-        // SAFETY: `StatxRaw` is plain integers, for which all zero bits are
-        // a valid value.
+        // SAFETY: `StatxRaw` is plain integers, for which all zero bits are a valid value.
         let mut raw: StatxRaw = unsafe { std::mem::zeroed() };
         raw.stx_mask = mask.bits();
         raw.stx_zfsflags = flags;
         Statx::from_raw(raw)
     }
 
-    /// The values are those of `include/sys/fs/zfs.h` and
-    /// `include/sys/zfs_znode.h`, written out by hand. HIDDEN is
-    /// 0x0000000200000000, ARCHIVE 0x0000000800000000, ZFS_ACL_TRIVIAL 0x4,
-    /// and ZFS_AV_MODIFIED 0x0000040000000000, which ZFS keeps to itself.
+    /// The values are those of `include/sys/fs/zfs.h` and `include/sys/zfs_znode.h`, written out by hand. HIDDEN is
+    /// 0x0000000200000000, ARCHIVE 0x0000000800000000, ZFS_ACL_TRIVIAL 0x4, and ZFS_AV_MODIFIED 0x0000040000000000,
+    /// which ZFS keeps to itself.
     #[test]
     fn the_zfs_flags_split_into_the_dos_attributes_and_the_trivial_bit() {
-        let flags = 0x0000_0002_0000_0000
-            | 0x0000_0008_0000_0000
-            | 0x4
-            | 0x0000_0400_0000_0000;
+        let flags = 0x0000_0002_0000_0000 | 0x0000_0008_0000_0000 | 0x4 | 0x0000_0400_0000_0000;
         let st = filled(StatxMask::ZFSFLAGS, flags);
         assert_eq!(st.zfs_attrs(), Some(ZfsAttr::HIDDEN | ZfsAttr::ARCHIVE));
         assert_eq!(st.nfs4_acl_is_trivial(), Some(true));
         let st = filled(StatxMask::ZFSFLAGS, 0x0000_0002_0000_0000);
         assert_eq!(st.zfs_attrs(), Some(ZfsAttr::HIDDEN));
         assert_eq!(st.nfs4_acl_is_trivial(), Some(false));
-        // A kernel that did not fill the field leaves its bit out of the
-        // mask, and whatever the field holds then means nothing.
+        // A kernel that did not fill the field leaves its bit out of the mask, and whatever the field holds then means
+        // nothing.
         let st = filled(StatxMask::BASIC_STATS, flags);
         assert_eq!(st.zfs_attrs(), None);
         assert_eq!(st.nfs4_acl_is_trivial(), None);
     }
 
-    /// `include/sys/zfs_znode.h` has ZFS_ACL_PROTECTED 0x10,
-    /// ZFS_ACL_DEFAULTED 0x20 and ZFS_ACL_AUTO_INHERIT 0x40, which
-    /// `zfs_getsecattr` turns into ACL_PROTECTED 0x2, ACL_DEFAULTED 0x4 and
-    /// ACL_AUTO_INHERIT 0x1, and ZFS_ACL_TRIVIAL into ACL_IS_TRIVIAL
-    /// 0x10000, all written out by hand. ZFS_INHERIT_ACE 0x2 and
-    /// ZFS_ACL_OBJ_ACE 0x8 are bits ZFS keeps to itself.
+    /// `include/sys/zfs_znode.h` has ZFS_ACL_PROTECTED 0x10, ZFS_ACL_DEFAULTED 0x20 and ZFS_ACL_AUTO_INHERIT 0x40,
+    /// which `zfs_getsecattr` turns into ACL_PROTECTED 0x2, ACL_DEFAULTED 0x4 and ACL_AUTO_INHERIT 0x1, and
+    /// ZFS_ACL_TRIVIAL into ACL_IS_TRIVIAL 0x10000, all written out by hand. ZFS_INHERIT_ACE 0x2 and ZFS_ACL_OBJ_ACE
+    /// 0x8 are bits ZFS keeps to itself.
     #[cfg(feature = "acl")]
     #[test]
     fn the_zfs_flags_give_the_flags_of_the_acl() {
-        let flags = |raw| {
-            filled(StatxMask::ZFSFLAGS, raw)
-                .nfs4_acl_flags()
-                .map(|f| f.bits())
-        };
+        let flags = |raw| filled(StatxMask::ZFSFLAGS, raw).nfs4_acl_flags().map(|f| f.bits());
         assert_eq!(flags(0x10), Some(0x2));
         assert_eq!(flags(0x20), Some(0x4));
         assert_eq!(flags(0x40), Some(0x1));
@@ -669,15 +590,13 @@ mod tests {
         assert_eq!(st.nfs4_acl_flags(), None);
     }
 
-    /// `include/uapi/linux/stat.h` of the kernel fork has
-    /// STATX_ATTR_POSIXACL 0x0100000000000000 and STATX_ATTR_NFSV4ACL
-    /// 0x0200000000000000, written out by hand. The type is read only where
-    /// the mask of the attributes names both bits.
+    /// `include/uapi/linux/stat.h` of the kernel fork has STATX_ATTR_POSIXACL 0x0100000000000000 and
+    /// STATX_ATTR_NFSV4ACL 0x0200000000000000, written out by hand. The type is read only where the mask of the
+    /// attributes names both bits.
     #[test]
     fn the_acltype_is_read_against_the_mask_of_the_attributes() {
         let with = |attributes: u64, mask: u64| {
-            // SAFETY: `StatxRaw` is plain integers, for which all zero bits
-            // are a valid value.
+            // SAFETY: `StatxRaw` is plain integers, for which all zero bits are a valid value.
             let mut raw: StatxRaw = unsafe { std::mem::zeroed() };
             raw.stx_attributes = attributes;
             raw.stx_attributes_mask = mask;
@@ -691,14 +610,12 @@ mod tests {
         assert_eq!(with(0, 0x0200_0000_0000_0000), None);
     }
 
-    /// `include/uapi/linux/stat.h` of the kernel fork has STATX_ATTR_RDONLY
-    /// 0x1000000000000000, written out by hand. It is read only where the
-    /// mask of the attributes names it.
+    /// `include/uapi/linux/stat.h` of the kernel fork has STATX_ATTR_RDONLY 0x1000000000000000, written out by hand. It
+    /// is read only where the mask of the attributes names it.
     #[test]
     fn the_read_only_bit_is_read_against_the_mask_of_the_attributes() {
         let with = |attributes: u64, mask: u64| {
-            // SAFETY: `StatxRaw` is plain integers, for which all zero bits
-            // are a valid value.
+            // SAFETY: `StatxRaw` is plain integers, for which all zero bits are a valid value.
             let mut raw: StatxRaw = unsafe { std::mem::zeroed() };
             raw.stx_attributes = attributes;
             raw.stx_attributes_mask = mask;
@@ -711,16 +628,13 @@ mod tests {
         assert_eq!(with(0, 0), None);
     }
 
-    /// `include/uapi/linux/stat.h` of the kernel fork has STATX_ACL
-    /// 0x08000000, STATX_ATTR_ACL_ACCESS 0x0400000000000000 and
-    /// STATX_ATTR_ACL_DEFAULT 0x0800000000000000, written out by hand. The
-    /// two are read only where the result mask names STATX_ACL, and the
-    /// ACL type beside them says nothing of the file's own ACLs.
+    /// `include/uapi/linux/stat.h` of the kernel fork has STATX_ACL 0x08000000, STATX_ATTR_ACL_ACCESS
+    /// 0x0400000000000000 and STATX_ATTR_ACL_DEFAULT 0x0800000000000000, written out by hand. The two are read only
+    /// where the result mask names STATX_ACL, and the ACL type beside them says nothing of the file's own ACLs.
     #[test]
     fn the_posix_acls_are_read_against_the_result_mask() {
         let acls = |mask: u32, attributes: u64| {
-            // SAFETY: `StatxRaw` is plain integers, for which all zero bits
-            // are a valid value.
+            // SAFETY: `StatxRaw` is plain integers, for which all zero bits are a valid value.
             let mut raw: StatxRaw = unsafe { std::mem::zeroed() };
             raw.stx_mask = mask;
             raw.stx_attributes = attributes;
@@ -737,8 +651,7 @@ mod tests {
         assert_eq!(both, (Some(true), Some(true)));
         let types = 0x0100_0000_0000_0000 | 0x0200_0000_0000_0000;
         assert_eq!(acls(asked, types), (Some(false), Some(false)));
-        // A kernel that did not answer leaves the bit out of the mask, and
-        // the attributes then mean nothing.
+        // A kernel that did not answer leaves the bit out of the mask, and the attributes then mean nothing.
         assert_eq!(acls(0x7ff, access | default), (None, None));
     }
 }

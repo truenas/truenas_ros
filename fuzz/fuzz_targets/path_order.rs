@@ -2,18 +2,14 @@
 
 //! Fuzz the ordered-listing comparator for **total-order violations**.
 //!
-//! `cmp_path_bytes` orders directory entries the way their full paths compare,
-//! synthesizing a directory's trailing `/` during the comparison instead of
-//! building a key. Its output feeds `sort_by` and `partition_point` over names
-//! an unprivileged user chose. Since Rust 1.81 `sort_by` **panics** on a
-//! comparator that contradicts itself, and `partition_point` on a non-monotone
-//! predicate silently cuts the resume boundary in the wrong place — so a
-//! listing would skip or repeat entries across a page.
+//! `cmp_path_bytes` orders directory entries the way their full paths compare, synthesizing a directory's trailing `/`
+//! during the comparison instead of building a key. Its output feeds `sort_by` and `partition_point` over names an
+//! unprivileged user chose. Since Rust 1.81 `sort_by` **panics** on a comparator that contradicts itself, and
+//! `partition_point` on a non-monotone predicate silently cuts the resume boundary in the wrong place — so a listing
+//! would skip or repeat entries across a page.
 //!
-//! The three laws are checked over a triple: reflexivity, antisymmetry (also
-//! called duality — `cmp(a,b)` is the reverse of `cmp(b,a)`), and transitivity
-//! in each of its forms. An entry's key is `(name, is_dir)`, so both halves
-//! vary.
+//! The three laws are checked over a triple: reflexivity, antisymmetry (also called duality — `cmp(a,b)` is the reverse
+//! of `cmp(b,a)`), and transitivity in each of its forms. An entry's key is `(name, is_dir)`, so both halves vary.
 
 use libfuzzer_sys::fuzz_target;
 use std::cmp::Ordering;
@@ -26,18 +22,13 @@ fn cmp(a: &Entry, b: &Entry) -> Ordering {
 }
 
 fuzz_target!(|data: &[u8]| {
-    // Three entries out of one input: a `\xff`-separated list of names, with
-    // the leading byte supplying each name's is-a-directory bit. Keeping this
-    // byte-driven means a corpus entry reads as the names it compares — the
-    // interesting cases are prefix pairs like `a` / `a/` / `ab`, which a
-    // structured generator would rarely line up on its own.
+    // Three entries from one input, a `\xff`-separated list of names with the leading byte giving each one's directory
+    // bit. Byte-driven input lines up prefix pairs like `a`, `a/` and `ab`, which a structured generator rarely would.
     let Some((&flags, rest)) = data.split_first() else {
         return;
     };
     let mut names = rest.split(|&b| b == 0xff);
-    let mut next = |bit: u8| -> Entry {
-        (names.next().unwrap_or_default().to_vec(), flags & bit != 0)
-    };
+    let mut next = |bit: u8| -> Entry { (names.next().unwrap_or_default().to_vec(), flags & bit != 0) };
     let (a, b, c) = (next(1), next(2), next(4));
 
     // Reflexivity: an entry equals itself.
@@ -47,15 +38,11 @@ fuzz_target!(|data: &[u8]| {
 
     // Duality: reversing the arguments reverses the answer.
     for (x, y) in [(&a, &b), (&b, &c), (&a, &c)] {
-        assert_eq!(
-            cmp(x, y),
-            cmp(y, x).reverse(),
-            "not antisymmetric: {x:?} vs {y:?}"
-        );
+        assert_eq!(cmp(x, y), cmp(y, x).reverse(), "not antisymmetric: {x:?} vs {y:?}");
     }
 
-    // Equality must be an equivalence: equal entries compare identically
-    // against any third entry, or `sort_by` can place them inconsistently.
+    // Equality must be an equivalence: equal entries compare identically against any third entry, or `sort_by` can
+    // place them inconsistently.
     if cmp(&a, &b) == Ordering::Equal {
         assert_eq!(
             cmp(&a, &c),
@@ -84,8 +71,7 @@ fuzz_target!(|data: &[u8]| {
     let mut all = vec![a, b, c];
     all.sort_by(cmp);
     assert!(
-        all.windows(2)
-            .all(|w| cmp(&w[0], &w[1]) != Ordering::Greater),
+        all.windows(2).all(|w| cmp(&w[0], &w[1]) != Ordering::Greater),
         "sort_by left the entries out of order: {all:?}"
     );
 });

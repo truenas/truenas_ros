@@ -1,16 +1,13 @@
 //! `statmount(2)` - detailed information about a single mount.
 
-use super::{
-    MNT_ID_REQ_SIZE_VER1, MntIdReq, MntPropagation, MountAttr, SYS_STATMOUNT,
-};
+use super::{MNT_ID_REQ_SIZE_VER1, MntIdReq, MntPropagation, MountAttr, SYS_STATMOUNT};
 use crate::errno::{self, Errno, retry_on_eintr};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
 tn_bitflags! {
-    /// `STATMOUNT_*` - fields requested from / returned by `statmount`
-    /// (the full 6.18 set, through the uid/gid maps).
+    /// `STATMOUNT_*` - fields requested from / returned by `statmount` (the full 6.18 set, through the uid/gid maps).
     pub struct StatmountMask: u64 {
         /// Superblock basics (`sb_dev_*`, `sb_magic`, `sb_flags`).
         SB_BASIC = 0x0000_0001;
@@ -59,11 +56,9 @@ tn_bitflags! {
     }
 }
 
-/// Fixed header of the kernel `struct statmount` (6.18). Strings live in the
-/// flexible `str[]` array immediately after this header (offset 512); the u32
-/// string fields hold byte offsets into it. The string base stays at 512
-/// across kernel versions (`__spare2` shrinks as fields are added), so this is
-/// forward/backward compatible.
+/// Fixed header of the kernel `struct statmount` (6.18). Strings live in the flexible `str[]` array immediately after
+/// this header (offset 512); the u32 string fields hold byte offsets into it. The string base stays at 512 across
+/// kernel versions (`__spare2` shrinks as fields are added), so this is forward/backward compatible.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawStatmount {
@@ -107,8 +102,7 @@ const _: () = assert!(core::mem::size_of::<RawStatmount>() == STR_BASE);
 
 /// Detailed information about a single mount, from [`statmount`].
 ///
-/// Every field group is `Some` only when its corresponding [`StatmountMask`]
-/// bit was requested and returned.
+/// Every field group is `Some` only when its corresponding [`StatmountMask`] bit was requested and returned.
 #[derive(Clone, Debug)]
 pub struct Statmount {
     /// The set of fields the kernel actually populated.
@@ -135,10 +129,9 @@ pub struct Statmount {
     pub mnt_root: Option<String>,
     /// Mount point relative to the current root.
     ///
-    /// A `PathBuf`, not a `String`: the kernel reports the mount point as raw
-    /// dentry bytes, which need not be UTF-8, and it is handed back to
-    /// `openat2`/`umount2` as those bytes so a lossy substitution cannot name a
-    /// different, still-openable path.
+    /// A `PathBuf`, not a `String`: the kernel reports the mount point as raw dentry bytes, which need not be UTF-8,
+    /// and it is handed back to `openat2`/`umount2` as those bytes so a lossy substitution cannot name a different,
+    /// still-openable path.
     pub mnt_point: Option<PathBuf>,
     /// Filesystem type name.
     pub fs_type: Option<String>,
@@ -154,8 +147,7 @@ pub struct Statmount {
     pub sb_flags: Option<SbFlags>,
     /// Subtype of `fs_type`, if any (e.g. the FUSE subtype).
     pub fs_subtype: Option<String>,
-    /// Mount source (device / ZFS dataset). Requires a 6.14+ kernel; `None`
-    /// when unsupported by the running kernel.
+    /// Mount source (device / ZFS dataset). Requires a 6.14+ kernel; `None` when unsupported by the running kernel.
     pub sb_source: Option<String>,
     /// Filesystem options, one per element.
     pub opt_array: Option<Vec<String>>,
@@ -174,21 +166,16 @@ pub struct Statmount {
 impl Statmount {
     /// The mount options string, matching `/proc/self/mountinfo`.
     ///
-    /// When both [`StatmountMask::MNT_OPTS`] and [`StatmountMask::SB_BASIC`]
-    /// were requested, a `ro,`/`rw,` prefix (derived from
-    /// [`SbFlags::RDONLY`]) is prepended, since `statmount` otherwise omits it.
+    /// When both [`StatmountMask::MNT_OPTS`] and [`StatmountMask::SB_BASIC`] were requested, a `ro,`/`rw,` prefix
+    /// (derived from [`SbFlags::RDONLY`]) is prepended, since `statmount` otherwise omits it.
     ///
-    /// The prefix is keyed on `SB_BASIC` alone. A filesystem whose
-    /// superblock emits no options at all - procfs, sysfs, tracefs, nsfs -
-    /// makes the kernel return without raising `MNT_OPTS`, so keying on that
-    /// bit would drop the read-only status of every such mount.
+    /// The prefix is keyed on `SB_BASIC` alone. A filesystem whose superblock emits no options at all - procfs, sysfs,
+    /// tracefs, nsfs - makes the kernel return without raising `MNT_OPTS`, so keying on that bit would drop the
+    /// read-only status of every such mount.
     pub fn mount_opts(&self) -> Option<String> {
         let opts = self.mnt_opts_raw.as_deref().unwrap_or("");
         if self.mask.contains(StatmountMask::SB_BASIC) {
-            let ro = self
-                .sb_flags
-                .unwrap_or_else(SbFlags::empty)
-                .contains(SbFlags::RDONLY);
+            let ro = self.sb_flags.unwrap_or_else(SbFlags::empty).contains(SbFlags::RDONLY);
             let prefix = if ro { "ro" } else { "rw" };
             Some(if opts.is_empty() {
                 prefix.to_string()
@@ -203,36 +190,29 @@ impl Statmount {
     }
 }
 
-/// The reply decoder exposed to the fuzz crate (`fuzz/`) under `__fuzz` only --
-/// the `mount` analogue of the net stack's `frame_step` re-export. Never part
-/// of the stable API.
+/// The reply decoder, exposed to the fuzz crate (`fuzz/`) under `__fuzz` only. Never part of the stable API.
 ///
-/// Driven by `fuzz/fuzz_targets/statmount_parse.rs`: [`parse`](fuzz::parse)
-/// reinterprets a caller-supplied word array as a `struct statmount` and walks
-/// its string area by the offsets the header declares, so a reply whose `size`,
-/// offsets, or `*_num` counts disagree with the buffer must still decode
-/// without reading out of bounds.
+/// `fuzz/fuzz_targets/statmount_parse.rs` drives it with replies whose `size`, offsets, or `*_num` counts may disagree
+/// with the buffer, and each must still decode without reading out of bounds.
 #[cfg(feature = "__fuzz")]
 pub mod fuzz {
-    /// Decode a `statmount` reply from its raw word buffer, or `None` if the
-    /// buffer is too short to hold the fixed header.
+    /// Decode a `statmount` reply from its raw word buffer, or `None` if the buffer is too short to hold the fixed
+    /// header.
     ///
-    /// The inner `parse` reads `RawStatmount` off the front unchecked - a
-    /// precondition [`statmount`](super::statmount) discharges by allocating
-    /// 1 KiB. Enforcing it here keeps this entry point safe for *any* fuzzer
-    /// input, so a short buffer is a `None` rather than an out-of-bounds read.
+    /// The inner `parse` reads `RawStatmount` off the front unchecked - a precondition [`statmount`](super::statmount)
+    /// discharges by allocating 1 KiB. Enforcing it here keeps this entry point safe for *any* fuzzer input, so a short
+    /// buffer is a `None` rather than an out-of-bounds read.
     pub fn parse(words: &[u64]) -> Option<super::Statmount> {
         (words.len() * 8 >= super::STR_BASE).then(|| super::parse(words))
     }
 }
 
-/// Retrieve detailed information about the mount identified by `mnt_id`,
-/// requesting the field groups named in `mask`.
+/// Retrieve detailed information about the mount identified by `mnt_id`, requesting the field groups named in `mask`.
 ///
 /// See [`statmount(2)`](https://man7.org/linux/man-pages/man2/statmount.2.html).
 pub fn statmount(mnt_id: u64, mask: StatmountMask) -> errno::Result<Statmount> {
-    // 8-byte-aligned buffer (kernel writes u64 fields). Start at 1 KiB, grow
-    // by 4 KiB on EOVERFLOW, matching the `truenas_os` C extension.
+    // 8-byte-aligned buffer (kernel writes u64 fields). Start at 1 KiB, which `parse` relies on, and grow by 4 KiB on
+    // EOVERFLOW.
     let mut words = vec![0u64; 1024 / 8];
     loop {
         let byte_len = words.len() * 8;
@@ -264,17 +244,13 @@ pub fn statmount(mnt_id: u64, mask: StatmountMask) -> errno::Result<Statmount> {
 }
 
 fn parse(words: &[u64]) -> Statmount {
-    // SAFETY: `words` is 8-byte aligned and at least 1 KiB (>= STR_BASE), so
-    // reading the fixed `RawStatmount` header is in-bounds and aligned.
+    // SAFETY: `words` is 8-byte aligned and at least 1 KiB (>= STR_BASE), so reading the fixed `RawStatmount` header is
+    // in-bounds and aligned.
     let hdr = unsafe { &*words.as_ptr().cast::<RawStatmount>() };
-    // SAFETY: same allocation, reinterpreted as bytes for string extraction.
-    // Clamp to the kernel-reported `size` (never past the allocation) so string
-    // offsets are bounded by what the kernel actually wrote - the safety is then
-    // local, not contingent on the buffer having been zero-initialised.
+    // SAFETY: same allocation, reinterpreted as bytes for string extraction, and clamped to the kernel-reported `size`
+    // and never past the allocation, so string offsets are bounded by what the kernel actually wrote.
     let written = (hdr.size as usize).min(words.len() * 8);
-    let bytes = unsafe {
-        std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), written)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), written) };
     let mask = StatmountMask::from_bits_retain(hdr.mask);
 
     let get_bytes = |offset: u32| -> Vec<u8> {
@@ -286,27 +262,17 @@ fn parse(words: &[u64]) -> Statmount {
         let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
         tail[..end].to_vec()
     };
-    // The kernel emits the mount point as raw dentry bytes - `statmount_mnt_point`
-    // writes it through `seq_path_root` with an empty escape set
-    // (fs/namespace.c) - so carry it as a path without a UTF-8 round-trip;
-    // substituting U+FFFD would yield a different, still-openable path.
-    let get_path = |offset: u32| -> PathBuf {
-        PathBuf::from(OsString::from_vec(get_bytes(offset)))
-    };
-    let get_str = |offset: u32| -> String {
-        String::from_utf8_lossy(&get_bytes(offset)).into_owned()
-    };
+    // The kernel emits the mount point as raw dentry bytes (`statmount_mnt_point` through `seq_path_root` with an empty
+    // escape set, fs/namespace.c), so carry it as a path without a UTF-8 round-trip.
+    let get_path = |offset: u32| -> PathBuf { PathBuf::from(OsString::from_vec(get_bytes(offset))) };
+    let get_str = |offset: u32| -> String { String::from_utf8_lossy(&get_bytes(offset)).into_owned() };
 
     // A run of `count` NUL-terminated strings starting at `offset` into `str`.
     let get_str_array = |offset: u32, count: u32| -> Vec<String> {
         let start = STR_BASE + offset as usize;
-        // `count` is header-declared, so reserving against it directly would
-        // let a reply claiming `u32::MAX` strings ask for ~100 GiB before a
-        // single byte is read. Each string consumes at least its terminator,
-        // so what remains of the string area is the real bound.
-        let mut out = Vec::with_capacity(
-            (count as usize).min(bytes.len().saturating_sub(start)),
-        );
+        // `count` is declared by the reply, so reserving against it would let `u32::MAX` ask for ~100 GiB before a byte
+        // is read. Each string costs at least its terminator, so what remains of the string area is the real bound.
+        let mut out = Vec::with_capacity((count as usize).min(bytes.len().saturating_sub(start)));
         let mut pos = start;
         for _ in 0..count {
             if pos >= bytes.len() {
@@ -331,37 +297,26 @@ fn parse(words: &[u64]) -> Statmount {
         mnt_id_old: mnt_basic.then_some(hdr.mnt_id_old),
         mnt_parent_id_old: mnt_basic.then_some(hdr.mnt_parent_id_old),
         mnt_attr: mnt_basic.then(|| MountAttr::from_bits_retain(hdr.mnt_attr)),
-        mnt_propagation: mnt_basic
-            .then(|| MntPropagation::from_bits_retain(hdr.mnt_propagation)),
+        mnt_propagation: mnt_basic.then(|| MntPropagation::from_bits_retain(hdr.mnt_propagation)),
         mnt_peer_group: mnt_basic.then_some(hdr.mnt_peer_group),
         mnt_master: mnt_basic.then_some(hdr.mnt_master),
-        propagate_from: has(StatmountMask::PROPAGATE_FROM)
-            .then_some(hdr.propagate_from),
+        propagate_from: has(StatmountMask::PROPAGATE_FROM).then_some(hdr.propagate_from),
         mnt_root: has(StatmountMask::MNT_ROOT).then(|| get_str(hdr.mnt_root)),
-        mnt_point: has(StatmountMask::MNT_POINT)
-            .then(|| get_path(hdr.mnt_point)),
+        mnt_point: has(StatmountMask::MNT_POINT).then(|| get_path(hdr.mnt_point)),
         fs_type: has(StatmountMask::FS_TYPE).then(|| get_str(hdr.fs_type)),
         mnt_ns_id: has(StatmountMask::MNT_NS_ID).then_some(hdr.mnt_ns_id),
         sb_dev_major: sb_basic.then_some(hdr.sb_dev_major),
         sb_dev_minor: sb_basic.then_some(hdr.sb_dev_minor),
         sb_magic: sb_basic.then_some(hdr.sb_magic),
         sb_flags: sb_basic.then(|| SbFlags::from_bits_retain(hdr.sb_flags)),
-        fs_subtype: has(StatmountMask::FS_SUBTYPE)
-            .then(|| get_str(hdr.fs_subtype)),
-        sb_source: has(StatmountMask::SB_SOURCE)
-            .then(|| get_str(hdr.sb_source)),
-        opt_array: has(StatmountMask::OPT_ARRAY)
-            .then(|| get_str_array(hdr.opt_array, hdr.opt_num)),
-        opt_sec_array: has(StatmountMask::OPT_SEC_ARRAY)
-            .then(|| get_str_array(hdr.opt_sec_array, hdr.opt_sec_num)),
-        supported_mask: has(StatmountMask::SUPPORTED_MASK)
-            .then(|| StatmountMask::from_bits_retain(hdr.supported_mask)),
-        mnt_uidmap: has(StatmountMask::MNT_UIDMAP)
-            .then(|| get_str_array(hdr.mnt_uidmap, hdr.mnt_uidmap_num)),
-        mnt_gidmap: has(StatmountMask::MNT_GIDMAP)
-            .then(|| get_str_array(hdr.mnt_gidmap, hdr.mnt_gidmap_num)),
-        mnt_opts_raw: has(StatmountMask::MNT_OPTS)
-            .then(|| get_str(hdr.mnt_opts)),
+        fs_subtype: has(StatmountMask::FS_SUBTYPE).then(|| get_str(hdr.fs_subtype)),
+        sb_source: has(StatmountMask::SB_SOURCE).then(|| get_str(hdr.sb_source)),
+        opt_array: has(StatmountMask::OPT_ARRAY).then(|| get_str_array(hdr.opt_array, hdr.opt_num)),
+        opt_sec_array: has(StatmountMask::OPT_SEC_ARRAY).then(|| get_str_array(hdr.opt_sec_array, hdr.opt_sec_num)),
+        supported_mask: has(StatmountMask::SUPPORTED_MASK).then(|| StatmountMask::from_bits_retain(hdr.supported_mask)),
+        mnt_uidmap: has(StatmountMask::MNT_UIDMAP).then(|| get_str_array(hdr.mnt_uidmap, hdr.mnt_uidmap_num)),
+        mnt_gidmap: has(StatmountMask::MNT_GIDMAP).then(|| get_str_array(hdr.mnt_gidmap, hdr.mnt_gidmap_num)),
+        mnt_opts_raw: has(StatmountMask::MNT_OPTS).then(|| get_str(hdr.mnt_opts)),
     }
 }
 
@@ -370,9 +325,8 @@ mod tests {
     use super::*;
     use crate::mount::is_zfs_snapshot;
 
-    /// A `Statmount` with every field cleared except `mask`. Constructible here
-    /// because this test module is a child of the module that owns the private
-    /// `mnt_opts_raw` field.
+    /// A `Statmount` with every field cleared except `mask`. Constructible here because this test module is a child of
+    /// the module that owns the private `mnt_opts_raw` field.
     fn base(mask: StatmountMask) -> Statmount {
         Statmount {
             mask,
@@ -404,63 +358,42 @@ mod tests {
         }
     }
 
-    /// A `statmount` reply laid out as the kernel lays one out: the fixed
-    /// header, then NUL-terminated strings at offset [`STR_BASE`], with
-    /// `mnt_root`, `mnt_point`, `fs_type` and `sb_source` populated.
-    fn synth(
-        mnt_root: &[u8],
-        mnt_point: &[u8],
-        fs_type: &[u8],
-        sb_source: &[u8],
-    ) -> Vec<u64> {
+    /// A `statmount` reply laid out as the kernel lays one out: the fixed header, then NUL-terminated strings at offset
+    /// [`STR_BASE`], with `mnt_root`, `mnt_point`, `fs_type` and `sb_source` populated.
+    fn synth(mnt_root: &[u8], mnt_point: &[u8], fs_type: &[u8], sb_source: &[u8]) -> Vec<u64> {
         let mut strs = Vec::new();
         let mut offsets = [0u32; 4];
-        for (slot, s) in offsets
-            .iter_mut()
-            .zip([mnt_root, mnt_point, fs_type, sb_source])
-        {
+        for (slot, s) in offsets.iter_mut().zip([mnt_root, mnt_point, fs_type, sb_source]) {
             *slot = strs.len() as u32;
             strs.extend_from_slice(s);
             strs.push(0);
         }
         let size = STR_BASE + strs.len();
         let mut words = vec![0u64; size.div_ceil(8)];
-        // SAFETY: `words` is 8-byte aligned and at least STR_BASE bytes long,
-        // and every `RawStatmount` field is an integer, so the zeroed buffer is
-        // already a valid instance of it.
+        // SAFETY: `words` is 8-byte aligned and at least STR_BASE bytes long, and every `RawStatmount` field is an
+        // integer, so the zeroed buffer is already a valid instance of it.
         let hdr = unsafe { &mut *words.as_mut_ptr().cast::<RawStatmount>() };
         hdr.size = size as u32;
-        hdr.mask = (StatmountMask::MNT_ROOT
-            | StatmountMask::MNT_POINT
-            | StatmountMask::FS_TYPE
-            | StatmountMask::SB_SOURCE)
-            .bits();
+        hdr.mask =
+            (StatmountMask::MNT_ROOT | StatmountMask::MNT_POINT | StatmountMask::FS_TYPE | StatmountMask::SB_SOURCE)
+                .bits();
         [hdr.mnt_root, hdr.mnt_point, hdr.fs_type, hdr.sb_source] = offsets;
-        // SAFETY: same allocation; `strs.len()` bytes starting at STR_BASE are
-        // in bounds by the `size.div_ceil(8)` allocation above.
+        // SAFETY: same allocation; `strs.len()` bytes starting at STR_BASE are in bounds by the `size.div_ceil(8)`
+        // allocation above.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                strs.as_ptr(),
-                words.as_mut_ptr().cast::<u8>().add(STR_BASE),
-                strs.len(),
-            );
+            std::ptr::copy_nonoverlapping(strs.as_ptr(), words.as_mut_ptr().cast::<u8>().add(STR_BASE), strs.len());
         }
         words
     }
 
-    // The kernel reports the mount point as raw dentry bytes, handed straight
-    // to openat2/umount2. Replacing an invalid sequence with U+FFFD would name
-    // a different, still-openable path.
+    // A non-UTF-8 mount point comes back byte for byte.
     #[test]
     fn non_utf8_mount_point_is_carried_verbatim() {
         use std::os::unix::ffi::OsStrExt;
         use std::path::Path;
         const POINT: &[u8] = b"/mnt/tank/share/ev\xffil";
         let sm = parse(&synth(b"/", POINT, b"zfs", b"tank"));
-        assert_eq!(
-            sm.mnt_point.as_ref().unwrap().as_os_str().as_bytes(),
-            POINT
-        );
+        assert_eq!(sm.mnt_point.as_ref().unwrap().as_os_str().as_bytes(), POINT);
         // The lossy form is a longer, different, and equally openable path.
         assert_ne!(String::from_utf8_lossy(POINT).as_bytes(), POINT);
         // Plain ASCII is unaffected.
@@ -512,11 +445,8 @@ mod tests {
         // No MNT_OPTS bit and no SB_BASIC -> nothing to report.
         assert_eq!(base(StatmountMask::MNT_BASIC).mount_opts(), None);
 
-        // SB_BASIC without MNT_OPTS -> still the prefix. This is the shape a
-        // real reply takes for a filesystem whose superblock emits no options
-        // at all (procfs, sysfs, tracefs, nsfs): the kernel returns without
-        // raising MNT_OPTS, so keying the prefix on that bit would drop the
-        // read-only status of every such mount.
+        // SB_BASIC without MNT_OPTS -> still the prefix, the shape a real reply takes for procfs, sysfs, tracefs and
+        // nsfs.
         let mut sm3 = base(StatmountMask::SB_BASIC);
         sm3.sb_flags = Some(SbFlags::empty());
         assert_eq!(sm3.mount_opts().as_deref(), Some("rw"));
@@ -524,36 +454,31 @@ mod tests {
         assert_eq!(sm3.mount_opts().as_deref(), Some("ro"));
     }
 
-    /// A string-array count is declared by the reply, not derived from it, so
-    /// it must never size an allocation on its own: `u32::MAX` options would
-    /// reserve ~96 GiB before a byte is read. The real bound is what remains
-    /// of the string area, since every string costs at least its terminator.
-    ///
-    /// Found by the `statmount_parse` fuzz target; kept here because the
-    /// property is about the decoder, not about any one byte sequence.
+    /// A string-array count is declared by the reply, so it must never size an allocation on its own. The real bound is
+    /// what remains of the string area.
     #[test]
     fn a_declared_string_count_cannot_size_an_allocation() {
         let mut words = synth(b"/", b"/mnt", b"zfs", b"tank/ds");
-        // SAFETY: `synth` returns a buffer at least `STR_BASE` bytes long and
-        // 8-byte aligned, whose every field is an integer.
+        // SAFETY: `synth` returns a buffer at least `STR_BASE` bytes long and 8-byte aligned, whose every field is an
+        // integer.
         let hdr = unsafe { &mut *words.as_mut_ptr().cast::<RawStatmount>() };
         hdr.mask |= StatmountMask::OPT_ARRAY.bits();
-        // The array starts past everything the reply actually carries, and
-        // claims the largest count the field can express.
+        // The array starts past everything the reply actually carries, and claims the largest count the field can
+        // express.
         hdr.opt_array = (hdr.size as usize - STR_BASE) as u32;
         hdr.opt_num = u32::MAX;
 
         let sm = parse(&words);
-        // The clamp is what keeps this from aborting on a 96 GiB reserve; the
-        // decode itself yields nothing, because nothing is there.
+        // The clamp is what keeps this from aborting on a 96 GiB reserve; the decode itself yields nothing, because
+        // nothing is there.
         assert_eq!(
             sm.opt_array.as_deref(),
             Some(&[][..]),
             "a count past the string area must decode to no strings"
         );
 
-        // The same count with the array pointed *inside* the strings reads
-        // only what is really there and stops at the end of the buffer.
+        // The same count with the array pointed *inside* the strings reads only what is really there and stops at the
+        // end of the buffer.
         let hdr = unsafe { &mut *words.as_mut_ptr().cast::<RawStatmount>() };
         hdr.opt_array = 0;
         hdr.opt_num = u32::MAX;

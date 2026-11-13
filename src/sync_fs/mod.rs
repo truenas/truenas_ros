@@ -1,14 +1,11 @@
 //! Blocking (synchronous) filesystem bindings - the `sync_fs` umbrella.
 //!
-//! The umbrella root is the base syscall layer (feature `sync-fs`): [`statx`],
-//! [`openat2`], [`mkdirat`], [`unlinkat`], [`fchown`], [`renameat2`],
-//! [`safe_open`], atomic
-//! writes, whole-directory name reads ([`dir`]), and the shared flag types
-//! ([`AtFlags`], [`OFlag`], [`Mode`]). Each sibling subsystem is a
-//! named submodule behind its own feature: [`xattr`], [`acl`] (NFS4/POSIX1E),
-//! [`fhandle`], [`iter`] (feature `fsiter`), and [`shutil`]. Mount topology
-//! and idmapped-mount support live in [`crate::mount`]; the io_uring reactor
-//! counterpart is the (future) `uring_fs` module.
+//! The umbrella root is the base syscall layer (feature `sync-fs`): [`statx`], [`openat2`], [`mkdirat`], [`unlinkat`],
+//! [`fchown`], [`renameat2`], [`safe_open`], atomic writes, whole-directory name reads ([`dir`]), and the shared flag
+//! types ([`AtFlags`], [`OFlag`], [`Mode`]). Each sibling subsystem is a named submodule behind its own feature:
+//! [`xattr`], [`acl`] (NFS4/POSIX1E), [`fhandle`], [`iter`] (feature `fsiter`), and [`shutil`]. Mount topology and
+//! idmapped-mount support live in [`crate::mount`], and the io_uring counterpart is `crate::uring_fs` (feature
+//! `uring-fs`).
 
 #[cfg(feature = "sync-fs")]
 mod atomic;
@@ -71,10 +68,7 @@ pub use safe_open::safe_open;
 #[cfg(feature = "sync-fs")]
 pub use statfs::{Statfs, fstatfs};
 #[cfg(feature = "sync-fs")]
-pub use statx::{
-    AclType, Statx, StatxAttr, StatxMask, StatxRaw, StatxTimestamp,
-    StatxTimestampRaw, makedev, statx,
-};
+pub use statx::{AclType, Statx, StatxAttr, StatxMask, StatxRaw, StatxTimestamp, StatxTimestampRaw, makedev, statx};
 #[cfg(feature = "sync-fs")]
 pub use unlinkat::unlinkat;
 #[cfg(feature = "sync-fs")]

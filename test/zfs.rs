@@ -1,19 +1,11 @@
-//! Privileged, ZFS-backed integration tests: real NFSv4 and POSIX ACLs on ZFS
-//! datasets, plus ZFS snapshot detection - the paths that a plain tmpfs cannot
-//! exercise.
+//! Privileged, ZFS-backed integration tests: real NFSv4 and POSIX ACLs on ZFS datasets, plus ZFS snapshot detection -
+//! the paths that a plain tmpfs cannot exercise.
 //!
-//! Each test resolves its dataset directory from, in order: the
-//! `TRUENAS_ROS_{NFS4,POSIX}_DATASET` environment variables, then the
-//! `/NFSV4ACL` / `/POSIXACL` convention (matching the Python `truenas_pyos`
-//! fixtures). When no such dataset is present the test **skips**, so the suite
-//! stays green in an unprivileged sandbox and only does real work in CI (see
-//! `.github/workflows/scripts/setup-test-zfs.sh`).
-#![cfg(all(
-    target_os = "linux",
-    feature = "acl",
-    feature = "xattr",
-    feature = "sync-fs"
-))]
+//! Each test resolves its dataset directory from, in order: the `TRUENAS_ROS_{NFS4,POSIX}_DATASET` environment
+//! variables, then the `/NFSV4ACL` / `/POSIXACL` convention (matching the Python `truenas_pyos` fixtures). When no such
+//! dataset is present the test **skips**, so the suite stays green in an unprivileged sandbox and only does real work
+//! in CI (see `.github/workflows/scripts/setup-test-zfs.sh`).
+#![cfg(all(target_os = "linux", feature = "acl", feature = "xattr", feature = "sync-fs"))]
 
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
@@ -21,21 +13,20 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use truenas_ros::AT_FDCWD;
 use truenas_ros::sync_fs::acl::{
-    Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm,
-    Nfs4Who, PosixAce, PosixAcl, PosixPerm, PosixTag, fgetacl, fsetacl,
+    Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm, Nfs4Who, PosixAce, PosixAcl, PosixPerm,
+    PosixTag, fgetacl, fsetacl,
 };
 use truenas_ros::sync_fs::xattr::fgetxattr;
 use truenas_ros::sync_fs::{
-    AclType, AtFlags, Mode, OFlag, OpenHow, RenameFlags, StatxMask, ZfsAttr,
-    fget_zfs_attrs, fset_zfs_attrs, linkat, openat2, renameat2, statx,
+    AclType, AtFlags, Mode, OFlag, OpenHow, RenameFlags, StatxMask, ZfsAttr, fget_zfs_attrs, fset_zfs_attrs, linkat,
+    openat2, renameat2, statx,
 };
 
 #[path = "support/zfs_dir.rs"]
 mod zfs_dir;
 
-/// Skip the calling test. `TRUENAS_ROS_REQUIRE_ZFS` turns the skip into a
-/// failure, so a fixture that stopped being provisioned cannot report a green
-/// suite that tested nothing.
+/// Skip the calling test. `TRUENAS_ROS_REQUIRE_ZFS` turns the skip into a failure, so a fixture that stopped being
+/// provisioned cannot report a green suite that tested nothing.
 #[track_caller]
 fn skip(why: &str) {
     assert!(
@@ -46,12 +37,9 @@ fn skip(why: &str) {
 
 /// Resolve an ACL-typed dataset directory, or `None` to skip the test.
 ///
-/// Checked with `statfs`, not `is_dir`: `zfs create -o mountpoint=/POSIXACL`
-/// leaves that directory behind on the root filesystem, so a dataset that
-/// stopped being mounted - one of the two degradations
-/// `qemu-4-test.sh`'s `TRUENAS_ROS_REQUIRE_ZFS` exists to catch - hands an
-/// `is_dir` gate a plain ext4/tmpfs directory whose POSIX ACLs answer
-/// perfectly well. `test/support/zfs_dir.rs` states the same reason.
+/// Checked with `statfs`, not `is_dir`, since `zfs create -o mountpoint=/POSIXACL` leaves that directory behind on the
+/// root filesystem, and a dataset that stopped being mounted would hand an `is_dir` gate a plain directory whose POSIX
+/// ACLs answer perfectly well.
 fn dataset(env_var: &str, fallback: &str) -> Option<PathBuf> {
     let dir = std::env::var_os(env_var)
         .map(PathBuf::from)
@@ -72,11 +60,7 @@ fn scratch_file(dir: &Path, tag: &str) -> (PathBuf, std::fs::File) {
     let p = dir.join(format!("rostest_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_file(&p);
     std::fs::write(&p, b"acl test").unwrap();
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&p)
-        .unwrap();
+    let f = std::fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
     (p, f)
 }
 
@@ -89,42 +73,30 @@ fn nfs4_codec_and_named_user_roundtrip() {
 
     let acl = match fgetacl(f.as_fd()) {
         Ok(Acl::Nfs4(a)) => a,
-        // The path exists but isn't an NFS4-ACL filesystem here - skip rather
-        // than fail (e.g. a placeholder `/NFSV4ACL` dir on a non-ZFS host).
+        // The path exists but isn't an NFS4-ACL filesystem here - skip rather than fail (e.g. a placeholder `/NFSV4ACL`
+        // dir on a non-ZFS host).
         _ => {
             let _ = std::fs::remove_file(&path);
-            return skip(
-                "the NFSv4 dataset path is not an NFSv4-ACL filesystem",
-            );
+            return skip("the NFSv4 dataset path is not an NFSv4-ACL filesystem");
         }
     };
-    // Whatever the fresh file carries (it may inherit entries from the parent),
-    // our codec reproduces the kernel's exact bytes.
+    // Whatever the fresh file carries (it may inherit entries from the parent), our codec reproduces the kernel's exact
+    // bytes.
     let raw0 = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
-    assert_eq!(
-        acl.to_xattr().unwrap(),
-        raw0,
-        "codec must round-trip live ZFS bytes"
-    );
+    assert_eq!(acl.to_xattr().unwrap(), raw0, "codec must round-trip live ZFS bytes");
 
-    // Append a named-user ALLOW to ZFS's own (valid) entries and write it back.
     let uid = 8_675_309;
     let mut aces = acl.aces.clone();
     aces.push(Nfs4Ace::new(
         Nfs4AceType::Allow,
         Nfs4Flag::empty(),
-        Nfs4Perm::READ_DATA
-            | Nfs4Perm::READ_ATTRIBUTES
-            | Nfs4Perm::READ_ACL
-            | Nfs4Perm::SYNCHRONIZE,
+        Nfs4Perm::READ_DATA | Nfs4Perm::READ_ATTRIBUTES | Nfs4Perm::READ_ACL | Nfs4Perm::SYNCHRONIZE,
         Nfs4Who::Named,
         uid,
     ));
     let updated = Acl::Nfs4(Nfs4Acl::from_aces(aces, Nfs4AclFlag::empty()));
     fsetacl(f.as_fd(), Some(&updated)).expect("fsetacl nfs4");
 
-    // Read back: no longer trivial, the named user is present, and our encoder
-    // byte-exactly reproduces what the kernel now stores.
     let back = match fgetacl(f.as_fd()) {
         Ok(Acl::Nfs4(a)) => a,
         other => panic!("expected nfs4, got {other:?}"),
@@ -136,13 +108,8 @@ fn nfs4_codec_and_named_user_roundtrip() {
             .any(|a| a.who_type == Nfs4Who::Named && a.who_id == uid)
     );
     let raw = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
-    assert_eq!(
-        back.to_xattr().unwrap(),
-        raw,
-        "encoder must match kernel bytes"
-    );
+    assert_eq!(back.to_xattr().unwrap(), raw, "encoder must match kernel bytes");
 
-    // Removing the ACL restores triviality.
     fsetacl(f.as_fd(), None).expect("fsetacl None");
     match fgetacl(f.as_fd()) {
         Ok(Acl::Nfs4(a)) => assert!(a.trivial()),
@@ -158,15 +125,11 @@ fn posix_named_user_roundtrip_on_zfs() {
     };
     let (path, f) = scratch_file(&dir, "posix");
 
-    // Fresh file: a trivial ACL synthesised from the mode bits.
     let acl = match fgetacl(f.as_fd()) {
         Ok(Acl::Posix(a)) => a,
-        // Not a POSIX-ACL filesystem here - skip.
         _ => {
             let _ = std::fs::remove_file(&path);
-            return skip(
-                "the POSIX dataset path is not a POSIX-ACL filesystem",
-            );
+            return skip("the POSIX dataset path is not a POSIX-ACL filesystem");
         }
     };
     assert!(acl.trivial());
@@ -193,17 +156,9 @@ fn posix_named_user_roundtrip_on_zfs() {
         Ok(Acl::Posix(a)) => a,
         other => panic!("expected posix, got {other:?}"),
     };
-    assert!(
-        back.access
-            .iter()
-            .any(|a| a.tag == PosixTag::User && a.id == uid)
-    );
+    assert!(back.access.iter().any(|a| a.tag == PosixTag::User && a.id == uid));
     let raw = fgetxattr(f.as_fd(), "system.posix_acl_access").unwrap();
-    assert_eq!(
-        back.access_bytes().unwrap(),
-        raw,
-        "encoder must match kernel bytes"
-    );
+    assert_eq!(back.access_bytes().unwrap(), raw, "encoder must match kernel bytes");
 
     let _ = fsetacl(f.as_fd(), None);
     let _ = std::fs::remove_file(&path);
@@ -223,18 +178,14 @@ fn posix_default_acl_on_directory() {
         Ok(Acl::Posix(a)) => a,
         _ => {
             let _ = std::fs::remove_dir_all(&sub);
-            return skip(
-                "the POSIX dataset path is not a POSIX-ACL filesystem",
-            );
+            return skip("the POSIX dataset path is not a POSIX-ACL filesystem");
         }
     };
-    // Access entries plus a default (inheritable) copy of them.
     let mut aces = base.access.clone();
     for a in base.access.clone() {
         aces.push(PosixAce { default: true, ..a });
     }
-    fsetacl(d.as_fd(), Some(&Acl::Posix(PosixAcl::from_aces(aces))))
-        .expect("fsetacl default");
+    fsetacl(d.as_fd(), Some(&Acl::Posix(PosixAcl::from_aces(aces)))).expect("fsetacl default");
     match fgetacl(d.as_fd()) {
         Ok(Acl::Posix(a)) => assert!(a.default.is_some(), "default ACL lost"),
         other => panic!("expected posix, got {other:?}"),
@@ -243,43 +194,35 @@ fn posix_default_acl_on_directory() {
     let _ = std::fs::remove_dir_all(&sub);
 }
 
-/// Snapshot the NFS4 dataset via the `zfs` CLI and confirm the auto-mounted
-/// snapshot under `.zfs/snapshot/` is recognised. Needs `TRUENAS_ROS_NFS4_DS`
-/// (the dataset name, set by the provisioning script) and the `mount` feature.
+/// Snapshot the NFS4 dataset via the `zfs` CLI and confirm the auto-mounted snapshot under `.zfs/snapshot/` is
+/// recognised. Needs `TRUENAS_ROS_NFS4_DS` (the dataset name, set by the provisioning script) and the `mount` feature.
 #[cfg(feature = "mount")]
 #[test]
 fn zfs_snapshot_is_detected() {
     use truenas_ros::mount::{is_zfs_snapshot, statmount_path};
-    let (Some(dir), Ok(ds)) =
-        (nfs4_dir(), std::env::var("TRUENAS_ROS_NFS4_DS"))
-    else {
+    let (Some(dir), Ok(ds)) = (nfs4_dir(), std::env::var("TRUENAS_ROS_NFS4_DS")) else {
         return skip("no NFSv4 dataset or TRUENAS_ROS_NFS4_DS unset");
     };
     let snap = format!("{ds}@rostest_{}", std::process::id());
-    let zfs =
-        |args: &[&str]| std::process::Command::new("zfs").args(args).status();
+    let zfs = |args: &[&str]| std::process::Command::new("zfs").args(args).status();
     let _ = zfs(&["destroy", "-r", &snap]);
     if !matches!(zfs(&["snapshot", &snap]), Ok(s) if s.success()) {
         return skip("could not snapshot (not root, or not our dataset)");
     }
     let snap_dir = format!("rostest_{}", std::process::id());
     let snap_path = dir.join(".zfs/snapshot").join(&snap_dir);
-    // Access the path first to trigger the ctldir automount; statmount_path's
-    // O_PATH open does not trigger it on its own.
+    // Access the path first to trigger the ctldir automount; statmount_path's O_PATH open does not trigger it on its
+    // own.
     let _ = std::fs::read_dir(&snap_path).map(|d| d.count());
     let sm = statmount_path(&snap_path);
     let _ = zfs(&["destroy", "-r", &snap]);
-    // Both degradations are announced. Held inside two silent `if`s, this
-    // test returned green whether it had asserted anything or not, so
-    // `REQUIRE_ZFS` could not see the fixture go missing under it - which
-    // is the whole job of the gate.
+    // Both degradations go through `skip`, so `REQUIRE_ZFS` sees the fixture go missing.
     let Ok(sm) = sm else {
         return skip("statmount of the snapshot mount failed");
     };
-    // Snapshot detection needs `sb_source`, which requires a new-enough
-    // kernel *and* ZFS wiring it up for the snapshot mount. Where it is
-    // unavailable, detection is gracefully disabled (exactly as
-    // `truenas_pyos` documents), so only assert when it was reported.
+    // Snapshot detection needs `sb_source`, which requires a new-enough kernel *and* ZFS wiring it up for the snapshot
+    // mount. Where it is unavailable, detection is gracefully disabled (exactly as `truenas_pyos` documents), so only
+    // assert when it was reported.
     if sm.sb_source.is_none() {
         return skip("the snapshot mount reported no sb_source");
     }
@@ -292,53 +235,35 @@ fn zfs_snapshot_is_detected() {
 }
 
 // ---------------------------------------------------------------------------
-// ZFS_READONLY / ZFS_IMMUTABLE - the file-attribute semantics a consumer's
-// read-only objects lean on. Each of these is a **pin on fork behaviour**,
-// probed rather than assumed (the `unix_peercred` discipline): a consumer
-// that sets `ZfsAttr::READONLY` on a staged object before it first gains a
-// name and `READONLY | IMMUTABLE` on superseded versions rests every step of
-// that choreography on a semantic the shipped ZFS could change under a
-// train bump. A red here is the platform moving, and names the doc or the
-// landing order that has to move with it.
+// ZFS_READONLY / ZFS_IMMUTABLE - the file-attribute semantics a consumer's read-only objects lean on. Each of these is
+// a **pin on fork behaviour**, probed rather than assumed (the `unix_peercred` discipline): a consumer that sets
+// `ZfsAttr::READONLY` on a staged object before it first gains a name and `READONLY | IMMUTABLE` on superseded versions
+// rests every step of that choreography on a semantic the shipped ZFS could change under a train bump. A red here is
+// the platform moving, and names the doc or the landing order that has to move with it.
 // ---------------------------------------------------------------------------
 
 /// Fork, become `nobody`, and try to open `path` for writing.
 ///
-/// `Ok(())` for a successful open; `Err(errno)` with the child's errno
-/// otherwise. The children exist because this suite runs as root and DAC
-/// never denies root anything on the fallback path - the writers the
-/// read-only flag is aimed at (NFS clients, local processes) arrive as
-/// unprivileged uids, so the probe must too. Raw syscalls in the child, no
-/// allocation after the fork (the path is a `CString` made before it), and
-/// `_exit` so no parent state is dropped twice - the `CredBroker` child's
-/// own rules.
+/// `Ok(())` for a successful open; `Err(errno)` with the child's errno otherwise. The children exist because this suite
+/// runs as root and DAC never denies root anything on the fallback path - the writers the read-only flag is aimed at
+/// (NFS clients, local processes) arrive as unprivileged uids, so the probe must too. Raw syscalls in the child, no
+/// allocation after the fork (the path is a `CString` made before it), and `_exit` so no parent state is dropped
+/// twice - the `CredBroker` child's own rules.
 fn open_for_write_as_nobody(path: &Path) -> Result<(), i32> {
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-    // SAFETY: fork; the child makes only async-signal-safe syscalls
-    // (setgroups/setresgid/setresuid/open/_exit) and allocates nothing.
+    // SAFETY: fork; the child makes only async-signal-safe syscalls (setgroups/setresgid/setresuid/open/_exit) and
+    // allocates nothing.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork");
     if pid == 0 {
-        // SAFETY: raw credential syscalls in the single-threaded child.
-        // setresuid to a non-zero uid clears the effective capability set,
-        // so the child cannot ride CAP_DAC_OVERRIDE through the check.
+        // SAFETY: raw credential syscalls in the single-threaded child. setresuid to a non-zero uid clears the
+        // effective capability set, so the child cannot ride CAP_DAC_OVERRIDE through the check.
         unsafe {
-            // Fail CLOSED, the discipline `register_as` states: each of
-            // these can fail after its permission check (`set_user` ->
-            // EAGAIN on the target uid's RLIMIT_NPROC, `prepare_creds` ->
-            // ENOMEM, an LSM veto in `security_task_fix_setuid`;
-            // `__sys_setresuid`, kernel/sys.c), and a child that stayed
-            // root opens every file below and exits 0. The posix-half
-            // assertion downstream expects a *successful* open, so an
-            // unchecked drop would pin nothing there for good; the nfs4
-            // half would redden and read as the platform growing
-            // enforcement, which is what its rustdoc tells the reader to
-            // relax the READONLY docs over. 255 is outside errno.
-            let dropped = libc::syscall(
-                libc::SYS_setgroups,
-                0usize,
-                std::ptr::null::<u32>(),
-            ) == 0
+            // Fail closed. Each of these can fail after its permission check (`set_user` -> EAGAIN on the target uid's
+            // RLIMIT_NPROC, `prepare_creds` -> ENOMEM, an LSM veto in `security_task_fix_setuid`, `__sys_setresuid` in
+            // kernel/sys.c), and a child that stayed root would open every file below, pinning nothing in the posix
+            // half and reading as new enforcement in the nfs4 half. 255 is outside errno.
+            let dropped = libc::syscall(libc::SYS_setgroups, 0usize, std::ptr::null::<u32>()) == 0
                 && libc::syscall(libc::SYS_setresgid, 65534, 65534, 65534) == 0
                 && libc::syscall(libc::SYS_setresuid, 65534, 65534, 65534) == 0
                 && libc::geteuid() == 65534
@@ -347,19 +272,12 @@ fn open_for_write_as_nobody(path: &Path) -> Result<(), i32> {
                 libc::_exit(255);
             }
             let fd = libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-            libc::_exit(if fd >= 0 {
-                0
-            } else {
-                *libc::__errno_location()
-            });
+            libc::_exit(if fd >= 0 { 0 } else { *libc::__errno_location() });
         }
     }
     let mut status = 0;
     // SAFETY: valid pid and status pointer.
-    assert!(
-        unsafe { libc::waitpid(pid, &mut status, 0) } == pid,
-        "waitpid"
-    );
+    assert!(unsafe { libc::waitpid(pid, &mut status, 0) } == pid, "waitpid");
     assert!(libc::WIFEXITED(status), "probe child did not exit");
     match libc::WEXITSTATUS(status) {
         0 => Ok(()),
@@ -374,11 +292,9 @@ fn open_for_write_as_nobody(path: &Path) -> Result<(), i32> {
 
 /// Read-modify-write a flag onto a file's ZFS attributes.
 ///
-/// `ZFS_IOC_SETDOSFLAGS` takes the whole visible mask, not a delta
-/// (`FLAG_CHANGE` in `__zpl_ioctl_setdosflags` diffs every bit against the
-/// argument), so a bare `fset_zfs_attrs(fd, READONLY)` would also *clear*
-/// the `ARCHIVE` bit ZFS set at create. This is the idiom a consumer must
-/// use, so it is the idiom the pins use.
+/// `ZFS_IOC_SETDOSFLAGS` takes the whole visible mask, not a delta (`FLAG_CHANGE` in `__zpl_ioctl_setdosflags` diffs
+/// every bit against the argument), so a bare `fset_zfs_attrs(fd, READONLY)` would also *clear* the `ARCHIVE` bit ZFS
+/// set at create. This is the idiom a consumer must use, so it is the idiom the pins use.
 fn add_zfs_attrs(f: &std::fs::File, add: ZfsAttr) -> ZfsAttr {
     let cur = fget_zfs_attrs(f.as_fd()).expect("fget_zfs_attrs");
     fset_zfs_attrs(f.as_fd(), cur | add).expect("fset_zfs_attrs");
@@ -387,21 +303,16 @@ fn add_zfs_attrs(f: &std::fs::File, add: ZfsAttr) -> ZfsAttr {
     now
 }
 
-/// The descriptor that holds a file open keeps writing after `READONLY`
-/// lands - the fchmod(0444) shape `zfs_zaccess_common` documents and
-/// `zfs_write` implements by exempting the flag ("Intentionally allow
-/// ZFS_READONLY through here", `zfs_vnops.c`). A writer that flags a staged
-/// object while its own descriptor still owes writes relies on exactly
-/// this, so a platform that starts checking the flag per-write breaks every
-/// such upload: this pin is what turns that into a red lane instead of a
-/// fleet incident.
+/// The descriptor that holds a file open keeps writing after `READONLY` lands - the fchmod(0444) shape
+/// `zfs_zaccess_common` documents and `zfs_write` implements by exempting the flag ("Intentionally allow ZFS_READONLY
+/// through here", `zfs_vnops.c`). A writer that flags a staged object while its own descriptor still owes writes relies
+/// on exactly this, so a platform that starts checking the flag per-write breaks every such upload: this pin is what
+/// turns that into a red lane instead of a fleet incident.
 ///
-/// The second half is the one write channel that never consults
-/// `zfs_write`: dirtying pages through a shared writable mapping. `zfs_map`
-/// refuses to create one over a flagged file - unconditionally, root
-/// included, on every acltype - while a private mapping stays allowed
-/// (copy-on-write publishes nothing). Both directions are asserted so the
-/// refusal is pinned to the sharing, not to mapping in general.
+/// The second half is the one write channel that never consults `zfs_write`: dirtying pages through a shared writable
+/// mapping. `zfs_map` refuses to create one over a flagged file - unconditionally, root included, on every acltype -
+/// while a private mapping stays allowed (copy-on-write publishes nothing). Both directions are asserted so the refusal
+/// is pinned to the sharing, not to mapping in general.
 #[test]
 fn a_readonly_flag_is_fchmod_shaped_for_the_descriptor_holding_it() {
     let Some(dir) = nfs4_dir() else {
@@ -422,19 +333,13 @@ fn a_readonly_flag_is_fchmod_shaped_for_the_descriptor_holding_it() {
         .expect("a held descriptor must keep writing once READONLY lands");
     f.sync_all().expect("fsync through the held descriptor");
 
-    // A fresh *read* open is untouched; reads were never in question.
     let _ro = std::fs::File::open(&path).expect("fresh O_RDONLY open");
 
-    // A shared writable mapping is refused at creation - `zfs_map` checks
-    // the flag at the vnop with no privilege fallback and no acltype gate,
-    // so this holds even though the suite runs as root - and it is asked
-    // through `f`, the descriptor the flag grandfathered for write(2):
-    // the grandfathering covers writes, not new mappings. (Through a
-    // read-only descriptor the VFS answers EACCES before ZFS is ever
-    // consulted - a writable shared mapping needs a writable fd - so
-    // only this fd reaches the vnop verdict at all.)
-    // SAFETY: mmap with a length inside the file; the result is checked
-    // before use and never dereferenced on failure.
+    // A shared writable mapping is refused at creation, since `zfs_map` checks the flag at the vnop with no privilege
+    // fallback and no acltype gate, so this holds as root. It is asked through `f`, the descriptor the flag
+    // grandfathered for write(2), because through a read-only descriptor the VFS answers EACCES before ZFS is
+    // consulted.
+    // SAFETY: mmap with a length inside the file; the result is checked before use and never dereferenced on failure.
     let shared = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -454,8 +359,8 @@ fn a_readonly_flag_is_fchmod_shaped_for_the_descriptor_holding_it() {
     let e = unsafe { *libc::__errno_location() };
     assert_eq!(e, libc::EPERM, "zfs_map answers EPERM, got errno {e}");
 
-    // SAFETY: as above; a private writable mapping is the control - its
-    // dirty pages never publish, and `zfs_map` allows it.
+    // SAFETY: as above; a private writable mapping is the control - its dirty pages never publish, and `zfs_map` allows
+    // it.
     let private = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -474,38 +379,30 @@ fn a_readonly_flag_is_fchmod_shaped_for_the_descriptor_holding_it() {
     // SAFETY: unmapping the mapping created above.
     unsafe { libc::munmap(private, 4) };
 
-    // A trusted.* xattr still lands: `xattr_permission`'s trusted branch
-    // is `CAP_SYS_ADMIN` alone, with no inode write check (`fs/xattr.c`),
-    // and the flag's own deny is `WRITE_MASK_DATA` through `zfs_zaccess`,
-    // which a trusted write never consults. A consumer that re-stamps a
-    // superseded predecessor's index record while that predecessor is
+    // A trusted.* xattr still lands: `xattr_permission`'s trusted branch is `CAP_SYS_ADMIN` alone, with no inode write
+    // check (`fs/xattr.c`), and the flag's own deny is `WRITE_MASK_DATA` through `zfs_zaccess`, which a trusted write
+    // never consults. A consumer that re-stamps a superseded predecessor's index record while that predecessor is
     // READONLY depends on it, so this is load-bearing, not a curiosity.
     {
         use truenas_ros::sync_fs::xattr::{XattrFlags, fsetxattr};
-        fsetxattr(f.as_fd(), "trusted.rostest_ro", b"v", XattrFlags::empty())
-            .expect(
-                "trusted.* must survive READONLY - the restamp depends \
+        fsetxattr(f.as_fd(), "trusted.rostest_ro", b"v", XattrFlags::empty()).expect(
+            "trusted.* must survive READONLY - the restamp depends \
                      on it",
-            );
+        );
     }
 
-    // Deletion needs no clearing: READONLY guards data, not names. This is
-    // why DeleteObject carries no unlatch step.
-    std::fs::remove_file(&path)
-        .expect("unlink of a READONLY file needs no clear step");
+    // Deletion needs no clearing, since READONLY guards data, not names.
+    std::fs::remove_file(&path).expect("unlink of a READONLY file needs no clear step");
 }
 
-/// A `READONLY` inode gains and loses names freely: first name by
-/// `linkat(AT_EMPTY_PATH)`, more names by plain link, moves by rename, and
-/// rename *over* a flagged victim - the supersede shape, where the current
-/// object is READONLY and a new PUT replaces its name.
+/// A `READONLY` inode gains and loses names freely: first name by `linkat(AT_EMPTY_PATH)`, more names by plain link,
+/// moves by rename, and rename *over* a flagged victim - the supersede shape, where the current object is READONLY and
+/// a new PUT replaces its name.
 ///
-/// The first-name half is the load-bearing one and is **fork behaviour, not
-/// doctrine**: this tree's Linux `zfs_link` carries no pflag check, while
-/// FreeBSD's refuses APPENDONLY|IMMUTABLE|READONLY sources outright
-/// (`module/os/freebsd/zfs/zfs_vnops_os.c`). A unification that imports the
-/// FreeBSD check turns this red - and the fix is to move the flag *after*
-/// the first link, not to delete this test.
+/// The first-name half is the load-bearing one and is **fork behaviour, not doctrine**: this tree's Linux `zfs_link`
+/// carries no pflag check, while FreeBSD's refuses APPENDONLY|IMMUTABLE|READONLY sources outright
+/// (`module/os/freebsd/zfs/zfs_vnops_os.c`). A unification that imports the FreeBSD check turns this red - and the fix
+/// is to move the flag *after* the first link, not to delete this test.
 #[test]
 fn a_readonly_inode_gains_and_loses_names_freely() {
     let Some(dir) = nfs4_dir() else {
@@ -516,8 +413,7 @@ fn a_readonly_inode_gains_and_loses_names_freely() {
         return skip("the NFSv4 dataset path does not answer ZFS ioctls");
     }
 
-    // The staged shape: an unnamed inode born in the directory the name
-    // will land in.
+    // The staged shape: an unnamed inode born in the directory the name will land in.
     let staged: std::fs::File = openat2(
         dirf.as_fd(),
         ".",
@@ -547,17 +443,12 @@ fn a_readonly_inode_gains_and_loses_names_freely() {
                  pflag check; see the FreeBSD divergence above)",
     );
     // More names, and a move - a flagged *source* everywhere.
-    linkat(&dirf, n1.as_str(), &dirf, n2.as_str(), AtFlags::empty())
-        .expect("second name for a READONLY file");
-    renameat2(&dirf, n2.as_str(), &dirf, n3.as_str(), RenameFlags::empty())
-        .expect("rename of a READONLY source");
+    linkat(&dirf, n1.as_str(), &dirf, n2.as_str(), AtFlags::empty()).expect("second name for a READONLY file");
+    renameat2(&dirf, n2.as_str(), &dirf, n3.as_str(), RenameFlags::empty()).expect("rename of a READONLY source");
 
-    // Supersede: an unflagged newcomer replaces the name of a READONLY
-    // incumbent. The victim's flag must not defend the *name* - a current
-    // object is only ever READONLY (never IMMUTABLE) precisely so this
-    // rename can happen.
-    std::fs::write(dir.join(format!("rostest_names_new_{pid}")), b"v2")
-        .expect("newcomer");
+    // Supersede: an unflagged newcomer replaces the name of a READONLY incumbent. The victim's flag must not defend the
+    // *name* - a current object is only ever READONLY (never IMMUTABLE) precisely so this rename can happen.
+    std::fs::write(dir.join(format!("rostest_names_new_{pid}")), b"v2").expect("newcomer");
     renameat2(
         &dirf,
         format!("rostest_names_new_{pid}").as_str(),
@@ -583,19 +474,14 @@ fn a_readonly_inode_gains_and_loses_names_freely() {
 
 /// Where the flag actually denies, and where it documentedly does not.
 ///
-/// An ordinary open-for-write is asked of ZFS at all only on an
-/// `acltype=nfsv4` dataset whose file carries a **non-trivial** ACL;
-/// everything else is answered from the mode alone. That scope is the
-/// platform contract a consumer relying on the flag has to state ("NFSv4
-/// required"), and this test is the contract in executable form: the nfsv4
-/// half proves the deny where it is promised, and the posix half proves the
-/// gap where it is documented.
+/// An ordinary open-for-write is asked of ZFS at all only on an `acltype=nfsv4` dataset whose file carries a
+/// **non-trivial** ACL, and everything else is answered from the mode alone. That scope is the platform contract a
+/// consumer relying on the flag has to state ("NFSv4 required"), and this test is the contract in executable form. The
+/// nfsv4 half proves the deny where it is promised, and the posix half proves the gap where it is documented.
 ///
-/// **A red on either half is the platform moving, not this test rotting.**
-/// If the posix half's open starts failing, or the root open below starts
-/// failing, the fork has grown enforcement - update `ZfsAttr::READONLY`'s
-/// rustdoc to match, which is what consumers state their requirements from,
-/// then the assertions.
+/// **A red on either half is the platform moving, not this test rotting.** If the posix half's open starts failing, or
+/// the root open below starts failing, the fork has grown enforcement - update `ZfsAttr::READONLY`'s rustdoc to match,
+/// which is what consumers state their requirements from, then the assertions.
 #[test]
 fn readonly_denies_a_fresh_writer_exactly_where_documented() {
     // --- the enforced half: acltype=nfsv4, non-trivial ACL ---------------
@@ -607,16 +493,13 @@ fn readonly_denies_a_fresh_writer_exactly_where_documented() {
         Ok(Acl::Nfs4(a)) => a,
         _ => {
             let _ = std::fs::remove_file(&path);
-            return skip(
-                "the NFSv4 dataset path is not an NFSv4-ACL filesystem",
-            );
+            return skip("the NFSv4 dataset path is not an NFSv4-ACL filesystem");
         }
     };
 
-    // Grant `nobody` write through the ACL - a named-user ACE, which also
-    // forces the ACL non-trivial, which is what gets the next open asked of
-    // ZFS at all. Asserted, not hoped: `trivial()` is the same verdict the
-    // kernel short-circuits on.
+    // Grant `nobody` write through the ACL - a named-user ACE, which also forces the ACL non-trivial, which is what
+    // gets the next open asked of ZFS at all. Asserted, not hoped: `trivial()` is the same verdict the kernel
+    // short-circuits on.
     let mut aces = acl.aces.clone();
     aces.push(Nfs4Ace::new(
         Nfs4AceType::Allow,
@@ -640,15 +523,13 @@ fn readonly_denies_a_fresh_writer_exactly_where_documented() {
     }
 
     // Control first: the grant works, so the later denial is the flag's.
-    open_for_write_as_nobody(&path)
-        .expect("the ACE grants nobody write before the flag");
+    open_for_write_as_nobody(&path).expect("the ACE grants nobody write before the flag");
 
     add_zfs_attrs(&f, ZfsAttr::READONLY);
 
-    // EACCES, not EPERM: the flag's own refusal is internal, and the
-    // privilege fallback that runs after it re-decides the errno - denying
-    // an unprivileged caller as EACCES. `IMMUTABLE` is the one that answers
-    // EPERM, because the VFS refuses it before ZFS is consulted at all.
+    // EACCES, not EPERM: the flag's own refusal is internal, and the privilege fallback that runs after it re-decides
+    // the errno - denying an unprivileged caller as EACCES. `IMMUTABLE` is the one that answers EPERM, because the VFS
+    // refuses it before ZFS is consulted at all.
     assert_eq!(
         open_for_write_as_nobody(&path),
         Err(libc::EACCES),
@@ -656,8 +537,8 @@ fn readonly_denies_a_fresh_writer_exactly_where_documented() {
          path"
     );
 
-    // Root passes on that same fallback. Pinned so a fork hardening
-    // announces itself here rather than in a fleet's backup scripts.
+    // Root passes on that same fallback. Pinned so a fork hardening announces itself here rather than in a fleet's
+    // backup scripts.
     std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
@@ -674,9 +555,8 @@ fn readonly_denies_a_fresh_writer_exactly_where_documented() {
         let _ = std::fs::remove_file(&ppath);
         return skip("the POSIX dataset path does not answer ZFS ioctls");
     }
-    // World-writable by mode, then flagged. On a posixacl dataset a plain
-    // write check never reaches ZFS, so the flag holds no one - the gap
-    // "NFSv4 required" exists to document.
+    // World-writable by mode, then flagged. On a posixacl dataset a plain write check never reaches ZFS, so the flag
+    // holds no one - the gap "NFSv4 required" exists to document.
     let mut perms = std::fs::metadata(&ppath).expect("stat").permissions();
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o666);
@@ -690,19 +570,16 @@ fn readonly_denies_a_fresh_writer_exactly_where_documented() {
     std::fs::remove_file(&ppath).expect("cleanup");
 }
 
-/// `IMMUTABLE` stacked on `READONLY` is the version-row lock, and it locks
-/// the *daemon* too: the flag reaches the VFS as `S_IMMUTABLE`
-/// (`zfs_znode_os.c`), so writes through descriptors opened before it
-/// (`zfs_write` checks IMMUTABLE per write, unlike READONLY), renames,
-/// unlinks (`may_delete`, `fs/namei.c`) and every xattr write - trusted.*
-/// included (`fs/xattr.c`, before the capability branch) - answer EPERM for
-/// every caller, capabilities notwithstanding, until the flag is cleared.
+/// `IMMUTABLE` stacked on `READONLY` is the version-row lock, and it locks the *daemon* too: the flag reaches the VFS
+/// as `S_IMMUTABLE` (`zfs_znode_os.c`), so writes through descriptors opened before it (`zfs_write` checks IMMUTABLE
+/// per write, unlike READONLY), renames, unlinks (`may_delete`, `fs/namei.c`) and every xattr write - trusted.*
+/// included (`fs/xattr.c`, before the capability branch) - answer EPERM for every caller, capabilities notwithstanding,
+/// until the flag is cleared.
 ///
-/// That is why every delete of a sealed version is a two-step: clear (needs
-/// `CAP_LINUX_IMMUTABLE`, ambient), then unlink - and why the *current*
-/// object must never carry it, or the supersede rename dies. The clear
-/// deliberately leaves READONLY in place: deletion needs no unlatch, so the
-/// window between clear and unlink is a read-only file, not a writable one.
+/// That is why every delete of a sealed version is a two-step: clear (needs `CAP_LINUX_IMMUTABLE`, ambient), then
+/// unlink - and why the *current* object must never carry it, or the supersede rename dies. The clear deliberately
+/// leaves READONLY in place: deletion needs no unlatch, so the window between clear and unlink is a read-only file, not
+/// a writable one.
 #[test]
 fn immutable_locks_the_version_row_until_cleared() {
     let Some(dir) = nfs4_dir() else {
@@ -716,12 +593,10 @@ fn immutable_locks_the_version_row_until_cleared() {
     use std::os::unix::fs::FileExt;
     use truenas_ros::sync_fs::xattr::{XattrFlags, fsetxattr};
 
-    // Controls before the lock: the held descriptor writes, and the
-    // trusted xattr lands (root holds CAP_SYS_ADMIN, so a later refusal is
-    // the inode's, not a permission miss).
+    // Controls before the lock: the held descriptor writes, and the trusted xattr lands (root holds CAP_SYS_ADMIN, so a
+    // later refusal is the inode's, not a permission miss).
     f.write_at(b"sealed", 0).expect("control write");
-    fsetxattr(f.as_fd(), "trusted.rostest", b"v", XattrFlags::empty())
-        .expect("control trusted.* write");
+    fsetxattr(f.as_fd(), "trusted.rostest", b"v", XattrFlags::empty()).expect("control trusted.* write");
 
     add_zfs_attrs(&f, ZfsAttr::READONLY | ZfsAttr::IMMUTABLE);
 
@@ -733,8 +608,7 @@ fn immutable_locks_the_version_row_until_cleared() {
          writes when the version seals"
     );
     assert_eq!(
-        fsetxattr(f.as_fd(), "trusted.rostest", b"w", XattrFlags::empty())
-            .unwrap_err(),
+        fsetxattr(f.as_fd(), "trusted.rostest", b"w", XattrFlags::empty()).unwrap_err(),
         truenas_ros::Errno::EPERM,
         "IMMUTABLE denies trusted.* xattr writes at the VFS - any record \
          the version row will ever need must land before the seal"
@@ -756,43 +630,28 @@ fn immutable_locks_the_version_row_until_cleared() {
         "IMMUTABLE must refuse unlink until cleared"
     );
 
-    // The two-step delete: clear IMMUTABLE alone - READONLY stays, so the
-    // condemned row is never writable on its way out - then unlink.
+    // The two-step delete: clear IMMUTABLE alone - READONLY stays, so the condemned row is never writable on its way
+    // out - then unlink.
     let cur = fget_zfs_attrs(f.as_fd()).expect("fget");
     fset_zfs_attrs(f.as_fd(), cur & !ZfsAttr::IMMUTABLE).expect("clear");
-    std::fs::remove_file(&path)
-        .expect("unlink after the clear, with READONLY still set");
+    std::fs::remove_file(&path).expect("unlink after the clear, with READONLY still set");
 }
 
-/// The creation hold is released on an `acltype=nfsv4` destination whose own
-/// ACL is trivial - and the `getxattr`/`listxattr` disagreement that made it
-/// not be.
+/// The creation hold is released on an `acltype=nfsv4` destination whose own ACL is trivial.
 ///
-/// `release_creation_hold` declines when the destination already carries an
-/// access ACL, because there the ACL *is* the permissions and a `chmod` would
-/// rewrite it. Asked as "does the xattr exist", that is answered "yes" by
-/// **every** object on an nfsv4 dataset: `__zpl_xattr_nfs41acl_get`
-/// (`module/os/linux/zfs/zpl_xattr.c`) synthesises the blob and refuses only a
-/// non-NFSv4 dataset and an empty ACL, and a trivial ACL is still three ACEs.
-/// So the hold was never released anywhere on this row, which is the row a
-/// share migration lands on.
+/// `release_creation_hold` declines when the destination already carries an access ACL, because there the ACL *is* the
+/// permissions and a `chmod` would rewrite it. "Does the xattr exist" is answered yes by **every** object on an nfsv4
+/// dataset, since `__zpl_xattr_nfs41acl_get` (`module/os/linux/zfs/zpl_xattr.c`) synthesises the blob and refuses only
+/// a non-NFSv4 dataset and an empty ACL, and a trivial ACL is still three ACEs. The answer is in the blob instead,
+/// whose first big-endian word is `vsa_aclflags`, into which `zfs_getacl` ORs `ACL_IS_TRIVIAL` (`zfs_acl.c:2063`). That
+/// is a `getxattr`, which io_uring has, where `listxattr` has no io_uring op at all.
 ///
-/// The answer is in the blob: its first big-endian word is `vsa_aclflags`,
-/// into which `zfs_getacl` ORs `ACL_IS_TRIVIAL` (`zfs_acl.c:2063`). That is
-/// what this pins, because it is what the fix reads - and it is a `getxattr`,
-/// which io_uring has, where `listxattr` (which would also answer) has no
-/// io_uring op at all.
+/// The failing direction is a POSIX-ACL source onto an nfsv4 destination. `copy_permissions` copies
+/// `system.posix_acl_access`, the destination answers `EOPNOTSUPP` for every object, and `raise_error: false` swallows
+/// it, so the hold release is all that stands between the caller and an owner-only tree.
 ///
-/// The failing direction is a POSIX-ACL source onto an nfsv4 destination:
-/// `copy_permissions` copies `system.posix_acl_access`, the destination
-/// answers `EOPNOTSUPP` for every object, and `raise_error: false` - the mode
-/// `copytree` documents for salvaging a tree - swallows it. The hold release
-/// is then the only thing between the caller and an owner-only tree.
-///
-/// The first half pins the platform behaviour, so a ZFS that stops publishing
-/// the flag reddens here rather than silently making the second half vacuous.
-/// `the_nfs4_trivial_bit_is_read_from_the_blob` pins the decoder itself, and
-/// runs everywhere.
+/// The first half pins the platform behaviour, so a ZFS that stops publishing the flag reddens here rather than making
+/// the second half vacuous. `the_nfs4_trivial_bit_is_read_from_the_blob` pins the decoder itself, and runs everywhere.
 #[cfg(feature = "shutil")]
 #[test]
 fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
@@ -802,8 +661,7 @@ fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
         return skip("need both a POSIX-ACL and an NFSv4-ACL dataset");
     };
 
-    // The premise: a fresh nfsv4 object answers the `get`, and the blob it
-    // answers with says it is trivial.
+    // The premise: a fresh nfsv4 object answers the `get`, and the blob it answers with says it is trivial.
     let (probe_path, probe) = scratch_file(&ndst, "hold_probe");
     match fgetacl(probe.as_fd()) {
         Ok(Acl::Nfs4(a)) if a.trivial() => {}
@@ -816,9 +674,7 @@ fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
         }
         _ => {
             let _ = std::fs::remove_file(&probe_path);
-            return skip(
-                "the NFSv4 dataset path is not an NFSv4-ACL filesystem",
-            );
+            return skip("the NFSv4 dataset path is not an NFSv4-ACL filesystem");
         }
     }
     let got = fgetxattr(probe.as_fd(), "system.nfs4_acl_xdr");
@@ -844,15 +700,10 @@ fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
     let _ = std::fs::remove_dir_all(&dst);
     std::fs::create_dir(&src).unwrap();
     std::fs::write(src.join("f"), b"payload").unwrap();
-    std::fs::set_permissions(
-        src.join("f"),
-        std::fs::Permissions::from_mode(0o644),
-    )
-    .unwrap();
+    std::fs::set_permissions(src.join("f"), std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    // A NON-trivial POSIX access ACL on the source file, so
-    // `copy_permissions` takes its xattr branch - the one an nfsv4
-    // destination refuses.
+    // A NON-trivial POSIX access ACL on the source file, so `copy_permissions` takes its xattr branch - the one an
+    // nfsv4 destination refuses.
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -862,9 +713,7 @@ fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
         Ok(Acl::Posix(a)) => a,
         _ => {
             let _ = std::fs::remove_dir_all(&src);
-            return skip(
-                "the POSIX dataset path is not a POSIX-ACL filesystem",
-            );
+            return skip("the POSIX dataset path is not a POSIX-ACL filesystem");
         }
     };
     let mut aces = base.access.clone();
@@ -880,21 +729,14 @@ fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
         id: -1,
         default: false,
     });
-    fsetacl(f.as_fd(), Some(&Acl::Posix(PosixAcl::from_aces(aces))))
-        .expect("fsetacl posix");
+    fsetacl(f.as_fd(), Some(&Acl::Posix(PosixAcl::from_aces(aces)))).expect("fsetacl posix");
     drop(f);
 
-    // Read the source's mode AFTER the ACL, not before: an access ACL
-    // carrying a MASK republishes the file's group bits as that mask
-    // (`posix_acl_update_mode`, `fs/posix_acl.c`), so the `0o644` this file
-    // was created at is `0o664` by now - owner `rw` from `user_obj`, group
-    // `rw` from the mask, other `r`. The hold release stamps `src_st.mode()`,
+    // Read the source's mode AFTER the ACL, not before: an access ACL carrying a MASK republishes the file's group bits
+    // as that mask (`posix_acl_update_mode`, `fs/posix_acl.c`), so the `0o644` this file was created at is `0o664` by
+    // now - owner `rw` from `user_obj`, group `rw` from the mask, other `r`. The hold release stamps `src_st.mode()`,
     // so the source is the oracle and a literal here is a guess that ages.
-    let src_mode = std::fs::metadata(src.join("f"))
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
+    let src_mode = std::fs::metadata(src.join("f")).unwrap().permissions().mode() & 0o777;
     let hold = 0o600;
     assert_ne!(
         src_mode, hold,
@@ -907,8 +749,7 @@ fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
         ..Default::default()
     };
     let copied = copytree(&src, &dst, &cfg);
-    let mode = std::fs::metadata(dst.join("f"))
-        .map(|m| m.permissions().mode() & 0o777);
+    let mode = std::fs::metadata(dst.join("f")).map(|m| m.permissions().mode() & 0o777);
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&dst);
     let stats = copied.expect("the salvage mode must not fail the copy");
@@ -919,19 +760,15 @@ fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
         "the destination kept the {hold:#o} creation hold: the ACL copy \
          failed EOPNOTSUPP and the release declined on a trivial ACL"
     );
-    assert_eq!(
-        got, src_mode,
-        "the hold was released but not to the source's mode"
-    );
+    assert_eq!(got, src_mode, "the hold was released but not to the source's mode");
 }
 
-/// `stx_gen` is the generation a ZFS file handle carries, so the handle can
-/// be rebuilt from one `statx` of the descriptor.
+/// `stx_gen` is the generation a ZFS file handle carries, so the handle can be rebuilt from one `statx` of the
+/// descriptor.
 ///
-/// Holds only where the TrueNAS kernel passes the field through `cp_statx`
-/// and ZFS fills it, and `TRUENAS_ROS_REQUIRE_STATX_GEN` turns a kernel that
-/// does not into a failure; the QEMU job arms it, as it does the change
-/// cookie's.
+/// Holds only where the TrueNAS kernel passes the field through `cp_statx` and ZFS fills it, and
+/// `TRUENAS_ROS_REQUIRE_STATX_GEN` turns a kernel that does not into a failure; the QEMU job arms it, as it does the
+/// change cookie's.
 #[cfg(feature = "fhandle")]
 #[test]
 fn statx_generation_is_the_file_handles() {
@@ -941,8 +778,7 @@ fn statx_generation_is_the_file_handles() {
     let Some(dir) = zfs_dir::zfs_dir_or_skip() else {
         return;
     };
-    // Made here, so the generation is a txg this pool just assigned rather
-    // than one a provisioning script left behind.
+    // Made here, so the generation is a txg this pool just assigned rather than one a provisioning script left behind.
     let sub = dir.join(format!("rostest_gen_{}", std::process::id()));
     let _ = std::fs::remove_dir(&sub);
     std::fs::create_dir(&sub).unwrap();
@@ -964,9 +800,8 @@ fn statx_generation_is_the_file_handles() {
         );
         return;
     };
-    // `zfs_fid`'s short form, after the eight-byte `struct file_handle`
-    // head: a `u16` length of ten, the object number in six little-endian
-    // bytes, then the generation in four with a zero remapped to one.
+    // `zfs_fid`'s short form, after the eight-byte `struct file_handle` head: a `u16` length of ten, the object number
+    // in six little-endian bytes, then the generation in four with a zero remapped to one.
     let fid = &raw[8..];
     assert_eq!(fid.len(), 12, "{raw:02x?}");
     assert_eq!(u16::from_le_bytes([fid[0], fid[1]]), 10);
@@ -983,16 +818,13 @@ fn statx_generation_is_the_file_handles() {
     );
 }
 
-/// `stx_zfsflags` gives what `ZFS_IOC_GETDOSFLAGS` and the ACL's own flags
-/// give, through an `O_PATH` descriptor the ioctl cannot take.
+/// `stx_zfsflags` gives what `ZFS_IOC_GETDOSFLAGS` and the ACL's own flags give, through an `O_PATH` descriptor the
+/// ioctl cannot take.
 ///
-/// Holds only where the TrueNAS kernel passes the field through `cp_statx`
-/// and ZFS fills it, in `zpl_getattr_impl`, and
-/// `TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS` turns a kernel that does not into a
-/// failure, which the QEMU job arms. On the NFSv4 dataset the trivial bit
-/// follows the file's ACL both ways, as `ACL_IS_TRIVIAL` in
-/// `system.nfs4_acl_xdr` does. On the POSIX dataset ZFS leaves it clear
-/// whatever the file holds.
+/// Holds only where the TrueNAS kernel passes the field through `cp_statx` and ZFS fills it, in `zpl_getattr_impl`, and
+/// `TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS` turns a kernel that does not into a failure, which the QEMU job arms. On the
+/// NFSv4 dataset the trivial bit follows the file's ACL both ways, as `ACL_IS_TRIVIAL` in `system.nfs4_acl_xdr` does.
+/// On the POSIX dataset ZFS leaves it clear whatever the file holds.
 #[test]
 fn statx_zfs_flags_are_the_ioctls_and_the_acls() {
     let Some(dir) = nfs4_dir() else {
@@ -1032,10 +864,7 @@ fn statx_zfs_flags_are_the_ioctls_and_the_acls() {
     aces.push(Nfs4Ace::new(
         Nfs4AceType::Allow,
         Nfs4Flag::empty(),
-        Nfs4Perm::READ_DATA
-            | Nfs4Perm::READ_ATTRIBUTES
-            | Nfs4Perm::READ_ACL
-            | Nfs4Perm::SYNCHRONIZE,
+        Nfs4Perm::READ_DATA | Nfs4Perm::READ_ATTRIBUTES | Nfs4Perm::READ_ACL | Nfs4Perm::SYNCHRONIZE,
         Nfs4Who::Named,
         8_675_309,
     ));
@@ -1044,7 +873,6 @@ fn statx_zfs_flags_are_the_ioctls_and_the_acls() {
     assert!(!trivial(&f));
     assert_eq!(flags_of().nfs4_acl_is_trivial(), Some(false));
 
-    // Removing the ACL leaves the trivial one the mode says.
     fsetacl(f.as_fd(), None).expect("fsetacl None");
     assert!(trivial(&f));
     assert_eq!(flags_of().nfs4_acl_is_trivial(), Some(true));
@@ -1063,22 +891,18 @@ fn statx_zfs_flags_are_the_ioctls_and_the_acls() {
     assert_eq!(st.nfs4_acl_is_trivial(), Some(false));
 }
 
-/// `stx_zfsflags` gives the flags of the ACL that `system.nfs4_acl_xdr`
-/// gives, on a file and a folder, with auto-inherit, protected and
-/// defaulted each set alone, then all three, then none, and once the ACL is
-/// removed.
+/// `stx_zfsflags` gives the flags of the ACL that `system.nfs4_acl_xdr` gives, on a file and a folder, with
+/// auto-inherit, protected and defaulted each set alone, then all three, then none, and once the ACL is removed.
 ///
-/// Holds only where ZFS reports the flags of the ACL in `zpl_getattr_impl`,
-/// and `TRUENAS_ROS_REQUIRE_STATX_ACL_FLAGS` turns a module that reports the
-/// trivial bit alone into a failure. A POSIX dataset gives none.
+/// Holds only where ZFS reports the flags of the ACL in `zpl_getattr_impl`, and `TRUENAS_ROS_REQUIRE_STATX_ACL_FLAGS`
+/// turns a module that reports the trivial bit alone into a failure. A POSIX dataset gives none.
 #[test]
 fn statx_gives_the_flags_of_the_acl() {
     let Some(dir) = nfs4_dir() else {
         return skip("no NFSv4-ACL dataset");
     };
     let (path, file) = scratch_file(&dir, "aclflags");
-    let folder =
-        dir.join(format!("rostest_aclflags_dir_{}", std::process::id()));
+    let folder = dir.join(format!("rostest_aclflags_dir_{}", std::process::id()));
     let _ = std::fs::remove_dir(&folder);
     std::fs::create_dir(&folder).unwrap();
     let folder_fd = std::fs::File::open(&folder).unwrap();
@@ -1087,26 +911,11 @@ fn statx_gives_the_flags_of_the_acl() {
         let _ = std::fs::remove_dir(&folder);
     };
     let write = |f: &std::fs::File, inherit: Nfs4Flag, flags: Nfs4AclFlag| {
-        let read = Nfs4Perm::READ_DATA
-            | Nfs4Perm::READ_ATTRIBUTES
-            | Nfs4Perm::READ_ACL
-            | Nfs4Perm::SYNCHRONIZE;
+        let read = Nfs4Perm::READ_DATA | Nfs4Perm::READ_ATTRIBUTES | Nfs4Perm::READ_ACL | Nfs4Perm::SYNCHRONIZE;
         let owner = read | Nfs4Perm::WRITE_DATA | Nfs4Perm::WRITE_ACL;
         let aces = [
-            Nfs4Ace::new(
-                Nfs4AceType::Allow,
-                inherit,
-                owner,
-                Nfs4Who::Owner,
-                -1,
-            ),
-            Nfs4Ace::new(
-                Nfs4AceType::Allow,
-                inherit,
-                read,
-                Nfs4Who::Named,
-                8_675_309,
-            ),
+            Nfs4Ace::new(Nfs4AceType::Allow, inherit, owner, Nfs4Who::Owner, -1),
+            Nfs4Ace::new(Nfs4AceType::Allow, inherit, read, Nfs4Who::Named, 8_675_309),
         ];
         let acl = Acl::Nfs4(Nfs4Acl::from_aces(aces, flags));
         fsetacl(f.as_fd(), Some(&acl)).expect("fsetacl nfs4");
@@ -1126,8 +935,7 @@ fn statx_gives_the_flags_of_the_acl() {
         None => {
             clean_up();
             assert!(
-                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS")
-                    .is_none(),
+                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS").is_none(),
                 "TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS is set but the dataset \
                  at {} reports none",
                 dir.display()
@@ -1137,8 +945,7 @@ fn statx_gives_the_flags_of_the_acl() {
         Some(seen) if !seen.contains(Nfs4AclFlag::PROTECTED) => {
             clean_up();
             assert!(
-                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ACL_FLAGS")
-                    .is_none(),
+                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ACL_FLAGS").is_none(),
                 "TRUENAS_ROS_REQUIRE_STATX_ACL_FLAGS is set but the dataset \
                  at {} reports the trivial bit alone",
                 dir.display()
@@ -1154,14 +961,11 @@ fn statx_gives_the_flags_of_the_acl() {
             Nfs4AclFlag::AUTO_INHERIT,
             Nfs4AclFlag::PROTECTED,
             Nfs4AclFlag::DEFAULTED,
-            Nfs4AclFlag::AUTO_INHERIT
-                | Nfs4AclFlag::PROTECTED
-                | Nfs4AclFlag::DEFAULTED,
+            Nfs4AclFlag::AUTO_INHERIT | Nfs4AclFlag::PROTECTED | Nfs4AclFlag::DEFAULTED,
             Nfs4AclFlag::empty(),
         ] {
             write(f, inherit, flags);
-            // ZFS keeps what was set, so the check below is not of two
-            // empty sets.
+            // ZFS keeps what was set, so the check below is not of two empty sets.
             assert_eq!(from_xattr(f), flags);
             assert_eq!(from_statx(f), Some(flags));
         }
@@ -1181,14 +985,11 @@ fn statx_gives_the_flags_of_the_acl() {
     assert_eq!(flags, Some(Nfs4AclFlag::empty()));
 }
 
-/// The TrueNAS kernel reports the ACL type of a file system in
-/// `stx_attributes` from the flags of its superblock (`vfs_getattr_nosec` in
-/// fs/stat.c), which ZFS keeps current as `acltype` changes, with no remount
-/// (`acltype_changed_cb` in module/os/linux/zfs/zfs_vfsops.c). The NFSv4
-/// and POSIX datasets report their own type, a dataset made with
-/// `acltype=off` reports none, and a change of `acltype` shows at the next
-/// statx. `TRUENAS_ROS_REQUIRE_STATX_ACLTYPE` turns a kernel that reports
-/// no type into a failure.
+/// The TrueNAS kernel reports the ACL type of a file system in `stx_attributes` from the flags of its superblock
+/// (`vfs_getattr_nosec` in fs/stat.c), which ZFS keeps current as `acltype` changes, with no remount
+/// (`acltype_changed_cb` in module/os/linux/zfs/zfs_vfsops.c). The NFSv4 and POSIX datasets report their own type, a
+/// dataset made with `acltype=off` reports none, and a change of `acltype` shows at the next statx.
+/// `TRUENAS_ROS_REQUIRE_STATX_ACLTYPE` turns a kernel that reports no type into a failure.
 #[test]
 fn statx_gives_the_acltype_of_the_dataset() {
     let (Some(nfs4), Some(posix)) = (nfs4_dir(), posix_dir()) else {
@@ -1197,9 +998,7 @@ fn statx_gives_the_acltype_of_the_dataset() {
     let acltype_of = |dir: &Path| {
         let f = std::fs::File::open(dir).unwrap();
         let mask = StatxMask::BASIC_STATS;
-        statx(f.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask)
-            .unwrap()
-            .acltype()
+        statx(f.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask).unwrap().acltype()
     };
     let Some(seen) = acltype_of(&nfs4) else {
         assert!(
@@ -1214,15 +1013,13 @@ fn statx_gives_the_acltype_of_the_dataset() {
     assert_eq!(acltype_of(&posix), Some(AclType::Posix));
     assert_eq!(acltype_of(Path::new("/proc/self")), Some(AclType::Off));
 
-    // A dataset of its own, since a change of acltype under the shared ones
-    // would reach the other tests.
+    // A dataset of its own, since a change of acltype under the shared ones would reach the other tests.
     let Ok(ds) = std::env::var("TRUENAS_ROS_NFS4_DS") else {
         return skip("TRUENAS_ROS_NFS4_DS unset");
     };
     let name = format!("rostest_acltype_{}", std::process::id());
     let child = format!("{ds}/{name}");
-    let zfs =
-        |args: &[&str]| std::process::Command::new("zfs").args(args).status();
+    let zfs = |args: &[&str]| std::process::Command::new("zfs").args(args).status();
     let _ = zfs(&["destroy", "-r", &child]);
     if !matches!(
         zfs(&["create", "-o", "acltype=off", &child]),
@@ -1242,15 +1039,11 @@ fn statx_gives_the_acltype_of_the_dataset() {
     assert_eq!(nfs4_now, Some(AclType::Nfsv4));
 }
 
-/// The TrueNAS kernel says in `stx_attributes` whether a file is on a
-/// read-only mount (`STATX_ATTR_RDONLY`, set in `vfs_statx_path` in
-/// fs/stat.c from `__mnt_is_readonly`). ZFS sets the superblock read only
-/// for `readonly=on` with no remount (`readonly_changed_cb` in
-/// module/os/linux/zfs/zfs_vfsops.c) and mounts a snapshot read only, so a
-/// dataset of its own follows the property both ways at the next statx, a
-/// file in its snapshot is read only, and `/proc` is not.
-/// `TRUENAS_ROS_REQUIRE_STATX_RDONLY` turns a kernel that does not say into
-/// a failure.
+/// The TrueNAS kernel says in `stx_attributes` whether a file is on a read-only mount (`STATX_ATTR_RDONLY`, set in
+/// `vfs_statx_path` in fs/stat.c from `__mnt_is_readonly`). ZFS sets the superblock read only for `readonly=on` with no
+/// remount (`readonly_changed_cb` in module/os/linux/zfs/zfs_vfsops.c) and mounts a snapshot read only, so a dataset of
+/// its own follows the property both ways at the next statx, a file in its snapshot is read only, and `/proc` is not.
+/// `TRUENAS_ROS_REQUIRE_STATX_RDONLY` turns a kernel that does not say into a failure.
 #[test]
 fn statx_says_whether_the_mount_is_read_only() {
     let Some(nfs4) = nfs4_dir() else {
@@ -1259,9 +1052,7 @@ fn statx_says_whether_the_mount_is_read_only() {
     let read_only = |path: &Path| {
         let f = std::fs::File::open(path).unwrap();
         let mask = StatxMask::BASIC_STATS;
-        statx(f.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask)
-            .unwrap()
-            .read_only()
+        statx(f.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask).unwrap().read_only()
     };
     let Some(shared) = read_only(&nfs4) else {
         assert!(
@@ -1275,15 +1066,13 @@ fn statx_says_whether_the_mount_is_read_only() {
     assert!(!shared);
     assert_eq!(read_only(Path::new("/proc/self/status")), Some(false));
 
-    // A dataset of its own, since readonly=on under the shared one would
-    // reach the other tests.
+    // A dataset of its own, since readonly=on under the shared one would reach the other tests.
     let Ok(ds) = std::env::var("TRUENAS_ROS_NFS4_DS") else {
         return skip("TRUENAS_ROS_NFS4_DS unset");
     };
     let name = format!("rostest_rdonly_{}", std::process::id());
     let child = format!("{ds}/{name}");
-    let zfs =
-        |args: &[&str]| std::process::Command::new("zfs").args(args).status();
+    let zfs = |args: &[&str]| std::process::Command::new("zfs").args(args).status();
     let _ = zfs(&["destroy", "-r", &child]);
     if !matches!(zfs(&["create", &child]), Ok(s) if s.success()) {
         return skip("could not create a dataset (not root, or not ours)");
@@ -1306,22 +1095,19 @@ fn statx_says_whether_the_mount_is_read_only() {
     assert_eq!(snapshot, Some(true));
 }
 
-/// The TrueNAS kernel says, when `STATX_ACL` is asked, whether a file has a
-/// POSIX access ACL and a folder a default one, from the ACLs the inode
-/// caches (`statx_posix_acls` in fs/stat.c, through `get_inode_acl`). Each
-/// follows a set and a removal at the next statx, an ACL the mode says all
-/// of is not kept (`zpl_set_acl_impl` in module/os/linux/zfs/zpl_xattr.c),
-/// a statx that does not ask is told nothing, and the NFSv4 dataset answers
-/// without the bit. `TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS` turns a kernel
-/// that does not answer on the POSIX dataset into a failure.
+/// The TrueNAS kernel says, when `STATX_ACL` is asked, whether a file has a POSIX access ACL and a folder a default
+/// one, from the ACLs the inode caches (`statx_posix_acls` in fs/stat.c, through `get_inode_acl`). Each follows a set
+/// and a removal at the next statx, an ACL the mode says all of is not kept (`zpl_set_acl_impl` in
+/// module/os/linux/zfs/zpl_xattr.c), a statx that does not ask is told nothing, and the NFSv4 dataset answers without
+/// the bit. `TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS` turns a kernel that does not answer on the POSIX dataset into a
+/// failure.
 #[test]
 fn statx_says_whether_a_file_has_a_posix_acl() {
     let (Some(posix), Some(nfs4)) = (posix_dir(), nfs4_dir()) else {
         return skip("no POSIX or NFSv4 dataset");
     };
     let (path, file) = scratch_file(&posix, "posixacls");
-    let folder =
-        posix.join(format!("rostest_posixacls_dir_{}", std::process::id()));
+    let folder = posix.join(format!("rostest_posixacls_dir_{}", std::process::id()));
     let _ = std::fs::remove_dir(&folder);
     std::fs::create_dir(&folder).unwrap();
     let folder_fd = std::fs::File::open(&folder).unwrap();
@@ -1346,13 +1132,11 @@ fn statx_says_whether_a_file_has_a_posix_acl() {
     }
     // The mode alone, then with a named user, which needs a mask.
     let mode = |default| {
-        [PosixTag::UserObj, PosixTag::GroupObj, PosixTag::Other].map(|tag| {
-            PosixAce {
-                tag,
-                perms: PosixPerm::READ | PosixPerm::WRITE,
-                id: -1,
-                default,
-            }
+        [PosixTag::UserObj, PosixTag::GroupObj, PosixTag::Other].map(|tag| PosixAce {
+            tag,
+            perms: PosixPerm::READ | PosixPerm::WRITE,
+            id: -1,
+            default,
         })
     };
     let named = |default| {

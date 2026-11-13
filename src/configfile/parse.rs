@@ -1,34 +1,25 @@
 //! The `configparser`-compatible read loop.
 //!
-//! A faithful port of CPython `configparser._read`
-//! (`Lib/configparser.py:1056-1168`): the same handling of full-line comments,
-//! multi-line continuation values (indentation measured on the *raw* line while
-//! section/option matching runs on the stripped line), DEFAULT-section merging,
-//! and strict duplicate detection. The result is accumulated into working
-//! structures and only merged into `cfg` once the whole document parses, so a
-//! parse error leaves the target untouched.
+//! A faithful port of CPython `configparser._read` (`Lib/configparser.py:1056-1168`): the same handling of full-line
+//! comments, multi-line continuation values (indentation measured on the *raw* line while section/option matching runs
+//! on the stripped line), DEFAULT-section merging, and strict duplicate detection. The result is accumulated into
+//! working structures and only merged into `cfg` once the whole document parses, so a parse error leaves the target
+//! untouched.
 
 use super::{ConfigFile, DEFAULT_SECTION, Ordered, optionxform};
 use crate::error::{Error, Result};
 use std::collections::HashSet;
 
-/// A value accumulator during parsing: `None` for a valueless key, otherwise the
-/// list of (stripped) lines that are joined at the end.
+/// A value accumulator during parsing: `None` for a valueless key, otherwise the list of (stripped) lines that are
+/// joined at the end.
 type Acc = Option<Vec<String>>;
 
 /// Whitespace as CPython counts it, which is not what Rust counts.
 ///
-/// `str.strip()`, `str.isspace()` and `re`'s `\s` all go through
-/// `Py_UNICODE_ISSPACE`, which includes U+001C..U+001F - the file, group,
-/// record and unit separators. Unicode's `White_Space` property, which
-/// `char::is_whitespace` implements, does not. Compared across every code
-/// point those four are the *only* disagreement in either direction, so
-/// widening by exactly them makes the two definitions identical.
-///
-/// It matters because every strip in the read loop is a strip `configparser`
-/// also performs: a key or value fenced by one of these bytes otherwise parses
-/// to a different string here than there, and `get` and `write_string` both
-/// inherit the difference.
+/// `str.strip()`, `str.isspace()` and `re`'s `\s` all go through `Py_UNICODE_ISSPACE`, which includes the separators
+/// U+001C..U+001F, and `char::is_whitespace` does not. Across every code point those four are the only disagreement in
+/// either direction, so widening by exactly them makes the two identical. A key or value fenced by one of them would
+/// otherwise parse to a different string here than there.
 fn is_py_space(c: char) -> bool {
     c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
 }
@@ -43,23 +34,14 @@ fn py_rstrip(s: &str) -> &str {
     s.trim_end_matches(is_py_space)
 }
 
-/// Why this loop would not read `key` back as the name it was given, or
-/// `None` if it round-trips. Each arm names its own reason.
+/// Why this loop would not read `key` back as the name it was given, or `None` if it round-trips.
 ///
-/// Keys are written verbatim - by [`super::write`], and by CPython's
-/// `_write_section` (`Lib/configparser.py:961`), which re-indents a newline
-/// in the *value* and does nothing to the key - so a name carrying this
-/// loop's syntax parses back as something else.
+/// Keys are written verbatim, by [`super::write`] and by CPython's `_write_section` (`Lib/configparser.py:961`), so a
+/// name carrying this loop's syntax parses back as something else. Screened at [`super::ConfigFile::set`], the only way
+/// in, since keys from [`read`] are safe by construction.
 ///
-/// Screened at [`super::ConfigFile::set`] rather than at write time, since
-/// that is the only way in: keys from [`read`] are safe by construction,
-/// because this loop splits on lines, splits at the first delimiter, and
-/// strips.
-///
-/// The `[` rule is blunter than [`section_header`], which also wants a
-/// closing `]` past the first column, so `[]x` is refused though it would
-/// survive. A second copy of the header rule would be free to drift from the
-/// one that decides.
+/// The `[` rule is blunter than [`section_header`], so `[]x` is refused though it would survive. A second copy of the
+/// header rule would be free to drift from the one that decides.
 pub(super) fn key_fault(key: &str) -> Option<&'static str> {
     if key.is_empty() {
         Some("is empty")
@@ -78,14 +60,11 @@ pub(super) fn key_fault(key: &str) -> Option<&'static str> {
     }
 }
 
-/// Why `[name]` would not be read back as this section, or `None` if it
-/// round-trips. Companion to [`key_fault`].
+/// Why `[name]` would not be read back as this section, or `None` if it round-trips. Companion to [`key_fault`].
 ///
-/// Less is forbidden than for a key: a header is delimited on both sides and
-/// [`section_header`] takes the *last* `]`, so a name containing, ending in,
-/// or padded around one survives. Only a line break, which closes the header
-/// early and leaves the rest to be read as its own section, and the empty
-/// name, which writes `[]` and is not a header at all.
+/// Less is forbidden than for a key: a header is delimited on both sides and [`section_header`] takes the *last* `]`,
+/// so a name containing, ending in, or padded around one survives. Only a line break, which closes the header early and
+/// leaves the rest to be read as its own section, and the empty name, which writes `[]` and is not a header at all.
 pub(super) fn section_fault(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         Some("is empty")
@@ -98,12 +77,10 @@ pub(super) fn section_fault(name: &str) -> Option<&'static str> {
 
 /// The current section as a duplicate-detection key.
 ///
-/// Stands in for the section's name, which is what `configparser` keys
-/// `elements_added` by. The substitution is sound because the mapping is
-/// injective within one read: section indices are only ever appended, a
-/// repeated header is rejected before it gets here, and a section literally
-/// named DEFAULT is routed to [`Cur::Default`] rather than given an index.
-/// Being `Copy`, it costs no allocation per option line.
+/// Stands in for the section's name, which is what `configparser` keys `elements_added` by. The substitution is sound
+/// because the mapping is injective within one read: section indices are only ever appended, a repeated header is
+/// rejected before it gets here, and a section literally named DEFAULT is routed to [`Cur::Default`] rather than given
+/// an index. Being `Copy`, it costs no allocation per option line.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum SectionId {
     Default,
@@ -127,17 +104,11 @@ enum Cur {
     Section(usize),
 }
 
-/// Parse `text` and merge it into `cfg`. `source` names the input for error
-/// messages.
-pub(super) fn read(
-    cfg: &mut ConfigFile,
-    source: &str,
-    text: &str,
-) -> Result<()> {
+/// Parse `text` and merge it into `cfg`. `source` names the input for error messages.
+pub(super) fn read(cfg: &mut ConfigFile, source: &str, text: &str) -> Result<()> {
     let allow_no_value = cfg.allow_no_value;
-    // The working state lives in a guard: on every exit - the error returns
-    // included - a scrubbed configuration's accumulated keys and values are
-    // burned rather than dropped.
+    // The working state lives in a guard: on every exit - the error returns included - a scrubbed configuration's
+    // accumulated keys and values are burned rather than dropped.
     let mut work = Work {
         default: Ordered::new(),
         sections: Ordered::new(),
@@ -149,23 +120,21 @@ pub(super) fn read(
     let mut cur = Cur::None;
     let mut optname: Option<String> = None;
     let mut indent_level: usize = 0;
-    // Non-fatal option-syntax errors are collected and reported together at the
-    // end (like `configparser`'s accumulated `ParsingError`).
+    // Non-fatal option-syntax errors are collected and reported together at the end (like `configparser`'s accumulated
+    // `ParsingError`).
     let mut parse_errors: Vec<String> = Vec::new();
 
-    // `split_inclusive('\n')` matches Python's line iteration exactly: one line
-    // per '\n', with no spurious trailing empty line when the text ends in '\n'.
+    // `split_inclusive('\n')` matches Python's line iteration exactly: one line per '\n', with no spurious trailing
+    // empty line when the text ends in '\n'.
     for (idx, line) in text.split_inclusive('\n').enumerate() {
         let lineno = idx + 1;
         let trimmed = py_strip(line);
-        let is_full_comment =
-            trimmed.starts_with('#') || trimmed.starts_with(';');
+        let is_full_comment = trimmed.starts_with('#') || trimmed.starts_with(';');
         let clean = if is_full_comment { "" } else { trimmed };
 
         if clean.is_empty() {
-            // A truly blank line (not a comment) extends an open multi-line
-            // value with an empty line; the join at the end rstrips trailing
-            // blanks away.
+            // A truly blank line (not a comment) extends an open multi-line value with an empty line; the join at the
+            // end rstrips trailing blanks away.
             if !is_full_comment
                 && let (Some(opts), Some(name)) = (
                     cur_opts(&mut work.default, &mut work.sections, &cur),
@@ -181,13 +150,10 @@ pub(super) fn read(
         // Continuation depth is measured on the raw (un-stripped) line.
         let cur_indent = line.chars().take_while(|c| is_py_space(*c)).count();
 
-        let is_continuation = !matches!(cur, Cur::None)
-            && optname.is_some()
-            && cur_indent > indent_level;
+        let is_continuation = !matches!(cur, Cur::None) && optname.is_some() && cur_indent > indent_level;
         if is_continuation {
             let name = optname.as_deref().unwrap();
-            let opts =
-                cur_opts(&mut work.default, &mut work.sections, &cur).unwrap();
+            let opts = cur_opts(&mut work.default, &mut work.sections, &cur).unwrap();
             match opts.get_mut(name) {
                 Some(Some(lines)) => lines.push(clean.to_string()),
                 _ => {
@@ -204,10 +170,8 @@ pub(super) fn read(
             if header == DEFAULT_SECTION {
                 cur = Cur::Default;
             } else if work.added_sections.contains(header) {
-                // The name is withheld from a scrubbed configuration's
-                // error like the duplicate-option key below: in a
-                // credentials file it is an identifier that must not
-                // reach a log.
+                // The name is withheld from a scrubbed configuration's error like the duplicate-option key below: in a
+                // credentials file it is an identifier that must not reach a log.
                 return Err(Error::Parse(if cfg.scrub {
                     format!("{source}:{lineno}: duplicate section")
                 } else {
@@ -224,9 +188,7 @@ pub(super) fn read(
 
         // An option (or garbage) with no open section is a hard error.
         if matches!(cur, Cur::None) {
-            return Err(Error::Parse(format!(
-                "{source}:{lineno}: missing section header"
-            )));
+            return Err(Error::Parse(format!("{source}:{lineno}: missing section header")));
         }
 
         indent_level = cur_indent;
@@ -245,10 +207,8 @@ pub(super) fn read(
 
         let mut dup_key = (SectionId::of(&cur), key.clone());
         if work.dups.contains(&dup_key) {
-            // The key is withheld from a scrubbed configuration's error: in
-            // a credentials file it is an identifier that must not reach a
-            // log. Both copies of it - the line's and the lookup tuple's --
-            // are burned.
+            // The key is withheld from a scrubbed configuration's error: in a credentials file it is an identifier that
+            // must not reach a log. Both copies of it - the line's and the lookup tuple's -- are burned.
             let msg = if cfg.scrub {
                 format!("{source}:{lineno}: duplicate option")
             } else {
@@ -264,8 +224,7 @@ pub(super) fn read(
         work.dups.insert(dup_key);
 
         let acc: Acc = value.map(|v| vec![v.to_string()]);
-        let opts =
-            cur_opts(&mut work.default, &mut work.sections, &cur).unwrap();
+        let opts = cur_opts(&mut work.default, &mut work.sections, &cur).unwrap();
         opts.insert(&key, acc);
         optname = Some(key);
     }
@@ -296,10 +255,9 @@ fn cur_opts<'a>(
 
 /// Match a section header `[name]` against a stripped line, returning `name`.
 ///
-/// Mirrors `configparser`'s `SECTCRE = \[(?P<header>.+)\]` matched with
-/// `.match()`: the line must start with `[`, the greedy `.+` runs to the *last*
-/// `]`, and there must be at least one character between the brackets. Anything
-/// after that last `]` is ignored (the match is not anchored at end).
+/// Mirrors `configparser`'s `SECTCRE = \[(?P<header>.+)\]` matched with `.match()`: the line must start with `[`, the
+/// greedy `.+` runs to the *last* `]`, and there must be at least one character between the brackets. Anything after
+/// that last `]` is ignored (the match is not anchored at end).
 fn section_header(clean: &str) -> Option<&str> {
     if !clean.starts_with('[') {
         return None;
@@ -313,14 +271,10 @@ fn section_header(clean: &str) -> Option<&str> {
 
 /// Split a stripped option line into `(key, value)`.
 ///
-/// Mirrors `configparser`'s `OPTCRE`/`OPTCRE_NV`: the first `=` or `:` splits
-/// key from value, whitespace around the delimiter is dropped, and the value is
-/// stripped. With `allow_no_value`, a line with no delimiter is a valueless key;
-/// otherwise it is a syntax error (returned as `None`).
-fn parse_option(
-    clean: &str,
-    allow_no_value: bool,
-) -> Option<(&str, Option<&str>)> {
+/// Mirrors `configparser`'s `OPTCRE`/`OPTCRE_NV`. The first `=` or `:` splits key from value, whitespace around the
+/// delimiter is dropped, and the value is stripped. With `allow_no_value`, a line with no delimiter is a valueless key,
+/// and otherwise it is a syntax error (returned as `None`).
+fn parse_option(clean: &str, allow_no_value: bool) -> Option<(&str, Option<&str>)> {
     match clean.find(['=', ':']) {
         Some(p) => {
             let key = py_rstrip(&clean[..p]);
@@ -337,19 +291,16 @@ fn parse_option(
     }
 }
 
-/// The parse's working state. A guard: when a scrubbed configuration's
-/// read exits - the error paths included - whatever accumulated here is
-/// burned rather than dropped. [`merge`] empties it on success, so the
-/// burn then covers only what merging left behind.
+/// The parse's working state. A guard: when a scrubbed configuration's read exits - the error paths included - whatever
+/// accumulated here is burned rather than dropped. [`merge`] empties it on success, so the burn then covers only what
+/// merging left behind.
 struct Work {
     default: Ordered<Acc>,
     sections: Ordered<Ordered<Acc>>,
-    /// Per-read duplicate detection (`configparser`'s `elements_added`,
-    /// fresh each read so a conflict is within one document); holds a
-    /// clone of every option key.
+    /// Per-read duplicate detection (`configparser`'s `elements_added`, fresh each read so a conflict is within one
+    /// document); holds a clone of every option key.
     dups: HashSet<(SectionId, String)>,
-    /// Its section-name half: a clone of every section name, held here so
-    /// a scrubbed read burns them on drop.
+    /// Its section-name half: a clone of every section name, held here so a scrubbed read burns them on drop.
     added_sections: HashSet<String>,
     scrub: bool,
 }
@@ -370,8 +321,7 @@ impl Drop for Work {
     }
 }
 
-/// Burn one working section: keys (the index's copies included) and every
-/// accumulated value line.
+/// Burn one working section: keys (the index's copies included) and every accumulated value line.
 fn scrub_acc(opts: &mut Ordered<Acc>) {
     opts.scrub_with(|acc| {
         if let Some(lines) = acc {
@@ -382,9 +332,8 @@ fn scrub_acc(opts: &mut Ordered<Acc>) {
     });
 }
 
-/// Join accumulated value lines with `\n` and rstrip, matching
-/// `configparser`'s `'\n'.join(val).rstrip()`. Under scrub the consumed
-/// lines are burned after the join.
+/// Join accumulated value lines with `\n` and rstrip, matching `configparser`'s `'\n'.join(val).rstrip()`. Under scrub
+/// the consumed lines are burned after the join.
 fn join(acc: Acc, scrub: bool) -> Option<String> {
     acc.map(|mut lines| {
         let mut s = lines.join("\n");
@@ -400,10 +349,9 @@ fn join(acc: Acc, scrub: bool) -> Option<String> {
 
 /// Merge the working structures into `cfg`, joining multi-line values.
 ///
-/// Existing `cfg` sections/keys keep their position and are overridden in
-/// place; new ones are appended in first-appearance order. Under scrub,
-/// every working copy consumed here - accumulator lines, key copies, a
-/// displaced earlier value - is burned as it is released.
+/// Existing `cfg` sections/keys keep their position and are overridden in place; new ones are appended in
+/// first-appearance order. Under scrub, every working copy consumed here - accumulator lines, key copies, a displaced
+/// earlier value - is burned as it is released.
 fn merge(cfg: &mut ConfigFile, work: &mut Work) {
     let scrub = work.scrub;
     let mut default = std::mem::take(&mut work.default);
@@ -413,10 +361,7 @@ fn merge(cfg: &mut ConfigFile, work: &mut Work) {
         }
     }
     for (mut key, acc) in default.entries {
-        super::scrub_displaced(
-            scrub,
-            cfg.defaults.insert(&key, join(acc, scrub)),
-        );
+        super::scrub_displaced(scrub, cfg.defaults.insert(&key, join(acc, scrub)));
         if scrub {
             super::scrub_string(&mut key);
         }
@@ -438,10 +383,7 @@ fn merge(cfg: &mut ConfigFile, work: &mut Work) {
             }
         }
         for (mut key, acc) in opts.entries {
-            super::scrub_displaced(
-                scrub,
-                target.insert(&key, join(acc, scrub)),
-            );
+            super::scrub_displaced(scrub, target.insert(&key, join(acc, scrub)));
             if scrub {
                 super::scrub_string(&mut key);
             }

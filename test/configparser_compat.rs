@@ -1,20 +1,15 @@
-//! Differential tests that prove the `configfile` module behaves byte-for-byte
-//! and semantically like Python's standard-library `configparser`.
+//! Differential tests that prove the `configfile` module behaves byte-for-byte and semantically like Python's
+//! standard-library `configparser`.
 //!
-//! Each corpus document is fed to the real `configparser` (via
-//! `test/support/configparser_oracle.py`) and to [`ConfigFile`]; the results are
-//! required to agree on serialization (both `space_around` modes), raw and
-//! interpolated `get`, the typed getters, and - crucially - whether the document
-//! is accepted or rejected at all. The corpus is a curated table of every parsing
-//! subtlety, a large batch of seeded-random documents, and a set of files read
-//! from disk, where `configparser` applies universal newlines.
+//! Each corpus document is fed to the real `configparser` (via `test/support/configparser_oracle.py`) and to
+//! [`ConfigFile`]; the results are required to agree on serialization (both `space_around` modes), raw and interpolated
+//! `get`, the typed getters, and - crucially - whether the document is accepted or rejected at all. The corpus is a
+//! curated table of every parsing subtlety, a large batch of seeded-random documents, and a set of files read from
+//! disk, where `configparser` applies universal newlines.
 //!
-//! Like `test/zfs.rs`, this suite **skips** (returns early) when `python3` is not
-//! available, so `cargo test` stays green in a bare sandbox. CI sets
-//! `TRUENAS_ROS_REQUIRE_PYTHON` so a missing interpreter is a hard failure there
-//! rather than a silent skip, guaranteeing the parity checks actually run. Point
-//! it at a specific interpreter with `TRUENAS_ROS_PYTHON`, and/or a specific
-//! `configparser` with `TRUENAS_ROS_CPYTHON_LIB` (added to `PYTHONPATH`).
+//! This suite skips when `python3` is not available. CI sets `TRUENAS_ROS_REQUIRE_PYTHON` so a missing interpreter
+//! fails there instead. Point it at a specific interpreter with `TRUENAS_ROS_PYTHON`, and at a specific `configparser`
+//! with `TRUENAS_ROS_CPYTHON_LIB`, which is added to `PYTHONPATH`.
 #![cfg(all(target_os = "linux", feature = "configfile"))]
 
 use std::io::Write;
@@ -56,8 +51,7 @@ enum Oracle {
 
 /// Resolve the interpreter, returning `None` (-> skip) if it cannot run.
 fn python() -> Option<String> {
-    let py = std::env::var("TRUENAS_ROS_PYTHON")
-        .unwrap_or_else(|_| "python3".to_string());
+    let py = std::env::var("TRUENAS_ROS_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let ok = Command::new(&py)
         .arg("--version")
         .stdout(Stdio::null())
@@ -68,9 +62,6 @@ fn python() -> Option<String> {
     if ok {
         return Some(py);
     }
-    // In CI, TRUENAS_ROS_REQUIRE_PYTHON is set so a missing interpreter is a hard
-    // failure (the differential coverage must actually run); locally, absent that
-    // variable, we skip gracefully.
     assert!(
         std::env::var_os("TRUENAS_ROS_REQUIRE_PYTHON").is_none(),
         "TRUENAS_ROS_REQUIRE_PYTHON is set but python3 ({py:?}) is not runnable"
@@ -79,10 +70,7 @@ fn python() -> Option<String> {
 }
 
 fn oracle_script() -> String {
-    format!(
-        "{}/test/support/configparser_oracle.py",
-        env!("CARGO_MANIFEST_DIR")
-    )
+    format!("{}/test/support/configparser_oracle.py", env!("CARGO_MANIFEST_DIR"))
 }
 
 /// A cursor over the oracle's length-prefixed record stream.
@@ -92,15 +80,8 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     fn field(&mut self) -> Vec<u8> {
-        let nl = self
-            .data
-            .iter()
-            .position(|&b| b == b'\n')
-            .expect("field length line");
-        let len: usize = std::str::from_utf8(&self.data[..nl])
-            .unwrap()
-            .parse()
-            .unwrap();
+        let nl = self.data.iter().position(|&b| b == b'\n').expect("field length line");
+        let len: usize = std::str::from_utf8(&self.data[..nl]).unwrap().parse().unwrap();
         let start = nl + 1;
         let field = self.data[start..start + len].to_vec();
         self.data = &self.data[start + len..];
@@ -141,11 +122,7 @@ fn parse_stream(data: &[u8]) -> Oracle {
             boolean: r.result(),
         });
     }
-    Oracle::Ok {
-        spaced,
-        tight,
-        probes,
-    }
+    Oracle::Ok { spaced, tight, probes }
 }
 
 /// Run the oracle over `doc`, or over a file when `args` carries `--path`.
@@ -155,9 +132,7 @@ fn run_oracle(py: &str, doc: &str, args: &[&str]) -> Oracle {
     if let Some(lib) = std::env::var_os("TRUENAS_ROS_CPYTHON_LIB") {
         cmd.env("PYTHONPATH", lib);
     }
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().expect("spawn python oracle");
     child
         .stdin
@@ -182,32 +157,18 @@ fn assert_doc(py: &str, doc: &str, check_typed: bool) {
 
     let (spaced, tight, probes) = match oracle {
         Oracle::ParseErr => {
-            assert!(
-                raw_res.is_err(),
-                "python rejected but rust(raw) accepted: {doc:?}"
-            );
-            assert!(
-                new_res.is_err(),
-                "python rejected but rust(new) accepted: {doc:?}"
-            );
+            assert!(raw_res.is_err(), "python rejected but rust(raw) accepted: {doc:?}");
+            assert!(new_res.is_err(), "python rejected but rust(new) accepted: {doc:?}");
             return;
         }
-        Oracle::Ok {
-            spaced,
-            tight,
-            probes,
-        } => (spaced, tight, probes),
+        Oracle::Ok { spaced, tight, probes } => (spaced, tight, probes),
     };
 
-    raw_res.unwrap_or_else(|e| {
-        panic!("python accepted but rust(raw) rejected {doc:?}: {e:?}")
-    });
-    new_res.unwrap_or_else(|e| {
-        panic!("python accepted but rust(new) rejected {doc:?}: {e:?}")
-    });
+    raw_res.unwrap_or_else(|e| panic!("python accepted but rust(raw) rejected {doc:?}: {e:?}"));
+    new_res.unwrap_or_else(|e| panic!("python accepted but rust(new) rejected {doc:?}: {e:?}"));
 
-    // Serialization parity (both delimiter-padding modes). `write` does not
-    // interpolate, so the interpolating parser must serialize identically.
+    // Serialization parity (both delimiter-padding modes). `write` does not interpolate, so the interpolating parser
+    // must serialize identically.
     assert_serialization(&rraw.write_string(), &spaced, doc, "spaced");
     assert_serialization(&rraw.to_string_with(false), &tight, doc, "tight");
     assert_serialization(&rnew.write_string(), &spaced, doc, "interp-spaced");
@@ -215,13 +176,13 @@ fn assert_doc(py: &str, doc: &str, check_typed: bool) {
     assert_probes(&rnew, &probes, doc, check_typed);
     assert_option_order(&rnew, &probes, doc);
 
-    // Rust's serialization must itself reparse to the same bytes (write/parse
-    // symmetry); combined with the parity above this pins full round-tripping.
+    // Rust's serialization must itself reparse to the same bytes (write/parse symmetry); combined with the parity above
+    // this pins full round-tripping.
     let s1 = rraw.write_string();
     let mut reparsed = ConfigFile::raw();
-    reparsed.read_str(&s1).unwrap_or_else(|e| {
-        panic!("reparse of own output failed {doc:?}: {e:?}")
-    });
+    reparsed
+        .read_str(&s1)
+        .unwrap_or_else(|e| panic!("reparse of own output failed {doc:?}: {e:?}"));
     assert_eq!(
         reparsed.write_string(),
         s1,
@@ -230,12 +191,7 @@ fn assert_doc(py: &str, doc: &str, check_typed: bool) {
 }
 
 /// Compare every probe the oracle reported against an interpolating `cfg`.
-fn assert_probes(
-    cfg: &ConfigFile,
-    probes: &[Probe],
-    doc: &str,
-    check_typed: bool,
-) {
+fn assert_probes(cfg: &ConfigFile, probes: &[Probe], doc: &str, check_typed: bool) {
     for p in probes {
         // Interpolated get() through the interpolating parser.
         match &p.get {
@@ -261,15 +217,12 @@ fn assert_probes(
     }
 }
 
-/// `options()` must agree with `configparser.options` on *order*, not just on
-/// membership: the oracle emits its probes by walking `cp.options(section)`
-/// for each section in turn, so the probe list is that order verbatim.
+/// `options()` must agree with `configparser.options` on *order*, not just on membership: the oracle emits its probes
+/// by walking `cp.options(section)` for each section in turn, so the probe list is that order verbatim.
 ///
-/// CPython copies the section and `update`s it with the defaults, putting the
-/// section's own keys first and appending the `DEFAULT` keys it did not
-/// override - the reverse of `items()`, which starts from the defaults. The
-/// two really do disagree upstream, so nothing here can be shared between
-/// them.
+/// CPython copies the section and `update`s it with the defaults, putting the section's own keys first and appending
+/// the `DEFAULT` keys it did not override - the reverse of `items()`, which starts from the defaults. The two really do
+/// disagree upstream, so nothing here can be shared between them.
 fn assert_option_order(cfg: &ConfigFile, probes: &[Probe], doc: &str) {
     let mut want: Vec<(&str, Vec<&str>)> = Vec::new();
     for p in probes {
@@ -364,46 +317,45 @@ fn assert_bool(cfg: &ConfigFile, p: &Probe, doc: &str) {
 
 // ---- corpus 1: curated edge cases -----------------------------------------
 
-/// Every parsing/serialization subtlety, hand-picked. Typed getters are checked
-/// for all of these (the values are controlled).
+/// Every parsing/serialization subtlety, hand-picked. Typed getters are checked for all of these (the values are
+/// controlled).
 const CURATED: &[&str] = &[
     "",
     "[s]\n",
     "[s]\nk = v\n",
     "[s]\nk=v\n",
     "[s]\nk : v\n",
-    "[s]\nKey = Value\n", // keys are lowercased
-    "[Section]\na=1\n[section]\nb=2\n", // section names are case-sensitive
-    "[s]\n  k = v\n",     // an indented option
-    "[s]\nk = a ; b\n",   // inline ';' is NOT a comment
-    "[s]\nk = a # b\n",   // inline '#' is NOT a comment either
-    "# lead comment\n[s]\nk = v\n", // full-line comment
-    "[s]\n  ; indented comment\n  k=v\n", // indented full-line comment
-    "[s]\nk =\n",         // empty value
-    "[s]\nk = line1\n  line2\n  line3\n", // multi-line value
-    "[s]\nk = line1\n\n  line3\n", // blank line inside a value
-    "[s]\nk = a=b=c\n",   // first delimiter splits
-    "[a]b]\nk = v\n",     // header greedy to last ']'
-    "[DEFAULT]\nd = base\n[s]\nk = v\n", // DEFAULT inheritance
-    "[DEFAULT]\nk = def\n[s]\nk = over\n", // section overrides DEFAULT
-    "[s]\nn = 42\nneg = -7\nz = 0\n", // integers
-    "[s]\nf = 3.14\ng = 1e3\nh = -0.5\n", // floats
-    "[s]\nb1 = yes\nb2 = Off\nb3 = TRUE\nb4 = 0\n", // booleans, mixed case
-    "[s]\npct = 100%%\n", // '%%' escapes to '%'
+    "[s]\nKey = Value\n",                               // keys are lowercased
+    "[Section]\na=1\n[section]\nb=2\n",                 // section names are case-sensitive
+    "[s]\n  k = v\n",                                   // an indented option
+    "[s]\nk = a ; b\n",                                 // inline ';' is NOT a comment
+    "[s]\nk = a # b\n",                                 // inline '#' is NOT a comment either
+    "# lead comment\n[s]\nk = v\n",                     // full-line comment
+    "[s]\n  ; indented comment\n  k=v\n",               // indented full-line comment
+    "[s]\nk =\n",                                       // empty value
+    "[s]\nk = line1\n  line2\n  line3\n",               // multi-line value
+    "[s]\nk = line1\n\n  line3\n",                      // blank line inside a value
+    "[s]\nk = a=b=c\n",                                 // first delimiter splits
+    "[a]b]\nk = v\n",                                   // header greedy to last ']'
+    "[DEFAULT]\nd = base\n[s]\nk = v\n",                // DEFAULT inheritance
+    "[DEFAULT]\nk = def\n[s]\nk = over\n",              // section overrides DEFAULT
+    "[s]\nn = 42\nneg = -7\nz = 0\n",                   // integers
+    "[s]\nf = 3.14\ng = 1e3\nh = -0.5\n",               // floats
+    "[s]\nb1 = yes\nb2 = Off\nb3 = TRUE\nb4 = 0\n",     // booleans, mixed case
+    "[s]\npct = 100%%\n",                               // '%%' escapes to '%'
     "[DEFAULT]\nbase = /srv\n[s]\np = %(base)s/data\n", // interpolation
-    "[s]\na = 1\nb = %(a)s%(a)s\nc = %(b)s\n", // chained interpolation
-    "[s]\nbad = 50%\n",   // invalid interpolation -> get() errs
-    // U+001C..U+001F are whitespace to CPython's strip and to `re`'s \s, but
-    // not to Unicode's White_Space that Rust's trim implements. They are the
-    // only four code points the two definitions disagree on, so they fence a
-    // key, a value, and a continuation line here.
+    "[s]\na = 1\nb = %(a)s%(a)s\nc = %(b)s\n",          // chained interpolation
+    "[s]\nbad = 50%\n",                                 // invalid interpolation -> get() errs
+    // U+001C..U+001F are whitespace to CPython's strip and to `re`'s \s, but not to Unicode's White_Space that Rust's
+    // trim implements. They are the only four code points the two definitions disagree on, so they fence a key, a
+    // value, and a continuation line here.
     "[s]\nk\u{1c} = v\n",
     "[s]\nk = \u{1f}v\u{1e}\n",
     "[s]\n\u{1d}k = v\n",
     "[s]\nk = one\n\u{1c}two\n",
     "[s]\nk =\u{1c}\n",
-    // A '\r' is not a line break on this path: `read_string` wraps the text in
-    // a StringIO with newline='\n'. The same bytes in a file are FILE_CORPUS.
+    // A '\r' is not a line break on this path: `read_string` wraps the text in a StringIO with newline='\n'. The same
+    // bytes in a file are FILE_CORPUS.
     "[s]\rk = v\rj = w\r",
     "[s]\r\nk = v\r\n",
     // Documents `configparser` rejects (Rust must reject them too):
@@ -427,8 +379,7 @@ fn curated_corpus_matches_configparser() {
 
 // ---- corpus 2: seeded-random documents ------------------------------------
 
-/// A tiny reproducible xorshift64 PRNG (no `rand` dependency, fixed seed so the
-/// corpus is identical on every run).
+/// A tiny reproducible xorshift64 PRNG (no `rand` dependency, fixed seed so the corpus is identical on every run).
 struct Rng(u64);
 
 impl Rng {
@@ -450,14 +401,12 @@ impl Rng {
     }
 }
 
-/// Build a random-but-plausible INI document, biased toward interesting shapes
-/// (sections, delimiters, comments, indentation, `%` sequences, empties).
+/// Build a random-but-plausible INI document, biased toward interesting shapes (sections, delimiters, comments,
+/// indentation, `%` sequences, empties).
 fn random_doc(rng: &mut Rng) -> String {
     let sections = ["s1", "s2", "DEFAULT", "Sec", "a]b", "x y"];
     let keys = ["k", "Key", "a", "b c", "n", "flag"];
-    let values = [
-        "v", "1", "true", "%(k)s", "50%", "%%", "x = y", "", "a ; b", "-3",
-    ];
+    let values = ["v", "1", "true", "%(k)s", "50%", "%%", "x = y", "", "a ; b", "-3"];
     let junk = ["[", "]", "=", ":", "%", "key", "(a)s", " ", "\t", "#", ";"];
 
     let mut s = String::new();
@@ -504,24 +453,23 @@ fn random_corpus_matches_configparser() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for _ in 0..500 {
         let doc = random_doc(&mut rng);
-        // Values are arbitrary here, so only exercise structure/serialization
-        // and interpolated get(), not the numeric/boolean converters.
+        // Values are arbitrary here, so only exercise structure/serialization and interpolated get(), not the
+        // numeric/boolean converters.
         assert_doc(&py, &doc, false);
     }
 }
 
 // ---- corpus 3: files, read through universal newlines ----------------------
 
-/// Documents whose line endings only matter on disk: `configparser.read()`
-/// opens the file with universal newlines, so every `\r\n` and lone `\r` is a
-/// line break - unlike the `read_string` path the corpora above exercise.
+/// Documents whose line endings only matter on disk: `configparser.read()` opens the file with universal newlines, so
+/// every `\r\n` and lone `\r` is a line break - unlike the `read_string` path the corpora above exercise.
 const FILE_CORPUS: &[&str] = &[
-    "[s]\rk = v\rj = w\r",       // classic-Mac CR endings
-    "[s]\r\nk = v\r\nj = w\r\n", // CRLF endings
+    "[s]\rk = v\rj = w\r",                  // classic-Mac CR endings
+    "[s]\r\nk = v\r\nj = w\r\n",            // CRLF endings
     "[DEFAULT]\rd = 1\r[s]\nk = %(d)s\r\n", // endings mixed in one file
-    "[s]\rk = one\r  two\r",     // a CR-separated multi-line value
-    "[s]\nk = v\r",              // a bare '\r' terminating the file
-    "k = v\r[s]\r",              // rejected: option before any section
+    "[s]\rk = one\r  two\r",                // a CR-separated multi-line value
+    "[s]\nk = v\r",                         // a bare '\r' terminating the file
+    "k = v\r[s]\r",                         // rejected: option before any section
 ];
 
 #[test]
@@ -542,29 +490,15 @@ fn file_line_endings_match_configparser_read() {
 
         let (spaced, tight, probes) = match run_oracle(&py, "", &args) {
             Oracle::ParseErr => {
-                assert!(
-                    raw_res.is_err(),
-                    "python rejected but rust(raw) accepted file {doc:?}"
-                );
-                assert!(
-                    new_res.is_err(),
-                    "python rejected but rust(new) accepted file {doc:?}"
-                );
+                assert!(raw_res.is_err(), "python rejected but rust(raw) accepted file {doc:?}");
+                assert!(new_res.is_err(), "python rejected but rust(new) accepted file {doc:?}");
                 continue;
             }
-            Oracle::Ok {
-                spaced,
-                tight,
-                probes,
-            } => (spaced, tight, probes),
+            Oracle::Ok { spaced, tight, probes } => (spaced, tight, probes),
         };
 
-        raw_res.unwrap_or_else(|e| {
-            panic!("python accepted but rust rejected file {doc:?}: {e:?}")
-        });
-        new_res.unwrap_or_else(|e| {
-            panic!("python accepted but rust rejected file {doc:?}: {e:?}")
-        });
+        raw_res.unwrap_or_else(|e| panic!("python accepted but rust rejected file {doc:?}: {e:?}"));
+        new_res.unwrap_or_else(|e| panic!("python accepted but rust rejected file {doc:?}: {e:?}"));
         assert_serialization(&rraw.write_string(), &spaced, doc, "spaced");
         assert_serialization(&rraw.to_string_with(false), &tight, doc, "tight");
         assert_probes(&rnew, &probes, doc, true);
@@ -580,8 +514,8 @@ fn absent_section_lookup_matches_configparser() {
         return;
     };
     let doc = "[DEFAULT]\nport = 8080\n[server]\nport = 9000\n";
-    // `sever` is a typo for `server`: `configparser` raises NoSectionError
-    // instead of serving the DEFAULT value. DEFAULT is addressable by name.
+    // `sever` is a typo for `server`: `configparser` raises NoSectionError instead of serving the DEFAULT value.
+    // DEFAULT is addressable by name.
     #[rustfmt::skip]
     let args = [
         "--probe", "sever", "port",

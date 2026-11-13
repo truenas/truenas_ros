@@ -1,19 +1,13 @@
-//! `Transfer-Encoding: chunked` - an incremental, resumable scanner over the
-//! wire form, plus the one-shot decoder the glue runs once a body is fully
-//! framed. Everything is a pure function of `(bytes, state)` - no I/O, no
-//! config - and the scanner and decoder share one state machine ([`run`]),
-//! so the framer's progress oracle and the glue's decoder can never disagree
-//! about where a chunked message ends.
+//! `Transfer-Encoding: chunked` - an incremental, resumable scanner over the wire form, plus the one-shot decoder the
+//! glue runs once a body is fully framed. Everything is a pure function of `(bytes, state)` - no I/O, no config - and
+//! the scanner and decoder share one state machine ([`run`]), so the framer's progress oracle and the glue's decoder
+//! can never disagree about where a chunked message ends.
 //!
-//! Strictness (RFC 9112 sec. 7.1): hex chunk sizes with checked arithmetic
-//! (overflow is a 400, not a wraparound), CRLF line endings only, chunk
-//! extensions parsed and ignored (a recipient MUST ignore unrecognized
-//! extensions), trailer field names token-validated (with the
-//! framing/routing/credential set dropped - [`FORBIDDEN_TRAILERS`]). Every
-//! line is capped
-//! ([`CHUNK_LINE_MAX`], [`TRAILER_LINE_MAX`]) so a peer can neither wedge
-//! the scanner short of a terminator nor drip an unbounded "line", and the
-//! whole trailer section is capped ([`TRAILER_MAX`] -> 431, the oversized-
+//! Strictness (RFC 9112 sec. 7.1): hex chunk sizes with checked arithmetic (overflow is a 400, not a wraparound), CRLF
+//! line endings only, chunk extensions parsed and ignored (a recipient MUST ignore unrecognized extensions), trailer
+//! field names token-validated (with the framing/routing/credential set dropped - [`FORBIDDEN_TRAILERS`]). Every line
+//! is capped ([`CHUNK_LINE_MAX`], [`TRAILER_LINE_MAX`]) so a peer can neither wedge the scanner short of a terminator
+//! nor drip an unbounded "line", and the whole trailer section is capped ([`TRAILER_MAX`] -> 431, the oversized-
 //! header-fields answer).
 
 use std::borrow::Cow;
@@ -21,19 +15,16 @@ use std::ops::Range;
 
 use super::head::{HeaderView, has_field_break, is_token_byte};
 
-/// Chunk-size line cap (hex digits + optional extensions, CRLF excluded).
-/// Real chunk-size lines are under 20 bytes; the headroom is for extensions,
-/// which are ignored but must still terminate.
+/// Chunk-size line cap (hex digits + optional extensions, CRLF excluded). Real chunk-size lines are under 20 bytes; the
+/// headroom is for extensions, which are ignored but must still terminate.
 pub(crate) const CHUNK_LINE_MAX: usize = 256;
 
-/// Single trailer field-line cap. Checksum trailers (the real-world use:
-/// `x-amz-checksum-*`) are well under 100 bytes.
+/// Single trailer field-line cap. Checksum trailers (the real-world use: `x-amz-checksum-*`) are well under 100 bytes.
 pub(crate) const TRAILER_LINE_MAX: usize = 1024;
 
-/// Whole trailer section cap, terminator included. This byte bound is also
-/// the field-count bound: the smallest field line runs a few bytes, so the
-/// cap admits at most a couple of thousand trailers before answering 431,
-/// which is why there is no separate count cap.
+/// Whole trailer section cap, terminator included. This byte bound is also the field-count bound: the smallest field
+/// line runs a few bytes, so the cap admits at most a couple of thousand trailers before answering 431, which is why
+/// there is no separate count cap.
 pub(crate) const TRAILER_MAX: usize = 8 * 1024;
 
 /// Where the scanner stands inside the chunk stream.
@@ -49,23 +40,20 @@ enum State {
     },
     /// Expecting the CRLF that closes a chunk's payload.
     DataCrlf,
-    /// In the trailer section (after the zero-size chunk), consuming field
-    /// lines until the empty line.
+    /// In the trailer section (after the zero-size chunk), consuming field lines until the empty line.
     Trailer,
     /// The terminator has been consumed; the message's extent is final.
     Done,
 }
 
-/// Resumable scan state. Offsets index the body region (the bytes after the
-/// head) from its start; the region only ever grows while a scan is live, so
-/// they stay valid across calls.
+/// Resumable scan state. Offsets index the body region (the bytes after the head) from its start; the region only ever
+/// grows while a scan is live, so they stay valid across calls.
 #[derive(Debug, Default)]
 pub(crate) struct ChunkScan {
-    /// Bytes fully scanned - the resume point, and the message extent once
-    /// [`State::Done`] is reached.
+    /// Bytes fully scanned - the resume point, and the message extent once [`State::Done`] is reached.
     pub consumed: usize,
-    /// Decoded payload bytes seen so far - the entity size, so far. The
-    /// framer reads this to enforce its decoded-body cap mid-stream.
+    /// Decoded payload bytes seen so far - the entity size, so far. The framer reads this to enforce its decoded-body
+    /// cap mid-stream.
     pub decoded: usize,
     /// Trailer-section bytes seen so far (for the [`TRAILER_MAX`] cap).
     trailer_bytes: usize,
@@ -94,19 +82,16 @@ fn find_crlf(rest: &[u8], max_line: usize) -> Find {
     }
 }
 
-/// Whether a CRLF-delimited line (size or trailer) carries a bare CR or LF.
-/// The chunked grammar terminates these lines with CRLF only (RFC 9112
-/// sec. 7.1). Since [`find_crlf`] stops at the first CRLF, a bare CR or LF
-/// earlier in the line - a chunk extension is the usual place - must be
-/// rejected here rather than left in place, or a recipient that treats a
-/// lone LF as a line ending could frame the body differently.
+/// Whether a CRLF-delimited line (size or trailer) carries a bare CR or LF. The chunked grammar terminates these lines
+/// with CRLF only (RFC 9112 sec. 7.1). Since [`find_crlf`] stops at the first CRLF, a bare CR or LF earlier in the
+/// line - a chunk extension is the usual place - must be rejected here rather than left in place, or a recipient that
+/// treats a lone LF as a line ending could frame the body differently.
 fn line_has_bare_crlf(line: &[u8]) -> bool {
     line.iter().any(|&b| matches!(b, b'\r' | b'\n'))
 }
 
-/// Parse a chunk-size line: `1*HEXDIG`, then nothing or an (ignored)
-/// extension introduced by `;` after optional whitespace. Checked
-/// arithmetic - a size that overflows `usize` is malformed, full stop.
+/// Parse a chunk-size line: `1*HEXDIG`, then nothing or an (ignored) extension introduced by `;` after optional
+/// whitespace. Checked arithmetic - a size that overflows `usize` is malformed, full stop.
 fn parse_size_line(line: &[u8]) -> Option<usize> {
     let mut digits = 0usize;
     let mut n = 0usize;
@@ -138,12 +123,10 @@ fn trim_ows_start(mut v: &[u8]) -> &[u8] {
     v
 }
 
-/// Split a trailer field line into `(name, value)`. `None` when the name is
-/// empty, not a token, the colon is missing, or the value carries a control
-/// byte - the line is malformed. The value screen is load-bearing: lines are
-/// delimited on CRLF only, so a bare LF or CR *inside* a value would let a
-/// permitted-named trailer carry a forbidden field line past the name-only
-/// [`FORBIDDEN_TRAILERS`] screen.
+/// Split a trailer field line into `(name, value)`. `None` when the name is empty, not a token, the colon is missing,
+/// or the value carries a control byte - the line is malformed. The value screen is load-bearing: lines are delimited
+/// on CRLF only, so a bare LF or CR *inside* a value would let a permitted-named trailer carry a forbidden field line
+/// past the name-only [`FORBIDDEN_TRAILERS`] screen.
 fn split_trailer(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let colon = line.iter().position(|&b| b == b':')?;
     if colon == 0 || !line[..colon].iter().all(|&b| is_token_byte(b)) {
@@ -156,31 +139,19 @@ fn split_trailer(line: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&line[..colon], value))
 }
 
-/// Field names that must not ride in a trailer section (RFC 9110 sec. 6.5.1):
-/// message framing, routing, and credentials. A conforming sender never puts
-/// these there, and surfacing them tempts any consumer that merges headers
-/// and trailers into letting a trailer rewrite framing or auth after the
-/// body - so a well-formed line bearing one is consumed and dropped, never
-/// surfaced.
+/// Field names that must not ride in a trailer section (RFC 9110 sec. 6.5.1), being message framing, routing and
+/// credentials. A well-formed line bearing one is consumed and dropped, never surfaced, so a consumer that merges
+/// headers and trailers cannot have framing or auth rewritten after the body.
 ///
-/// **Three of the six clauses sec. 6.5.1 names, and the doc on
-/// [`HttpRequest::trailers`](crate::http::HttpRequest::trailers) says which
-/// three.** The request modifiers, the response control data and the
-/// payload-processing fields ride through: a consumer that merges the two
-/// sections still sees an `If-Match` or a `Content-Type` arriving after the
-/// body. That is an incomplete list rather than a broken promise, and
-/// widening it changes what consumers are handed - but *credentials* is a
-/// clause this claims outright, so every field in it belongs here.
+/// This covers three of the six clauses sec. 6.5.1 names. Request modifiers, response control data and
+/// payload-processing fields still ride through, and widening the list changes what consumers are handed.
 const FORBIDDEN_TRAILERS: [&str; 6] = [
     // Message framing.
     "transfer-encoding",
     "content-length",
     // Routing.
     "host",
-    // Credentials. RFC 9110 sec. 6.5.1 names the authentication fields as a
-    // clause, not as a list of one: a proxy credential arriving after the
-    // body is the same rewrite as an origin one, and SigV4 signs the head
-    // block rather than this section.
+    // Credentials, the whole clause. A proxy credential arriving after the body is the same rewrite as an origin one.
     "authorization",
     "proxy-authorization",
     "cookie",
@@ -192,13 +163,11 @@ fn forbidden_trailer(name: &[u8]) -> bool {
         .any(|f| name.eq_ignore_ascii_case(f.as_bytes()))
 }
 
-/// The one state machine under [`scan`], [`decode`], and [`compact`]:
-/// advance over `body` from where `s` left off, reporting payload spans and
-/// validated trailer lines to the sinks **as ranges into `body`** - so an
-/// in-place caller can record positions without borrowing against a buffer
-/// it means to mutate. `Ok(Some(extent))` - the message occupies exactly the
-/// first `extent` bytes of `body`; `Ok(None)` - need more bytes;
-/// `Err(status)` - malformed (400) or oversized trailers (431).
+/// The one state machine under [`scan`], [`decode`], and [`compact`]. It advances over `body` from where `s` left off
+/// and reports payload spans and validated trailer lines to the sinks **as ranges into `body`**, so an in-place caller
+/// can record positions without borrowing a buffer it means to mutate. `Ok(Some(extent))` means the message occupies
+/// exactly the first `extent` bytes of `body`, `Ok(None)` means more bytes are needed, and `Err(status)` is malformed
+/// input (400) or oversized trailers (431).
 fn run(
     body: &[u8],
     s: &mut ChunkScan,
@@ -210,8 +179,8 @@ fn run(
             return Ok(Some(s.consumed));
         }
         let Some(rest) = body.get(s.consumed..) else {
-            // The buffer shrank beneath the resume point - a caller contract
-            // break (the accumulate buffer only grows), not wire data.
+            // The buffer shrank beneath the resume point - a caller contract break (the accumulate buffer only grows),
+            // not wire data.
             return Err(400);
         };
         match s.state {
@@ -276,8 +245,7 @@ fn run(
                         s.state = State::Done;
                     } else {
                         match split_trailer(line) {
-                            // Forbidden names (framing/routing/credentials)
-                            // are consumed but never surfaced.
+                            // Forbidden names (framing/routing/credentials) are consumed but never surfaced.
                             Some((name, _)) if forbidden_trailer(name) => {}
                             Some(_) => on_trailer(start..start + i),
                             None => return Err(400),
@@ -289,49 +257,40 @@ fn run(
     }
 }
 
-/// Advance the scan over `body` (the byte region after the head), resuming
-/// from where the previous call stopped. See [`run`] for the verdicts.
-pub(crate) fn scan(
-    body: &[u8],
-    s: &mut ChunkScan,
-) -> Result<Option<usize>, u16> {
+/// Advance the scan over `body` (the byte region after the head), resuming from where the previous call stopped. See
+/// [`run`] for the verdicts.
+pub(crate) fn scan(body: &[u8], s: &mut ChunkScan) -> Result<Option<usize>, u16> {
     run(body, s, &mut |_| {}, &mut |_| {})
 }
 
-/// One step of a **chunk-at-a-time** walk: where the next payload extent
-/// starts and how long it is, without scanning past it.
-///
-/// [`scan`] answers "is the whole message here yet", which requires holding
-/// the whole message. This answers "where is the next payload", which is
-/// what a caller streaming a body needs - it can consume each chunk and
-/// forget it, so the buffer never holds more than one.
+/// One step of a **chunk-at-a-time** walk, giving where the next payload extent starts and how long it is without
+/// scanning past it. Unlike [`scan`] it never needs the whole message present, so a streaming caller can consume each
+/// chunk and forget it.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Step {
     /// Not enough bytes to decide yet.
     More,
     /// `framing` bytes of chunk header precede `payload` bytes of data.
     Chunk {
-        /// Bytes before the payload: the CRLF closing the previous chunk
-        /// when there was one, then the size line and its CRLF.
+        /// Bytes before the payload: the CRLF closing the previous chunk when there was one, then the size line and its
+        /// CRLF.
         framing: usize,
         /// Payload bytes, as the size line declared them.
         payload: usize,
     },
-    /// The terminal chunk and its trailer section together occupy `framing`
-    /// bytes. There is no payload and the body ends here.
+    /// The terminal chunk and its trailer section together occupy `framing` bytes. There is no payload and the body
+    /// ends here.
     Last {
-        /// Extent of the terminal chunk, including any trailer section and
-        /// the closing CRLF.
+        /// Extent of the terminal chunk, including any trailer section and the closing CRLF.
         framing: usize,
     },
     /// Malformed, with the status to answer.
     Bad(u16),
 }
 
-/// Locate the next chunk's payload. `after_payload` is set once a previous
-/// chunk's data has been consumed, because the CRLF that closes it is left
-/// for this call to eat - counting it as the *next* chunk's framing keeps
-/// the caller's cursor on a payload boundary at every step.
+/// Locate the next chunk's payload. `after_payload` is set once a previous chunk's data has been consumed, because the
+/// CRLF that closes it is left for this call to eat - counting it as the *next* chunk's framing keeps the caller's
+/// cursor on a payload boundary at every step.
 pub(crate) fn step(buf: &[u8], after_payload: bool) -> Step {
     let mut at = 0;
     if after_payload {
@@ -353,14 +312,11 @@ pub(crate) fn step(buf: &[u8], after_payload: bool) -> Step {
             }
             match parse_size_line(line) {
                 None => Step::Bad(400),
-                // A zero size line opens the terminal chunk, whose trailer
-                // section still has to be walked to its end. From here the
-                // remainder IS a complete (empty) chunked message, so the
-                // whole-message scanner answers it exactly.
+                // A zero size line opens the terminal chunk, whose trailer section still has to be walked to its end.
+                // From here the remainder IS a complete (empty) chunked message, so the whole-message scanner answers
+                // it exactly.
                 Some(0) => match scan(rest, &mut ChunkScan::default()) {
-                    Ok(Some(extent)) => Step::Last {
-                        framing: at + extent,
-                    },
+                    Ok(Some(extent)) => Step::Last { framing: at + extent },
                     Ok(None) => Step::More,
                     Err(status) => Step::Bad(status),
                 },
@@ -373,10 +329,8 @@ pub(crate) fn step(buf: &[u8], after_payload: bool) -> Step {
     }
 }
 
-/// Accumulator for the decoded entity: a message whose payload is one
-/// contiguous span (the single-chunk shape default botocore sends) stays a
-/// borrow of the wire; only a second span forces the stitch into an owned
-/// buffer.
+/// Accumulator for the decoded entity: a message whose payload is one contiguous span (the single-chunk shape default
+/// botocore sends) stays a borrow of the wire; only a second span forces the stitch into an owned buffer.
 enum Entity<'b> {
     /// No payload seen yet.
     Empty,
@@ -386,15 +340,11 @@ enum Entity<'b> {
     Stitched(Vec<u8>),
 }
 
-/// One-shot decode of a fully framed chunked message: the de-chunked entity
-/// plus the parsed trailer fields. A single-chunk message borrows its
-/// payload straight from `wire` (`Cow::Borrowed`) - no copy; only multi-chunk
-/// messages stitch into an owned buffer. The framer's scan already accepted
-/// these exact bytes as a complete message, so any failure here is a codec
-/// bug - callers answer it as one (500), never as a client error.
-pub(crate) fn decode(
-    wire: &[u8],
-) -> Result<(Cow<'_, [u8]>, Vec<HeaderView<'_>>), ()> {
+/// One-shot decode of a fully framed chunked message: the de-chunked entity plus the parsed trailer fields. A
+/// single-chunk message borrows its payload straight from `wire` (`Cow::Borrowed`) - no copy; only multi-chunk messages
+/// stitch into an owned buffer. The framer's scan already accepted these exact bytes as a complete message, so any
+/// failure here is a codec bug - callers answer it as one (500), never as a client error.
+pub(crate) fn decode(wire: &[u8]) -> Result<(Cow<'_, [u8]>, Vec<HeaderView<'_>>), ()> {
     let mut s = ChunkScan::default();
     let mut entity = Entity::Empty;
     let mut lines: Vec<&[u8]> = Vec::new();
@@ -438,10 +388,9 @@ pub(crate) fn decode(
     Ok((entity, trailers))
 }
 
-/// The de-chunked layout of a wire buffer after [`compact`]: where the
-/// entity now lies inside it, plus the trailer lines copied out of it (tiny,
-/// usually none) - copied so the buffer itself is free to move on as the
-/// entity's own allocation while the views borrow this struct instead.
+/// The de-chunked layout of a wire buffer after [`compact`]: where the entity now lies inside it, plus the trailer
+/// lines copied out of it (tiny, usually none) - copied so the buffer itself is free to move on as the entity's own
+/// allocation while the views borrow this struct instead.
 pub(crate) struct Compacted {
     /// Entity offset within the wire buffer.
     pub start: usize,
@@ -452,9 +401,8 @@ pub(crate) struct Compacted {
 }
 
 impl Compacted {
-    /// The trailer views, borrowing this struct rather than the wire buffer
-    /// -- the reason the lines were copied out. The scan validated every line
-    /// already, so a failure here is a codec bug (callers answer 500).
+    /// The trailer views, borrowing this struct rather than the wire buffer -- the reason the lines were copied out.
+    /// The scan validated every line already, so a failure here is a codec bug (callers answer 500).
     pub(crate) fn trailers(&self) -> Result<Vec<HeaderView<'_>>, ()> {
         let mut out = Vec::with_capacity(self.trailer_lines.len());
         for line in &self.trailer_lines {
@@ -466,20 +414,16 @@ impl Compacted {
     }
 }
 
-/// The in-place twin of [`decode`], for a caller that **owns** the wire
-/// buffer: walk the same state machine, then make the entity contiguous
-/// inside `wire` without leaving the allocation. A single-payload message
-/// (the default botocore shape) moves no bytes at all - the entity is
-/// reported where it lies; a multi-payload message compacts its spans over
-/// the framing bytes with overlapping moves. The single-span, bare-trailer
-/// path allocates nothing. The framer's scan accepted these exact bytes as a
-/// complete message, so any failure is a codec bug - callers answer it as
-/// one (500), never as a client error.
+/// The in-place twin of [`decode`], for a caller that **owns** the wire buffer: walk the same state machine, then make
+/// the entity contiguous inside `wire` without leaving the allocation. A single-payload message (the default botocore
+/// shape) moves no bytes at all - the entity is reported where it lies; a multi-payload message compacts its spans over
+/// the framing bytes with overlapping moves. The single-span, bare-trailer path allocates nothing. The framer's scan
+/// accepted these exact bytes as a complete message, so any failure is a codec bug - callers answer it as one (500),
+/// never as a client error.
 pub(crate) fn compact(wire: &mut [u8]) -> Result<Compacted, ()> {
     let mut s = ChunkScan::default();
     let mut first: Option<Range<usize>> = None;
-    // Empty Vecs never allocate: these stay unallocated unless the message
-    // is multi-chunk / carries trailers.
+    // Empty Vecs never allocate: these stay unallocated unless the message is multi-chunk / carries trailers.
     let mut rest_spans: Vec<Range<usize>> = Vec::new();
     let mut trailer_lines: Vec<Vec<u8>> = Vec::new();
     {
@@ -510,8 +454,8 @@ pub(crate) fn compact(wire: &mut [u8]) -> Result<Compacted, ()> {
     let start = head_span.start;
     let mut end = head_span.end;
     for r in rest_spans {
-        // The destination never overtakes the source (framing bytes precede
-        // every span), and overlapping moves are copy_within's contract.
+        // The destination never overtakes the source (framing bytes precede every span), and overlapping moves are
+        // copy_within's contract.
         wire.copy_within(r.clone(), end);
         end += r.len();
     }
@@ -527,16 +471,12 @@ pub(crate) fn compact(wire: &mut [u8]) -> Result<Compacted, ()> {
 mod tests {
     use super::*;
 
-    /// The default boto3-over-TLS PutObject body, byte-for-byte as captured
-    /// on the dev box (boto3 1.37.9): one HTTP chunk wrapping the whole
-    /// aws-chunked entity, whose checksum trailer is *inside* the entity;
-    /// the HTTP layer terminates bare.
+    /// The default boto3 PutObject body over TLS, byte for byte. One HTTP chunk wraps the whole aws-chunked entity,
+    /// whose checksum trailer is *inside* the entity, and the HTTP layer terminates bare.
     fn botocore_wire() -> Vec<u8> {
         let mut wire = b"8e\r\n64\r\n".to_vec();
         wire.extend_from_slice(&[b'A'; 100]);
-        wire.extend_from_slice(
-            b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n\r\n0\r\n\r\n",
-        );
+        wire.extend_from_slice(b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n\r\n0\r\n\r\n");
         assert_eq!(wire.len(), 153);
         wire
     }
@@ -544,9 +484,7 @@ mod tests {
     fn botocore_entity() -> Vec<u8> {
         let mut entity = b"64\r\n".to_vec();
         entity.extend_from_slice(&[b'A'; 100]);
-        entity.extend_from_slice(
-            b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n",
-        );
+        entity.extend_from_slice(b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n");
         assert_eq!(entity.len(), 0x8e);
         entity
     }
@@ -558,8 +496,8 @@ mod tests {
         assert_eq!(scan(&wire, &mut s), Ok(Some(153)));
         assert_eq!(s.decoded, 0x8e);
         let (entity, trailers) = decode(&wire).expect("decodes");
-        // The HTTP band de-chunks its own layer only: the aws-chunked
-        // entity passes through untouched, and there are no HTTP trailers.
+        // The HTTP band de-chunks its own layer only: the aws-chunked entity passes through untouched, and there are no
+        // HTTP trailers.
         assert_eq!(&entity[..], botocore_entity());
         assert!(trailers.is_empty());
         // One HTTP chunk -> the entity is a borrow of the wire, not a copy.
@@ -568,9 +506,8 @@ mod tests {
 
     #[test]
     fn resumes_at_every_split_point() {
-        // Sans-io parsers fail on resumption, not on well-formed input:
-        // drip the golden body one byte at a time through a single
-        // persistent scan and assert the verdicts and extent.
+        // Sans-io parsers fail on resumption, not on well-formed input: drip the golden body one byte at a time through
+        // a single persistent scan and assert the verdicts and extent.
         let wire = botocore_wire();
         let mut s = ChunkScan::default();
         for cut in 0..wire.len() {
@@ -583,8 +520,7 @@ mod tests {
 
     #[test]
     fn multi_chunk_and_empty_entity() {
-        let (entity, trailers) =
-            decode(b"3\r\nfoo\r\n4\r\nbars\r\n0\r\n\r\n").expect("decodes");
+        let (entity, trailers) = decode(b"3\r\nfoo\r\n4\r\nbars\r\n0\r\n\r\n").expect("decodes");
         assert_eq!(&entity[..], b"foobars");
         assert!(trailers.is_empty());
         // Two payload spans force the stitch into an owned buffer.
@@ -597,9 +533,7 @@ mod tests {
 
     #[test]
     fn trailers_parsed_and_trimmed() {
-        let (entity, trailers) =
-            decode(b"0\r\nx-amz-checksum-crc32: abc==\r\nx-two:v\r\n\r\n")
-                .expect("decodes");
+        let (entity, trailers) = decode(b"0\r\nx-amz-checksum-crc32: abc==\r\nx-two:v\r\n\r\n").expect("decodes");
         assert!(entity.is_empty());
         assert_eq!(trailers.len(), 2);
         assert_eq!(trailers[0].name, "x-amz-checksum-crc32");
@@ -610,10 +544,9 @@ mod tests {
 
     #[test]
     fn forbidden_trailer_fields_dropped() {
-        // Framing, routing, and credential names cannot ride in trailers
-        // (RFC 9110 sec. 6.5.1): well-formed lines bearing them are consumed
-        // but never surfaced, so a consumer merging headers and trailers
-        // cannot have its framing or auth rewritten after the body.
+        // Framing, routing, and credential names cannot ride in trailers (RFC 9110 sec. 6.5.1): well-formed lines
+        // bearing them are consumed but never surfaced, so a consumer merging headers and trailers cannot have its
+        // framing or auth rewritten after the body.
         let wire = b"0\r\n\
             Content-Length: 999\r\n\
             Transfer-Encoding: chunked\r\n\
@@ -632,18 +565,14 @@ mod tests {
 
     #[test]
     fn extensions_ignored() {
-        let (entity, _) =
-            decode(b"5;name=val\r\nhello\r\n0\r\n\r\n").expect("decodes");
+        let (entity, _) = decode(b"5;name=val\r\nhello\r\n0\r\n\r\n").expect("decodes");
         assert_eq!(&entity[..], b"hello");
-        let (entity, _) =
-            decode(b"5 ;x\r\nhello\r\n0\r\n\r\n").expect("decodes");
+        let (entity, _) = decode(b"5 ;x\r\nhello\r\n0\r\n\r\n").expect("decodes");
         assert_eq!(&entity[..], b"hello");
     }
 
-    /// A chunk-at-a-time walk over the golden botocore wire: one payload
-    /// extent, then the terminal chunk with its trailer section. The whole
-    /// point is that neither answer needs the rest of the message present,
-    /// which is what lets a caller consume each chunk and forget it.
+    /// A chunk-at-a-time walk over the golden wire gives one payload extent, then the terminal chunk with its trailer
+    /// section, and neither answer needs the rest of the message present.
     #[test]
     fn step_walks_a_body_one_chunk_at_a_time() {
         let wire = botocore_wire();
@@ -655,34 +584,21 @@ mod tests {
         assert_eq!(payload, 0x8e, "the size line's own declaration");
         // Consume framing + payload; the CRLF closing it is the next step's.
         let rest = &wire[framing + payload..];
-        assert_eq!(
-            step(rest, true),
-            Step::Last {
-                framing: rest.len()
-            }
-        );
+        assert_eq!(step(rest, true), Step::Last { framing: rest.len() });
     }
 
-    /// The CRLF closing a payload belongs to the next step, so a caller's
-    /// cursor sits on a payload boundary at every point. Anything else there
-    /// is a framing error, not a short read.
+    /// The CRLF closing a payload belongs to the next step, so a caller's cursor sits on a payload boundary at every
+    /// point. Anything else there is a framing error, not a short read.
     #[test]
     fn step_eats_the_crlf_that_closed_the_last_payload() {
         assert_eq!(step(b"", true), Step::More);
         assert_eq!(step(b"\r", true), Step::More, "a CRLF prefix may grow");
         assert_eq!(step(b"XX4\r\n", true), Step::Bad(400));
-        assert_eq!(
-            step(b"\r\n4\r\n", true),
-            Step::Chunk {
-                framing: 5,
-                payload: 4
-            }
-        );
+        assert_eq!(step(b"\r\n4\r\n", true), Step::Chunk { framing: 5, payload: 4 });
     }
 
-    /// Sans-io parsers fail on resumption. Every prefix short of a decision
-    /// must answer `More` rather than guess, and the decision must not move
-    /// once it is reachable.
+    /// Sans-io parsers fail on resumption. Every prefix short of a decision must answer `More` rather than guess, and
+    /// the decision must not move once it is reachable.
     #[test]
     fn step_resumes_at_every_split_point() {
         let wire = botocore_wire();
@@ -695,9 +611,8 @@ mod tests {
         }
     }
 
-    /// The shape boto3 actually sends over TLS: 128 KiB HTTP chunks wrapping
-    /// a 1 MiB aws-chunked stream. The walk sees only the outer layer - the
-    /// inner size line is payload here, and stripping it is the S3 band's.
+    /// The shape boto3 sends over TLS, 128 KiB HTTP chunks wrapping a 1 MiB aws-chunked stream. The walk sees only the
+    /// outer layer, and the inner size line is payload.
     #[test]
     fn step_sees_only_the_outer_framing() {
         let mut wire = b"20000\r\n".to_vec();
@@ -714,8 +629,8 @@ mod tests {
         );
     }
 
-    /// A malformed size line is refused here rather than left for a reader
-    /// that might frame it differently - the same rule `scan` applies.
+    /// A malformed size line is refused here rather than left for a reader that might frame it differently - the same
+    /// rule `scan` applies.
     #[test]
     fn step_refuses_what_scan_refuses() {
         assert_eq!(step(b"zz\r\n", false), Step::Bad(400));
@@ -727,14 +642,12 @@ mod tests {
     }
 
     fn scan_err(wire: &[u8]) -> u16 {
-        scan(wire, &mut ChunkScan::default())
-            .expect_err("expected a scan error")
+        scan(wire, &mut ChunkScan::default()).expect_err("expected a scan error")
     }
 
     #[test]
     fn malformed_is_400() {
-        // Non-hex size; garbage after digits; bare-LF line; missing CRLF
-        // after payload; size overflow (17 hex digits).
+        // Non-hex size; garbage after digits; bare-LF line; missing CRLF after payload; size overflow (17 hex digits).
         assert_eq!(scan_err(b"zz\r\n"), 400);
         assert_eq!(scan_err(b"5x\r\nhello\r\n0\r\n\r\n"), 400);
         assert_eq!(scan_err(b"5\nhello\r\n0\r\n\r\n"), 400);
@@ -748,20 +661,15 @@ mod tests {
 
     #[test]
     fn a_trailer_value_cannot_carry_a_field_line() {
-        // A bare LF or CR inside a value smuggles a forbidden field past
-        // the name-only screen the moment any consumer splits the surfaced
-        // value on line breaks; RFC 9110 sec. 5.5 admits no control byte in a
-        // field value, so the line is malformed, not data.
-        assert_eq!(
-            scan_err(b"0\r\nx-ok: v\nAuthorization: Basic Zm9v\r\n\r\n"),
-            400
-        );
+        // A bare LF or CR inside a value smuggles a forbidden field past the name-only screen the moment any consumer
+        // splits the surfaced value on line breaks; RFC 9110 sec. 5.5 admits no control byte in a field value, so the
+        // line is malformed, not data.
+        assert_eq!(scan_err(b"0\r\nx-ok: v\nAuthorization: Basic Zm9v\r\n\r\n"), 400);
         assert_eq!(scan_err(b"0\r\nx-ok: v\rHost: evil\r\n\r\n"), 400);
         assert_eq!(scan_err(b"0\r\nx-ok: a\x00b\r\n\r\n"), 400);
         assert_eq!(scan_err(b"0\r\nx-ok: a\x7fb\r\n\r\n"), 400);
         // Horizontal tab is the one control byte a value admits.
-        let (_, trailers) =
-            decode(b"0\r\nx-ok: a\tb\r\n\r\n").expect("decodes");
+        let (_, trailers) = decode(b"0\r\nx-ok: a\tb\r\n\r\n").expect("decodes");
         assert_eq!(trailers[0].value, b"a\tb");
     }
 
@@ -787,15 +695,13 @@ mod tests {
 
     #[test]
     fn bare_cr_or_lf_in_a_size_or_trailer_line_is_400() {
-        // A bare CR or LF earlier in a size line, usually inside a chunk
-        // extension, is rejected rather than left in place: the line is
-        // CRLF-terminated, and accepting it would let an LF-tolerant peer
-        // frame the body differently.
+        // A bare CR or LF earlier in a size line, usually inside a chunk extension, is rejected rather than left in
+        // place: the line is CRLF-terminated, and accepting it would let an LF-tolerant peer frame the body
+        // differently.
         assert_eq!(scan_err(b"1;x\n1\r\nA\r\n0\r\n\r\n"), 400);
         assert_eq!(scan_err(b"1;a\rb\r\nA\r\n0\r\n\r\n"), 400);
         assert_eq!(scan_err(b"2;\nxx\r\n0\r\n\r\n"), 400);
-        // The same rule on a trailer line, including a leading bare CR that
-        // trimming the value would otherwise hide.
+        // The same rule on a trailer line, including a leading bare CR that trimming the value would otherwise hide.
         assert_eq!(scan_err(b"0\r\nx-ok: \rvalue\r\n\r\n"), 400);
         assert_eq!(scan_err(b"0\r\nx-a\n: 1\r\n\r\n"), 400);
     }
@@ -804,24 +710,23 @@ mod tests {
 
     #[test]
     fn empty_chunk_size_line_is_400() {
-        // A CRLF where a chunk size is expected has no hex digit; treating it
-        // as a zero-size terminator would leave a stray CRLF in front of the
-        // next message.
+        // A CRLF where a chunk size is expected has no hex digit; treating it as a zero-size terminator would leave a
+        // stray CRLF in front of the next message.
         assert_eq!(scan_err(b"\r\n\r\n"), 400);
         assert_eq!(scan_err(b"1\r\nZ\r\n\r\n\r\n"), 400);
     }
 
     #[test]
     fn chunk_data_shorter_than_declared_is_400() {
-        // Five bytes declared, three supplied: the footer check sees "0\r"
-        // instead of CRLF, so the message is malformed, not complete.
+        // Five bytes declared, three supplied: the footer check sees "0\r" instead of CRLF, so the message is
+        // malformed, not complete.
         assert_eq!(scan_err(b"5\r\nabc\r\n0\r\n\r\n"), 400);
     }
 
     #[test]
     fn chunk_size_radix_and_sign_is_400() {
-        // A chunk size is bare hex: no 0x prefix, no sign, no leading space.
-        // 0x0 is the case a lax parser could misread as the terminator.
+        // A chunk size is bare hex: no 0x prefix, no sign, no leading space. 0x0 is the case a lax parser could misread
+        // as the terminator.
         assert_eq!(scan_err(b"0x5\r\nhello\r\n0\r\n\r\n"), 400);
         assert_eq!(scan_err(b"0x0\r\n\r\n"), 400);
         assert_eq!(scan_err(b"+5\r\nhello\r\n0\r\n\r\n"), 400);
@@ -831,19 +736,14 @@ mod tests {
 
     #[test]
     fn max_chunk_size_is_accepted_awaiting_payload() {
-        // Sixteen hex digits is usize::MAX: parsed without overflow, then
-        // awaiting payload. The size parse does not bound the body - the
-        // decoded-size cap does - and seventeen digits overflow to 400.
-        assert_eq!(
-            scan(b"ffffffffffffffff\r\n", &mut ChunkScan::default()),
-            Ok(None)
-        );
+        // Sixteen hex digits is usize::MAX: parsed without overflow, then awaiting payload. The size parse does not
+        // bound the body - the decoded-size cap does - and seventeen digits overflow to 400.
+        assert_eq!(scan(b"ffffffffffffffff\r\n", &mut ChunkScan::default()), Ok(None));
     }
 
     #[test]
     fn chunk_footer_requires_exact_crlf() {
-        // Both bytes of a chunk's trailing CRLF are checked, including when
-        // the two arrive in separate reads.
+        // Both bytes of a chunk's trailing CRLF are checked, including when the two arrive in separate reads.
         assert_eq!(scan_err(b"3\r\nabcX\r\n1a\r\n"), 400); // first byte
         assert_eq!(scan_err(b"3\r\nabc\rX\r\n1a\r\n"), 400); // second byte
         let mut s = ChunkScan::default();
@@ -853,33 +753,25 @@ mod tests {
 
     #[test]
     fn scan_does_not_grow_past_the_terminal_chunk() {
-        // Once the terminal chunk is seen the extent is fixed; bytes of a
-        // following pipelined message are not absorbed into it.
+        // Once the terminal chunk is seen the extent is fixed; bytes of a following pipelined message are not absorbed
+        // into it.
         let mut s = ChunkScan::default();
         assert_eq!(scan(b"0\r\n\r\n", &mut s), Ok(Some(5)));
-        assert_eq!(
-            scan(b"0\r\n\r\nGET /next HTTP/1.1\r\n\r\n", &mut s),
-            Ok(Some(5))
-        );
+        assert_eq!(scan(b"0\r\n\r\nGET /next HTTP/1.1\r\n\r\n", &mut s), Ok(Some(5)));
     }
 
     #[test]
     fn lf_only_line_endings_never_complete() {
-        // LF-only line endings are not CRLF, so the scan keeps asking for
-        // more and never completes on a lone LF.
-        assert_eq!(
-            scan(b"5\nhello\n0\n\n", &mut ChunkScan::default()),
-            Ok(None)
-        );
+        // LF-only line endings are not CRLF, so the scan keeps asking for more and never completes on a lone LF.
+        assert_eq!(scan(b"5\nhello\n0\n\n", &mut ChunkScan::default()), Ok(None));
         assert_eq!(scan(b"0\n\n", &mut ChunkScan::default()), Ok(None));
     }
 
     #[test]
     fn resumes_through_a_trailer_section() {
-        // Feed a multi-chunk body with a trailer section one byte at a time
-        // through a single scan: every prefix asks for more, then the whole
-        // extent completes, and the trailer-section byte count is not
-        // double-counted across re-entry.
+        // Feed a multi-chunk body with a trailer section one byte at a time through a single scan: every prefix asks
+        // for more, then the whole extent completes, and the trailer-section byte count is not double-counted across
+        // re-entry.
         let wire = b"3\r\nfoo\r\n4\r\nbars\r\n0\r\nx-a: 1\r\nx-b: 2\r\n\r\n";
         let mut s = ChunkScan::default();
         for cut in 0..wire.len() {
@@ -893,16 +785,15 @@ mod tests {
 
     #[test]
     fn decode_rejects_trailing_garbage() {
-        // decode requires the message to occupy the wire exactly - the
-        // framer only ever hands it a complete extent.
+        // decode requires the message to occupy the wire exactly - the framer only ever hands it a complete extent.
         assert!(decode(b"0\r\n\r\nEXTRA").is_err());
         assert!(decode(b"0\r\n").is_err());
     }
 
     #[test]
     fn compact_single_chunk_moves_nothing() {
-        // The default botocore shape is one payload span: compact reports
-        // the entity where it lies and the wire is byte-for-byte untouched.
+        // The default botocore shape is one payload span: compact reports the entity where it lies and the wire is
+        // byte-for-byte untouched.
         let mut wire = botocore_wire();
         let orig = wire.clone();
         let c = compact(&mut wire).expect("compacts");
@@ -924,9 +815,8 @@ mod tests {
 
     #[test]
     fn compact_agrees_with_decode() {
-        // The in-place twin against the copying oracle, across the shapes
-        // that matter: golden, multi-chunk, empty entity, trailers (with
-        // the forbidden set dropped), extensions.
+        // The in-place twin against the copying oracle, across the shapes that matter: golden, multi-chunk, empty
+        // entity, trailers (with the forbidden set dropped), extensions.
         let shapes: Vec<Vec<u8>> = vec![
             botocore_wire(),
             b"3\r\nfoo\r\n4\r\nbars\r\n0\r\n\r\n".to_vec(),

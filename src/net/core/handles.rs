@@ -1,31 +1,22 @@
-//! Core cross-thread primitives shared by the server and client roles: the
-//! wake eventfd and the routing tokens hand-offs ride on, the generation-
-//! stamped handshake hand-back, the shared loop flags, and the stats cells the
-//! loop increments. Each role builds its own public handles (deferred replies,
-//! pushes, shutdown) on top of these.
+//! Core cross-thread primitives shared by the server and client roles: the wake eventfd and the routing tokens
+//! hand-offs ride on, the generation- stamped handshake hand-back, the shared loop flags, and the stats cells the loop
+//! increments. Each role builds its own public handles (deferred replies, pushes, shutdown) on top of these.
 
 use crate::net::core::protocol::{ClientAddr, CloseReason};
 #[cfg(all(doc, feature = "net-server"))]
-use crate::net::server::{
-    Deferred, Protocol, PushHandle, Server, ShutdownHandle, StatsHandle,
-};
+use crate::net::server::{Deferred, Protocol, PushHandle, Server, ShutdownHandle, StatsHandle};
 use crate::sync::Arc;
 use crate::uring::wake::LoopShared;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 
-/// The ticket a kTLS handshake worker uses to hand a connection back to the
-/// server once the handshake finishes (or fails).
+/// The ticket a kTLS handshake worker uses to hand a connection back to the server once the handshake finishes (or
+/// fails).
 ///
-/// Furnished - with a real socket fd - to the [`Server::set_tls_handshake`]
-/// handler for one accepted connection. Move it (and the fd) to your own
-/// worker, run the TLS handshake (which installs kTLS on the socket), and call
-/// [`AcceptDeferral::ready`] with the per-connection state on success - which
-/// confirms the kernel actually holds both directions' keys before anything
-/// is served - or [`AcceptDeferral::reject`] on failure. Dropping it without either **rejects**
-/// the connection, so a panicked/lost worker can't leak the parked slot. The
-/// state `U` crosses to the loop thread here (hence `Send` when `U: Send`), but
-/// only once, before serving begins - there is never concurrent access.
+/// Furnished with a real socket fd to the [`Server::set_tls_handshake`] handler for one accepted connection. Move it
+/// and the fd to your own worker, run the TLS handshake, and call [`AcceptDeferral::ready`] with the per-connection
+/// state on success or [`AcceptDeferral::reject`] on failure. Dropping it without either rejects the connection, so a
+/// lost worker cannot leak the parked slot. The state `U` crosses to the loop thread once, before serving begins.
 #[must_use = "call ready(state) or reject(), or the connection is dropped"]
 pub struct AcceptDeferral<U> {
     pub(crate) slot: u32,
@@ -33,43 +24,35 @@ pub struct AcceptDeferral<U> {
     pub(crate) tx: mpsc::Sender<HandshakeOutcome<U>>,
     pub(crate) shared: Arc<LoopShared>,
     pub(crate) done: bool,
-    /// The deferral's own alias of the socket, for [`ready`]'s key
-    /// readback (`AcceptDeferral::ready`). A dup rather than the furnished
-    /// fd's number, because the worker owns that fd and may close it - a
-    /// number can be reused, an open description cannot.
+    /// The deferral's own alias of the socket, for [`ready`]'s key readback (`AcceptDeferral::ready`). A dup rather
+    /// than the furnished fd's number, because the worker owns that fd and may close it - a number can be reused, an
+    /// open description cannot.
     pub(crate) sock: std::os::fd::OwnedFd,
 }
 
 impl<U> AcceptDeferral<U> {
-    /// The handshake succeeded and kTLS is active on the socket: install the
-    /// connection with per-connection state `state` and begin serving it over
-    /// the kernel-TLS transport. Consumes the handle.
+    /// The handshake succeeded and kTLS is active on the socket: install the connection with per-connection state
+    /// `state` and begin serving it over the kernel-TLS transport. Consumes the handle.
     ///
-    /// The worker's word is checked against the kernel before anything is
-    /// served: both TLS directions must actually hold keys
-    /// (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`), or the connection is shed as
-    /// if rejected. A socket the kernel never keyed (a handshake library
-    /// that silently fell back to userspace records, or keyed only one
-    /// direction) passes bytes through in the clear, so serving it as
-    /// encrypted would publish plaintext framed as TLS.
+    /// The worker's word is checked against the kernel before anything is served: both TLS directions must actually
+    /// hold keys (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`), or the connection is shed as if rejected. A socket the kernel
+    /// never keyed (a handshake library that silently fell back to userspace records, or keyed only one direction)
+    /// passes bytes through in the clear, so serving it as encrypted would publish plaintext framed as TLS.
     pub fn ready(mut self, state: U) {
         self.done = true;
-        let keyed = crate::net::core::probe::ktls_keyed_both_ways(
-            std::os::fd::AsRawFd::as_raw_fd(&self.sock),
-        );
+        let keyed = crate::net::core::probe::ktls_keyed_both_ways(std::os::fd::AsRawFd::as_raw_fd(&self.sock));
         self.send(if keyed { Ok(state) } else { Err(()) });
     }
 
-    /// The handshake failed (or the connection is unwanted): shed it. Consumes
-    /// the handle.
+    /// The handshake failed (or the connection is unwanted): shed it. Consumes the handle.
     pub fn reject(mut self) {
         self.done = true;
         self.send(Err(()));
     }
 
     fn send(&mut self, result: Result<U, ()>) {
-        // The server owns the receiver for its whole life; a send error just
-        // means it has shut down, in which case the outcome is moot.
+        // The server owns the receiver for its whole life; a send error just means it has shut down, in which case the
+        // outcome is moot.
         let _ = self.tx.send(HandshakeOutcome {
             slot: self.slot,
             generation: self.generation,
@@ -103,8 +86,8 @@ pub(crate) struct HandshakeOutcome<U> {
     pub(crate) result: Result<U, ()>,
 }
 
-/// Shared counter cells behind [`StatsHandle`]; the loop thread is the single
-/// writer (Relaxed increments), snapshots read Relaxed.
+/// Shared counter cells behind [`StatsHandle`]; the loop thread is the single writer (Relaxed increments), snapshots
+/// read Relaxed.
 #[derive(Debug, Default)]
 pub(crate) struct StatsInner {
     pub(crate) accepted: AtomicU64,
@@ -125,48 +108,38 @@ pub(crate) struct StatsInner {
     pub(crate) recv_ops: AtomicU64,
     pub(crate) bytes_in: AtomicU64,
     pub(crate) bytes_out: AtomicU64,
-    /// Gauges, not counters: stored outright at each pool mutation rather
-    /// than incremented.
+    /// Gauges, not counters: stored outright at each pool mutation rather than incremented.
     #[cfg(feature = "net-server")]
     pub(crate) recv_bufs_lent: AtomicU64,
     #[cfg(feature = "net-server")]
     pub(crate) recv_bufs_total: AtomicU64,
-    /// Reads parked on a `RecvRetry` backoff because the pool was at its
-    /// bound with every buffer lent (counts parks, not connections).
+    /// Reads parked on a `RecvRetry` backoff because the pool was at its bound with every buffer lent (counts parks,
+    /// not connections).
     #[cfg(feature = "net-server")]
     pub(crate) recv_shortage_parks: AtomicU64,
     /// Reads that found a provided-buffer ring dry (`-ENOBUFS`).
     #[cfg(feature = "net-server")]
     pub(crate) buf_shortages: AtomicU64,
-    /// Provided-buffer rings `RLIMIT_MEMLOCK` refused at construction.
-    /// Written once, before the loop starts.
+    /// Provided-buffer rings `RLIMIT_MEMLOCK` refused at construction. Written once, before the loop starts.
     #[cfg(feature = "net-server")]
     pub(crate) buf_rings_refused_memlock: AtomicU64,
 }
 
 /// Bump a stats counter (single-writer loop thread; Relaxed is sufficient).
 macro_rules! stat {
-    // Absolute `Ordering` path: the macro expands in the sibling stage
-    // modules, which do not all import it.
+    // Absolute `Ordering` path: the macro expands in the sibling stage modules, which do not all import it.
     ($self:expr, $field:ident) => {
-        $self
-            .stats
-            .$field
-            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
+        $self.stats.$field.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
     };
     ($self:expr, $field:ident, $n:expr) => {
-        $self
-            .stats
-            .$field
-            .fetch_add($n, ::std::sync::atomic::Ordering::Relaxed)
+        $self.stats.$field.fetch_add($n, ::std::sync::atomic::Ordering::Relaxed)
     };
 }
 pub(crate) use stat;
 
-/// Routing key for a deferred reply: which pool slot, which connection
-/// generation (so a reply for a recycled slot is dropped), and which request on
-/// that connection (so a reply for a request that was already answered - e.g. a
-/// worker outliving an inline reply - is dropped instead of duplicated).
+/// Routing key for a deferred reply: which pool slot, which connection generation (so a reply for a recycled slot is
+/// dropped), and which request on that connection (so a reply for a request that was already answered - e.g. a worker
+/// outliving an inline reply - is dropped instead of duplicated).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Token {
     pub(crate) slot: u32,
@@ -174,7 +147,6 @@ pub(crate) struct Token {
     pub(crate) req_id: u64,
 }
 
-/// The close hook ([`Server::set_close_hook`]): `(peer, reason, &mut state)`,
-/// once per connection at its first transition to closing. Boxed dyn: cold
-/// path, keeps [`Protocol`] at three closures.
+/// The close hook ([`Server::set_close_hook`]): `(peer, reason, &mut state)`, once per connection at its first
+/// transition to closing. Boxed dyn: cold path, keeps [`Protocol`] at three closures.
 pub(crate) type CloseHook<U> = Box<dyn FnMut(&ClientAddr, CloseReason, &mut U)>;

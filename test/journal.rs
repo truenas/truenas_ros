@@ -1,14 +1,12 @@
 //! The journal transport against the real journald.
 //!
-//! Records go to the journal's own socket and are read back with
-//! `journalctl -o export`, found by a field that names the run, so the test
-//! checks what journald kept and not only what was sent. One case runs this
-//! binary again as a systemd service of its own, where systemd sets
-//! `JOURNAL_STREAM`, to check that `Journal::open` chooses the socket there.
+//! Records go to the journal's own socket and are read back with `journalctl -o export`, found by a field that names
+//! the run, so the test checks what journald kept and not only what was sent. One case runs this binary again as a
+//! systemd service of its own, where systemd sets `JOURNAL_STREAM`, to check that `Journal::open` chooses the socket
+//! there.
 //!
-//! A machine with no journald, or one whose journal this user cannot read,
-//! skips. `TRUENAS_ROS_REQUIRE_JOURNAL` turns either skip into a failure, as
-//! the QEMU job sets it, where systemd runs and the job is root.
+//! A machine with no journald, or one whose journal this user cannot read, skips. `TRUENAS_ROS_REQUIRE_JOURNAL` turns
+//! either skip into a failure, as the QEMU job sets it, where systemd runs and the job is root.
 #![cfg(all(target_os = "linux", feature = "log"))]
 
 #[path = "support/privilege.rs"]
@@ -55,27 +53,21 @@ fn journal_or_skip() -> bool {
 
 /// A value no other run gives, for the field the records are found by.
 fn run_id(what: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     format!("{what}-{}-{nanos}", std::process::id())
 }
 
 /// A logger that sends to journald's socket whatever the environment says.
 fn native() -> (Arc<Journal>, Logger) {
-    let journal =
-        Arc::new(Journal::native(IDENTIFIER, Level::Debug, SOCKET).unwrap());
+    let journal = Arc::new(Journal::native(IDENTIFIER, Level::Debug, SOCKET).unwrap());
     (Arc::clone(&journal), Logger::new(journal))
 }
 
 /// One entry of `journalctl -o export`, its fields in order.
 type Entry = Vec<(String, Vec<u8>)>;
 
-/// The entries of the export format. A field is `NAME=value` and a newline,
-/// or for a value that is not plain text, `NAME`, a newline, its length in
-/// 64 bits little endian, the value and a newline. An empty line ends an
-/// entry.
+/// The entries of the export format. A field is `NAME=value` and a newline, or for a value that is not plain text,
+/// `NAME`, a newline, its length in 64 bits little endian, the value and a newline. An empty line ends an entry.
 fn parse_export(mut bytes: &[u8]) -> Vec<Entry> {
     let mut entries = Vec::new();
     let mut entry = Entry::new();
@@ -117,10 +109,9 @@ fn field<'a>(entry: &'a Entry, name: &str) -> Option<&'a str> {
         .map(|(_, v)| std::str::from_utf8(v).expect("UTF-8"))
 }
 
-/// The entries whose `TRUENAS_ROS_TEST` is `id`, once there are `want` of
-/// them. journald may take a moment to write, so this asks for up to ten
-/// seconds. None means they never came, which skips unless the journal is
-/// required, since a user outside the journal's group reads none of it.
+/// The entries whose `TRUENAS_ROS_TEST` is `id`, once there are `want` of them. journald may take a moment to write, so
+/// this asks for up to ten seconds. None means they never came, which skips unless the journal is required, since a
+/// user outside the journal's group reads none of it.
 fn read_back(id: &str, want: usize) -> Option<Vec<Entry>> {
     let until = Instant::now() + Duration::from_secs(10);
     loop {
@@ -170,8 +161,7 @@ fn a_record_lands_with_its_level_name_source_and_fields() {
     assert!(file.ends_with("journal.rs"), "{file}");
     let line: u32 = field(entry, "CODE_LINE").unwrap().parse().unwrap();
     assert!(line > 0);
-    // journald's own field says the record came by its protocol and not as
-    // a line of stderr.
+    // journald's own field says the record came by its protocol and not as a line of stderr.
     assert_eq!(field(entry, "_TRANSPORT"), Some("journal"));
 }
 
@@ -184,12 +174,7 @@ fn each_level_lands_as_its_priority() {
     let id = run_id("levels");
     for level in Level::ALL {
         let name = level.as_str();
-        truenas_ros::log!(
-            logger,
-            level,
-            [TRUENAS_ROS_TEST = id, LEVEL = name],
-            "at {name}"
-        );
+        truenas_ros::log!(logger, level, [TRUENAS_ROS_TEST = id, LEVEL = name], "at {name}");
     }
     let Some(entries) = read_back(&id, Level::ALL.len()) else {
         return;
@@ -204,8 +189,7 @@ fn each_level_lands_as_its_priority() {
     }
 }
 
-/// A value with a newline is sent with its length, and journald keeps it
-/// whole, as it keeps a message with a newline.
+/// A value with a newline is sent with its length, and journald keeps it whole, as it keeps a message with a newline.
 #[test]
 fn a_value_with_a_newline_lands_whole() {
     if !journal_or_skip() {
@@ -227,8 +211,7 @@ fn a_value_with_a_newline_lands_whole() {
     assert_eq!(field(&entries[0], "MESSAGE"), Some("two\nlines"));
 }
 
-/// A value past the limit lands cut after the last whole character that
-/// fits, with the mark of a cut after it.
+/// A value past the limit lands cut after the last whole character that fits, with the mark of a cut after it.
 #[test]
 fn a_long_value_lands_cut_at_the_limit() {
     if !journal_or_skip() {
@@ -237,12 +220,7 @@ fn a_long_value_lands_cut_at_the_limit() {
     let (_journal, logger) = native();
     let id = run_id("long");
     let long = "é".repeat(MAX_VALUE);
-    truenas_ros::log!(
-        logger,
-        Level::Notice,
-        [TRUENAS_ROS_TEST = id, LONG = long],
-        "long"
-    );
+    truenas_ros::log!(logger, Level::Notice, [TRUENAS_ROS_TEST = id, LONG = long], "long");
     let Some(entries) = read_back(&id, 1) else {
         return;
     };
@@ -251,9 +229,8 @@ fn a_long_value_lands_cut_at_the_limit() {
     assert_eq!(kept, want);
 }
 
-/// `open` chooses the socket exactly when systemd said stderr is the
-/// journal. The socket is addressed at each send and never connected, so
-/// it is chosen even when journald is not there yet.
+/// `open` chooses the socket exactly when systemd said stderr is the journal. The socket is addressed at each send and
+/// never connected, so it is chosen even when journald is not there yet.
 #[test]
 fn open_follows_the_stream_variable() {
     let journal = Journal::open(IDENTIFIER, Level::Notice);
@@ -261,10 +238,9 @@ fn open_follows_the_stream_variable() {
     assert_eq!(journal.is_native(), stream);
 }
 
-/// This binary runs again as a service of its own, which runs only
-/// `child_under_a_unit`. systemd sets `JOURNAL_STREAM` there, so `open`
-/// must choose the socket, and the record must arrive by the journal's
-/// protocol rather than as a line of the service's stderr.
+/// This binary runs again as a service of its own, which runs only `child_under_a_unit`. systemd sets `JOURNAL_STREAM`
+/// there, so `open` must choose the socket, and the record must arrive by the journal's protocol rather than as a line
+/// of the service's stderr.
 #[test]
 fn open_chooses_the_socket_under_a_unit() {
     if !journal_or_skip() || !privilege::root_or_skip("systemd-run") {
@@ -293,8 +269,7 @@ fn open_chooses_the_socket_under_a_unit() {
     assert_eq!(field(&entries[0], "_TRANSPORT"), Some("journal"));
 }
 
-/// The child of `open_chooses_the_socket_under_a_unit`, run as a service.
-/// Run any other way it does nothing.
+/// The child of `open_chooses_the_socket_under_a_unit`, run as a service. Run any other way it does nothing.
 #[test]
 #[ignore = "run only as a service by open_chooses_the_socket_under_a_unit"]
 fn child_under_a_unit() {
@@ -305,10 +280,5 @@ fn child_under_a_unit() {
     let journal = Journal::open(IDENTIFIER, Level::Notice);
     assert!(journal.is_native(), "JOURNAL_STREAM chose the socket");
     let logger = Logger::new(Arc::new(journal));
-    truenas_ros::log!(
-        logger,
-        Level::Notice,
-        [TRUENAS_ROS_TEST = id],
-        "from a unit"
-    );
+    truenas_ros::log!(logger, Level::Notice, [TRUENAS_ROS_TEST = id], "from a unit");
 }

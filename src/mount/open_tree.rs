@@ -26,20 +26,14 @@ tn_bitflags! {
 /// Open the mount object or directory tree at `path` relative to `dirfd`.
 ///
 /// See [`open_tree(2)`](https://man7.org/linux/man-pages/man2/open_tree.2.html).
-pub fn open_tree<P, Fd>(
-    dirfd: Fd,
-    path: &P,
-    flags: OpenTreeFlags,
-) -> errno::Result<OwnedFd>
+pub fn open_tree<P, Fd>(dirfd: Fd, path: &P, flags: OpenTreeFlags) -> errno::Result<OwnedFd>
 where
     P: ?Sized + TnPath,
     Fd: AsFd,
 {
     let raw = dirfd.as_fd().as_raw_fd();
     let fd = path.with_tn_path(|c| {
-        retry_on_eintr(|| unsafe {
-            libc::syscall(libc::SYS_open_tree, raw, c.as_ptr(), flags.bits())
-        })
+        retry_on_eintr(|| unsafe { libc::syscall(libc::SYS_open_tree, raw, c.as_ptr(), flags.bits()) })
     })??;
     // SAFETY: open_tree returns a fresh owned fd on success.
     Ok(unsafe { owned_from_raw(fd as RawFd) })

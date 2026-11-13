@@ -275,15 +275,17 @@ Do not reopen these without a reason that is new.
   heads.
 - **The ring is a conveyor of descriptors, not a slab.** Each descriptor
   carries its own address, so buffers are allocated and posted on demand
-  (SPDK's `uring_sock_group_populate_buf_ring`). A buffer is freed only in
-  `BufRing::release`, after the kernel has handed it back - a per-buffer
-  question, where a slab would need a whole-pool proof that nothing is lent.
-  Buffers are allocated uninitialized: every reader stops at the bytes the
-  kernel wrote (`post`).
-- **Shrinking lowers the target; buffers follow as they cycle.** A posted
-  descriptor cannot be retracted, so surplus is given up in `release`, one
-  buffer per cycle. A pool that goes silent keeps its residue, bounded by
-  the ring.
+  (SPDK's `uring_sock_group_populate_buf_ring`). A buffer's storage is freed
+  only by `BufRing::trim`, and only for an id neither posted nor lent, a
+  per-buffer question where a slab would need a whole-pool proof that
+  nothing is lent. Buffers are allocated uninitialized, since every reader
+  stops at the bytes the kernel wrote (`post`).
+- **Shrinking lowers the target, and buffers follow as they cycle.** A
+  posted descriptor cannot be retracted, so `release` keeps a surplus
+  buffer out of the ring, and `BufPool::rebalance` frees what is out and
+  halves the target once the pool has stayed quiet for `SHRINK_AFTER` idle
+  rounds. A pool that goes silent keeps the buffers still posted, bounded
+  by the ring.
 - **Gathering a message out of several buffers does not transfer here**
   (SPDK's `recv_stream`): a head scan needs contiguous bytes, and the join
   is the copy the ring exists to avoid. SPDK's dry-ring fallback does
@@ -674,9 +676,15 @@ separate commits even when they ship together.
 
 Write for the next person changing the code, not to defend the last change.
 
+A comment says only what the code cannot, an invariant, a constraint, a
+reason, or a warning that stops a plausible wrong change, in a few
+sentences. It leaves out the history of the code, how a problem was found
+and who found it, a figure from one run or commit, and what the code
+already says. The reasoning of a Settled decision lives at the code it
+names, and is not repeated anywhere else. A `// SAFETY:` comment gives the
+reason the block is sound and nothing else.
+
 - No back-compatibility apparatus for consumers that do not exist.
-- Do not narrate past mistakes ("the previous behaviour was X"); state the
-  constraint and the consequence.
 - Do keep a warning that stops a plausible wrong simplification.
   `is_subtree_skip` in `uring_fs/query_tree.rs` is the shape to copy.
 - Do not name a consumer of the crate; say what a consumer relies on, as
@@ -685,6 +693,28 @@ Write for the next person changing the code, not to defend the last change.
 Cite sources rather than asserting behaviour: kernel and ZFS claims are
 checked against `/CODE/linux` and `/CODE/zfs` and cited by function or
 `file:line`.
+
+Code and comments wrap at 120 columns, and Markdown at 80. `rustfmt.toml`
+sets the width for code, and a comment is filled to it by hand, since
+rustfmt leaves comments as they are.
+
+## Splitting files
+
+A file past 1,500 lines is split, tests and code alike, in a commit of its
+own.
+
+A split moves code and changes nothing else. Every item keeps its name and
+the path it is reached by, through a re-export where it moved into a new
+module, and its visibility widens only as far as the move needs. A test
+binary stays one binary, its root at the path `Cargo.toml` names and its
+parts in the folder of that name beside it. A test keeps its name and stays
+under every path a workflow picks it by, the filters, skips and `--exact`
+probe of `miri.yml` among them.
+
+A split keeps the number of tests each target runs, in debug and in
+release, and the counts CI asserts, `MODELS`, `MIRI_TESTS` and
+`MIRI_HTTP_TESTS`. `git diff --color-moved` shows it as moved lines, and
+the only new lines are module declarations, imports and visibility.
 
 ## The gate
 

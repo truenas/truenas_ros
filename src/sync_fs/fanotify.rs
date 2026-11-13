@@ -1,22 +1,17 @@
-//! `fanotify(7)`, events about files and mounts read from a notification
-//! group.
+//! `fanotify(7)`, events about files and mounts read from a notification group.
 //!
-//! [`Fanotify::init`] creates a group and [`Fanotify::mark`] or
-//! [`Fanotify::mark_path`] says what it watches. The group is a pollable file
-//! descriptor, so a caller reads it on a thread with [`Fanotify::read`], or
-//! polls it and reads it on a ring. [`parse`] decodes the bytes of a read
-//! with no I/O, so a caller that reads the descriptor itself decodes them the
-//! same way.
+//! [`Fanotify::init`] creates a group and [`Fanotify::mark`] or [`Fanotify::mark_path`] says what it watches. The group
+//! is a pollable file descriptor, so a caller reads it on a thread with [`Fanotify::read`], or polls it and reads it on
+//! a ring. [`parse`] decodes the bytes of a read with no I/O, so a caller that reads the descriptor itself decodes them
+//! the same way.
 //!
-//! Only notification groups are offered. A group of `FAN_CLASS_CONTENT` or
-//! `FAN_CLASS_PRE_CONTENT` holds every access it marks until the reader
-//! answers, and a process whose access goes unanswered hangs, so those
-//! classes and their replies are left out until a caller needs them.
+//! Only notification groups are offered. A group of `FAN_CLASS_CONTENT` or `FAN_CLASS_PRE_CONTENT` holds every access
+//! it marks until the reader answers, and a process whose access goes unanswered hangs, so those classes and their
+//! replies are left out until a caller needs them.
 //!
-//! A group that reports mount events, [`InitFlags::REPORT_MNT`], reports
-//! nothing else and can mark only a mount namespace (`fanotify_init` and
-//! `do_fanotify_mark` in `fs/notify/fanotify/fanotify_user.c`), so watching
-//! mounts and files at once takes two groups.
+//! A group that reports mount events, [`InitFlags::REPORT_MNT`], reports nothing else and can mark only a mount
+//! namespace (`fanotify_init` and `do_fanotify_mark` in `fs/notify/fanotify/fanotify_user.c`), so watching mounts and
+//! files at once takes two groups.
 
 use crate::errno::{self, Errno, retry_on_eintr};
 use crate::error::{Error, Result};
@@ -29,8 +24,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 
 tn_bitflags! {
-    /// Flags for [`Fanotify::init`], the flags of `fanotify_init` that a
-    /// notification group may take. `FAN_CLOEXEC` is always set.
+    /// Flags for [`Fanotify::init`], the flags of `fanotify_init` that a notification group may take. `FAN_CLOEXEC` is
+    /// always set.
     pub struct InitFlags: libc::c_uint {
         /// A read with nothing queued fails with `EAGAIN` and does not block.
         NONBLOCK = 0x0000_0002;
@@ -52,18 +47,16 @@ tn_bitflags! {
         REPORT_TARGET_FID = 0x0000_1000;
         /// An fd the kernel could not open is reported as a negative errno.
         REPORT_FD_ERROR = 0x0000_2000;
-        /// The group reports mount events of a mount namespace and nothing
-        /// else. Making it needs no privilege, and marking the namespace
-        /// needs `CAP_SYS_ADMIN`.
+        /// The group reports mount events of a mount namespace and nothing else. Making it needs no privilege, and
+        /// marking the namespace needs `CAP_SYS_ADMIN`.
         REPORT_MNT = 0x0000_4000;
     }
 }
 
 tn_bitflags! {
-    /// Flags for [`Fanotify::mark`]. The type of a mark is `MOUNT`,
-    /// `FILESYSTEM` or `MNTNS`, or none of them for an inode. `MNTNS` holds
-    /// the bits of both others, as the uapi defines it, so test for it with
-    /// `contains(MNTNS)` before the other two.
+    /// Flags for [`Fanotify::mark`]. The type of a mark is `MOUNT`, `FILESYSTEM` or `MNTNS`, or none of them for an
+    /// inode. `MNTNS` holds the bits of both others, as the uapi defines it, so test for it with `contains(MNTNS)`
+    /// before the other two.
     pub struct MarkFlags: libc::c_uint {
         /// Add the events of the mask to the mark.
         ADD = 0x0000_0001;
@@ -93,9 +86,8 @@ tn_bitflags! {
 }
 
 tn_bitflags! {
-    /// The events of a mark and of an event read from a group. The events
-    /// that need a reply are left out with their classes, and a decoded
-    /// event keeps any bit this type does not name.
+    /// The events of a mark and of an event read from a group. The events that need a reply are left out with their
+    /// classes, and a decoded event keeps any bit this type does not name.
     pub struct EventMask: u64 {
         /// A file was read.
         ACCESS = 0x0000_0001;
@@ -127,13 +119,11 @@ tn_bitflags! {
         Q_OVERFLOW = 0x0000_4000;
         /// A file system reported an error.
         FS_ERROR = 0x0000_8000;
-        /// A mount was attached to the marked namespace. A mount moved
-        /// within it comes with both this and `MNT_DETACH` (`FS_MNT_MOVE` in
-        /// `include/linux/fsnotify_backend.h`), so only an event with
-        /// `MNT_DETACH` alone means the mount left.
+        /// A mount was attached to the marked namespace. A mount moved within it comes with both this and `MNT_DETACH`
+        /// (`FS_MNT_MOVE` in `include/linux/fsnotify_backend.h`), so only an event with `MNT_DETACH` alone means the
+        /// mount left.
         MNT_ATTACH = 0x0100_0000;
-        /// A mount was detached from the marked namespace, or moved within
-        /// it when `MNT_ATTACH` comes too.
+        /// A mount was detached from the marked namespace, or moved within it when `MNT_ATTACH` comes too.
         MNT_DETACH = 0x0200_0000;
         /// Events of the children of a marked directory are wanted too.
         EVENT_ON_CHILD = 0x0800_0000;
@@ -147,8 +137,8 @@ tn_bitflags! {
 const FAN_CLOEXEC: libc::c_uint = 0x0000_0001;
 const METADATA_VERSION: u8 = 3;
 
-// The mirrors below give the uapi layout to `offset_of` and `size_of`.
-// They are never built, since the parser reads fields from the bytes.
+// The mirrors below give the uapi layout to `offset_of` and `size_of`. They are never built, since the parser reads
+// fields from the bytes.
 /// `struct fanotify_event_metadata`.
 #[allow(dead_code)]
 #[repr(C)]
@@ -237,67 +227,37 @@ pub struct Fanotify(OwnedFd);
 impl Fanotify {
     /// Create a notification group (`fanotify_init(2)`).
     ///
-    /// `event_flags` are the open flags of the descriptor an event carries
-    /// when the group reports neither FIDs nor mounts, and `O_CLOEXEC` is
-    /// added to them.
+    /// `event_flags` are the open flags of the descriptor an event carries when the group reports neither FIDs nor
+    /// mounts, and `O_CLOEXEC` is added to them.
     ///
-    /// A group that reports FIDs or mounts may be made without
-    /// `CAP_SYS_ADMIN`, and any other group or flag of
-    /// `FANOTIFY_ADMIN_INIT_FLAGS` needs it (`fanotify_init` in
-    /// `fs/notify/fanotify/fanotify_user.c`). A group made without it may
-    /// then mark only inodes, so one that reports mounts is refused its
-    /// mark of the namespace with `EPERM`.
-    pub fn init(
-        flags: InitFlags,
-        event_flags: OFlag,
-    ) -> errno::Result<Fanotify> {
-        let event_flags =
-            (event_flags | OFlag::O_CLOEXEC).bits() as libc::c_uint;
+    /// A group that reports FIDs or mounts may be made without `CAP_SYS_ADMIN`, and any other group or flag of
+    /// `FANOTIFY_ADMIN_INIT_FLAGS` needs it (`fanotify_init` in `fs/notify/fanotify/fanotify_user.c`). A group made
+    /// without it may then mark only inodes, so one that reports mounts is refused its mark of the namespace with
+    /// `EPERM`.
+    pub fn init(flags: InitFlags, event_flags: OFlag) -> errno::Result<Fanotify> {
+        let event_flags = (event_flags | OFlag::O_CLOEXEC).bits() as libc::c_uint;
         // SAFETY: plain integer arguments, and no memory is read.
-        let fd = Errno::result(unsafe {
-            libc::fanotify_init(flags.bits() | FAN_CLOEXEC, event_flags)
-        })?;
-        // SAFETY: on success `fanotify_init` returns a new descriptor that
-        // nothing else owns.
+        let fd = Errno::result(unsafe { libc::fanotify_init(flags.bits() | FAN_CLOEXEC, event_flags) })?;
+        // SAFETY: on success `fanotify_init` returns a new descriptor that nothing else owns.
         Ok(Fanotify(unsafe { owned_from_raw(fd) }))
     }
 
-    /// Change the mark on the object `fd` names itself, as the nsfs file of
-    /// a mount namespace for [`MarkFlags::MNTNS`] (`fanotify_mark(2)` with
-    /// no path).
+    /// Change the mark on the object `fd` names itself, as the nsfs file of a mount namespace for [`MarkFlags::MNTNS`]
+    /// (`fanotify_mark(2)` with no path).
     ///
-    /// A mark of a mount, a file system or a mount namespace needs
-    /// `CAP_SYS_ADMIN` in the user namespace the group was made in
-    /// (`do_fanotify_mark`), and fails with `EPERM` without it.
-    pub fn mark<Fd: AsFd>(
-        &self,
-        flags: MarkFlags,
-        mask: EventMask,
-        fd: Fd,
-    ) -> errno::Result<()> {
+    /// A mark of a mount, a file system or a mount namespace needs `CAP_SYS_ADMIN` in the user namespace the group was
+    /// made in (`do_fanotify_mark`), and fails with `EPERM` without it.
+    pub fn mark<Fd: AsFd>(&self, flags: MarkFlags, mask: EventMask, fd: Fd) -> errno::Result<()> {
         let fd = fd.as_fd().as_raw_fd();
-        // SAFETY: a null path makes the kernel take `fd` itself as the
-        // object, and no other memory is read.
+        // SAFETY: a null path makes the kernel take `fd` itself as the object, and no other memory is read.
         retry_on_eintr(|| unsafe {
-            libc::fanotify_mark(
-                self.0.as_raw_fd(),
-                flags.bits(),
-                mask.bits(),
-                fd,
-                std::ptr::null(),
-            )
+            libc::fanotify_mark(self.0.as_raw_fd(), flags.bits(), mask.bits(), fd, std::ptr::null())
         })?;
         Ok(())
     }
 
     /// Change the mark on `path` relative to `dirfd` (`fanotify_mark(2)`).
-    pub fn mark_path<P, Fd>(
-        &self,
-        flags: MarkFlags,
-        mask: EventMask,
-        dirfd: Fd,
-        path: &P,
-    ) -> errno::Result<()>
+    pub fn mark_path<P, Fd>(&self, flags: MarkFlags, mask: EventMask, dirfd: Fd, path: &P) -> errno::Result<()>
     where
         P: ?Sized + TnPath,
         Fd: AsFd,
@@ -306,13 +266,7 @@ impl Fanotify {
         path.with_tn_path(|c| {
             // SAFETY: `c` is a NUL terminated path that outlives the call.
             retry_on_eintr(|| unsafe {
-                libc::fanotify_mark(
-                    self.0.as_raw_fd(),
-                    flags.bits(),
-                    mask.bits(),
-                    dirfd,
-                    c.as_ptr(),
-                )
+                libc::fanotify_mark(self.0.as_raw_fd(), flags.bits(), mask.bits(), dirfd, c.as_ptr())
             })
         })??;
         Ok(())
@@ -320,15 +274,12 @@ impl Fanotify {
 
     /// Read the queued events into `buf` and decode them.
     ///
-    /// The kernel copies only whole events and fails with `EINVAL` when
-    /// `buf` cannot hold the first, so 4 KiB is a safe size for any event
-    /// with a name. A group made with [`InitFlags::NONBLOCK`] fails with
-    /// `EAGAIN` when nothing is queued.
+    /// The kernel copies only whole events and fails with `EINVAL` when `buf` cannot hold the first, so 4 KiB is a safe
+    /// size for any event with a name. A group made with [`InitFlags::NONBLOCK`] fails with `EAGAIN` when nothing is
+    /// queued.
     pub fn read<'b>(&self, buf: &'b mut [u8]) -> errno::Result<Events<'b>> {
         // SAFETY: the kernel writes at most `buf.len()` bytes into `buf`.
-        let n = retry_on_eintr(|| unsafe {
-            libc::read(self.0.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
-        })?;
+        let n = retry_on_eintr(|| unsafe { libc::read(self.0.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) })?;
         Ok(Events {
             events: parse(&buf[..n as usize]),
         })
@@ -343,11 +294,9 @@ impl AsFd for Fanotify {
 
 /// The events of one [`Fanotify::read`].
 ///
-/// The kernel installs a descriptor for the reader in every event fd and
-/// pidfd that is not negative (`copy_event_to_user` in
-/// `fs/notify/fanotify/fanotify_user.c`). Each [`ReadEvent`] owns its two,
-/// and dropping the batch closes those of the events not taken, so none
-/// leaks.
+/// The kernel installs a descriptor for the reader in every event fd and pidfd that is not negative
+/// (`copy_event_to_user` in `fs/notify/fanotify/fanotify_user.c`). Each [`ReadEvent`] owns its two, and dropping the
+/// batch closes those of the events not taken, so none leaks.
 #[derive(Debug)]
 pub struct Events<'b> {
     events: EventIter<'b>,
@@ -358,11 +307,9 @@ pub struct Events<'b> {
 pub struct ReadEvent<'b> {
     /// The decoded event.
     pub event: Event<'b>,
-    /// The object of the event, for a group that reports neither FIDs nor
-    /// mounts.
+    /// The object of the event, for a group that reports neither FIDs nor mounts.
     pub fd: Option<OwnedFd>,
-    /// The process behind the event, for a group made with
-    /// [`InitFlags::REPORT_PIDFD`].
+    /// The process behind the event, for a group made with [`InitFlags::REPORT_PIDFD`].
     pub pidfd: Option<OwnedFd>,
 }
 
@@ -375,9 +322,8 @@ impl<'b> Iterator for Events<'b> {
             Err(e) => return Some(Err(e)),
         };
         let adopt = |fd: RawFd| {
-            // SAFETY: these bytes came from a read of the group, which
-            // installs each descriptor that is not negative for the reader
-            // alone, and the iterator yields each event once.
+            // SAFETY: these bytes came from a read of the group, which installs each descriptor that is not negative
+            // for the reader alone, and the iterator yields each event once.
             (fd >= 0).then(|| unsafe { owned_from_raw(fd) })
         };
         let pidfd = event.infos().find_map(|info| match info {
@@ -398,15 +344,13 @@ impl Drop for Events<'_> {
     }
 }
 
-/// Decode the events in the bytes of a read of a group. No descriptor is
-/// taken, so a caller that reads the group itself owns and must close the
-/// fds and pidfds the events name.
+/// Decode the events in the bytes of a read of a group. No descriptor is taken, so a caller that reads the group itself
+/// owns and must close the fds and pidfds the events name.
 pub fn parse(bytes: &[u8]) -> EventIter<'_> {
     EventIter { rest: bytes }
 }
 
-/// The events of [`parse`]. A malformed event ends the iteration with an
-/// error.
+/// The events of [`parse`]. A malformed event ends the iteration with an error.
 #[derive(Clone, Debug)]
 pub struct EventIter<'a> {
     rest: &'a [u8],
@@ -437,22 +381,15 @@ fn split_event(bytes: &[u8]) -> Result<(Event<'_>, &[u8])> {
         return Err(invalid("an event shorter than its fixed part"));
     }
     let event_len = u32_at(bytes, offset_of!(RawMetadata, event_len)) as usize;
-    let metadata_len =
-        u16_at(bytes, offset_of!(RawMetadata, metadata_len)) as usize;
+    let metadata_len = u16_at(bytes, offset_of!(RawMetadata, metadata_len)) as usize;
     if bytes[offset_of!(RawMetadata, vers)] != METADATA_VERSION {
         return Err(invalid("an event of an unknown metadata version"));
     }
-    if metadata_len < EVENT_METADATA_LEN
-        || metadata_len > event_len
-        || event_len > bytes.len()
-    {
+    if metadata_len < EVENT_METADATA_LEN || metadata_len > event_len || event_len > bytes.len() {
         return Err(invalid("an event whose lengths do not fit the buffer"));
     }
     let event = Event {
-        mask: EventMask::from_bits_retain(u64_at(
-            bytes,
-            offset_of!(RawMetadata, mask),
-        )),
+        mask: EventMask::from_bits_retain(u64_at(bytes, offset_of!(RawMetadata, mask))),
         fd: i32_at(bytes, offset_of!(RawMetadata, fd)),
         pid: i32_at(bytes, offset_of!(RawMetadata, pid)),
         info: &bytes[metadata_len..event_len],
@@ -475,16 +412,13 @@ impl<'a> Event<'a> {
         self.mask
     }
 
-    /// The descriptor of the object as the kernel wrote it. It is -1 when
-    /// the group reports FIDs or mounts or the queue overflowed, and a
-    /// negative errno under [`InitFlags::REPORT_FD_ERROR`] when it could not
-    /// be opened.
+    /// The descriptor of the object as the kernel wrote it. It is -1 when the group reports FIDs or mounts or the queue
+    /// overflowed, and a negative errno under [`InitFlags::REPORT_FD_ERROR`] when it could not be opened.
     pub fn raw_fd(&self) -> i32 {
         self.fd
     }
 
-    /// The process or, under [`InitFlags::REPORT_TID`], the thread behind
-    /// the event, or 0 when the kernel withholds it.
+    /// The process or, under [`InitFlags::REPORT_TID`], the thread behind the event, or 0 when the kernel withholds it.
     pub fn pid(&self) -> i32 {
         self.pid
     }
@@ -495,8 +429,7 @@ impl<'a> Event<'a> {
     }
 }
 
-/// The info records of an [`Event`]. A malformed record ends the iteration
-/// with an error.
+/// The info records of an [`Event`]. A malformed record ends the iteration with an error.
 #[derive(Clone, Debug)]
 pub struct InfoIter<'a> {
     rest: &'a [u8],
@@ -525,15 +458,12 @@ impl<'a> Iterator for InfoIter<'a> {
 /// An info record of an event.
 #[derive(Clone, Copy, Debug)]
 pub enum Info<'a> {
-    /// An object named by fsid and file handle, with the name of an entry
-    /// for the kinds that carry one.
+    /// An object named by fsid and file handle, with the name of an entry for the kinds that carry one.
     Fid(Fid<'a>),
-    /// The pidfd of the process behind the event as the kernel wrote it. It
-    /// is -1 when the process had gone, and -2 or a negative errno when no
-    /// pidfd could be made.
+    /// The pidfd of the process behind the event as the kernel wrote it. It is -1 when the process had gone, and -2 or
+    /// a negative errno when no pidfd could be made.
     Pidfd(i32),
-    /// A file system error, `FAN_FS_ERROR`, and how many were merged into
-    /// the event.
+    /// A file system error, `FAN_FS_ERROR`, and how many were merged into the event.
     Error {
         /// The errno the file system reported.
         error: i32,
@@ -547,8 +477,7 @@ pub enum Info<'a> {
         /// How many bytes.
         count: u64,
     },
-    /// The unique mount ID of a mount event, as `STATX_MNT_ID_UNIQUE` and
-    /// `statmount` give it.
+    /// The unique mount ID of a mount event, as `STATX_MNT_ID_UNIQUE` and `statmount` give it.
     Mount(u64),
     /// A record of a type this module does not name.
     Other {
@@ -581,9 +510,8 @@ pub struct Fid<'a> {
     pub kind: FidKind,
     /// The fsid of its file system, as `statfs` gives it.
     pub fsid: [u32; 2],
-    /// The `struct file_handle`, its header and `handle_bytes` of opaque
-    /// data, in the form `FileHandle::from_bytes` of the `fhandle` feature
-    /// takes.
+    /// The `struct file_handle`, its header and `handle_bytes` of opaque data, in the form `FileHandle::from_bytes` of
+    /// the `fhandle` feature takes.
     pub handle: &'a [u8],
     /// The entry's name, for the kinds that carry one.
     pub name: Option<&'a OsStr>,
@@ -610,8 +538,9 @@ fn split_info(bytes: &[u8]) -> Result<(Info<'_>, &[u8])> {
         }
     };
     let info = match info_type {
-        INFO_FID | INFO_DFID | INFO_DFID_NAME | INFO_OLD_DFID_NAME
-        | INFO_NEW_DFID_NAME => Info::Fid(fid(info_type, record)?),
+        INFO_FID | INFO_DFID | INFO_DFID_NAME | INFO_OLD_DFID_NAME | INFO_NEW_DFID_NAME => {
+            Info::Fid(fid(info_type, record)?)
+        }
         INFO_PIDFD => {
             need(size_of::<RawPidfd>())?;
             Info::Pidfd(i32_at(record, offset_of!(RawPidfd, pidfd)))
@@ -659,8 +588,7 @@ fn fid(info_type: u8, record: &[u8]) -> Result<Fid<'_>> {
         return Err(invalid("a FID record whose handle does not fit"));
     }
     let end = start + HANDLE_HEADER_LEN + handle_bytes;
-    // The name follows the handle with its NUL, and zeros pad the record to
-    // four bytes (`copy_fid_info_to_user`).
+    // The name follows the handle with its NUL, and zeros pad the record to four bytes (`copy_fid_info_to_user`).
     let name = match kind {
         FidKind::Object | FidKind::Dir => None,
         _ => {
@@ -707,14 +635,11 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 mod tests {
     use super::*;
 
-    /// Builds the bytes of a read the way `copy_event_to_user` lays them
-    /// out, host order and all.
+    /// Builds the bytes of a read the way `copy_event_to_user` lays them out, host order and all.
     fn event(mask: u64, fd: i32, pid: i32, infos: &[Vec<u8>]) -> Vec<u8> {
         let info_len: usize = infos.iter().map(Vec::len).sum();
         let mut out = Vec::new();
-        out.extend_from_slice(
-            &((EVENT_METADATA_LEN + info_len) as u32).to_ne_bytes(),
-        );
+        out.extend_from_slice(&((EVENT_METADATA_LEN + info_len) as u32).to_ne_bytes());
         out.push(METADATA_VERSION);
         out.push(0);
         out.extend_from_slice(&(EVENT_METADATA_LEN as u16).to_ne_bytes());
@@ -740,12 +665,7 @@ mod tests {
         out
     }
 
-    fn fid_record(
-        info_type: u8,
-        fsid: [u32; 2],
-        handle: &[u8],
-        name: Option<&str>,
-    ) -> Vec<u8> {
+    fn fid_record(info_type: u8, fsid: [u32; 2], handle: &[u8], name: Option<&str>) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&fsid[0].to_ne_bytes());
         body.extend_from_slice(&fsid[1].to_ne_bytes());
@@ -788,8 +708,7 @@ mod tests {
 
     #[test]
     fn a_mount_event_gives_its_mount_id() {
-        let bytes =
-            event(EventMask::MNT_ATTACH.bits(), -1, 0, &[mnt(0x1_0000_002a)]);
+        let bytes = event(EventMask::MNT_ATTACH.bits(), -1, 0, &[mnt(0x1_0000_002a)]);
         let event = parse(&bytes).next().unwrap().unwrap();
         assert_eq!(event.mask(), EventMask::MNT_ATTACH);
         assert_eq!(event.raw_fd(), -1);
@@ -809,16 +728,12 @@ mod tests {
                 (e.mask(), id)
             })
             .collect();
-        assert_eq!(
-            got,
-            [(EventMask::MNT_ATTACH, 7), (EventMask::MNT_DETACH, 8)]
-        );
+        assert_eq!(got, [(EventMask::MNT_ATTACH, 7), (EventMask::MNT_DETACH, 8)]);
     }
 
     #[test]
     fn a_dir_name_record_gives_fsid_handle_and_name() {
-        let record =
-            fid_record(INFO_DFID_NAME, [5, 6], &[1, 2, 3, 4, 5], Some("a.txt"));
+        let record = fid_record(INFO_DFID_NAME, [5, 6], &[1, 2, 3, 4, 5], Some("a.txt"));
         let bytes = event(EventMask::CREATE.bits(), -1, 42, &[record]);
         let Info::Fid(fid) = only_info(&bytes) else {
             panic!("not a FID record");
@@ -832,10 +747,8 @@ mod tests {
 
     #[test]
     fn a_rename_carries_the_old_and_the_new_name() {
-        let old =
-            fid_record(INFO_OLD_DFID_NAME, [1, 1], &[9; 8], Some("before"));
-        let new =
-            fid_record(INFO_NEW_DFID_NAME, [1, 1], &[9; 8], Some("after"));
+        let old = fid_record(INFO_OLD_DFID_NAME, [1, 1], &[9; 8], Some("before"));
+        let new = fid_record(INFO_NEW_DFID_NAME, [1, 1], &[9; 8], Some("after"));
         let bytes = event(EventMask::RENAME.bits(), -1, 1, &[old, new]);
         let event = parse(&bytes).next().unwrap().unwrap();
         let names: Vec<_> = event
@@ -856,8 +769,7 @@ mod tests {
 
     #[test]
     fn an_object_record_has_no_name() {
-        let bytes =
-            event(0, -1, 0, &[fid_record(INFO_FID, [0, 0], &[7; 12], None)]);
+        let bytes = event(0, -1, 0, &[fid_record(INFO_FID, [0, 0], &[7; 12], None)]);
         let Info::Fid(fid) = only_info(&bytes) else {
             panic!("not a FID record");
         };
@@ -881,13 +793,7 @@ mod tests {
         let infos: Vec<_> = event.infos().map(Result::unwrap).collect();
         assert!(matches!(infos[0], Info::Pidfd(-2)));
         assert!(matches!(infos[1], Info::Error { error: 5, count: 3 }));
-        assert!(matches!(
-            infos[2],
-            Info::Range {
-                offset: 100,
-                count: 50
-            }
-        ));
+        assert!(matches!(infos[2], Info::Range { offset: 100, count: 50 }));
     }
 
     #[test]
@@ -914,8 +820,7 @@ mod tests {
         assert_eq!(event.mask().bits(), 1 << 62);
     }
 
-    /// Each refusal ends the iteration, so a caller is never handed bytes
-    /// past a length that did not fit.
+    /// Each refusal ends the iteration, so a caller is never handed bytes past a length that did not fit.
     #[test]
     fn malformed_events_are_refused() {
         let good = event(0, -1, 0, &[mnt(1)]);
@@ -969,8 +874,7 @@ mod tests {
             b
         };
         let no_nul = {
-            let mut b =
-                fid_record(INFO_DFID_NAME, [0, 0], &[1; 4], Some("abc"));
+            let mut b = fid_record(INFO_DFID_NAME, [0, 0], &[1; 4], Some("abc"));
             for byte in &mut b[24..] {
                 *byte = b'x';
             }

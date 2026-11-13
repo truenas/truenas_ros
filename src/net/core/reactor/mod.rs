@@ -1,28 +1,25 @@
-//! The role-generic reactor core: [`Reactor`], the io_uring engine both the
-//! server and client roles embed. Holds the ring, the connection table, the
-//! projected [`CoreConfig`], the shared cross-thread flags/stats, and the
-//! kernel-touched landing pads; the role wrappers (`net::server` and
-//! `net::client`) own admission/listen/connect/protocol on top of it.
+//! The role-generic reactor core: [`Reactor`], the io_uring engine both the server and client roles embed. Holds the
+//! ring, the connection table, the projected [`CoreConfig`], the shared cross-thread flags/stats, and the
+//! kernel-touched landing pads; the role wrappers (`net::server` and `net::client`) own
+//! admission/listen/connect/protocol on top of it.
 //!
-//! The engine is split by lifecycle stage across the submodules - `io` (the
-//! request data plane's submission/completion helpers), `close` (teardown),
-//! `wake` (the wake arm and drain quiescence check) - plus this file's SQE
-//! staging and slot bookkeeping every stage shares.
+//! The engine is split by lifecycle stage across the submodules - `io` (the request data plane's submission/completion
+//! helpers), `close` (teardown), `wake` (the wake arm and drain quiescence check) - plus this file's SQE staging and
+//! slot bookkeeping every stage shares.
 
 mod close;
 mod io;
 mod wake;
 
-// The role layers are the only consumers, so a core-alone build has
-// none: gate the re-export or it is an unused import there.
+// The role layers are the only consumers, so a core-alone build has none: gate the re-export or it is an unused import
+// there.
 #[cfg(feature = "net-server")]
 pub(crate) use io::recv_pool_buf_len;
 #[cfg(any(feature = "net-server", feature = "net-client"))]
 pub(crate) use io::{Enacted, Gate, RecvStep, SendStep, SpliceStep};
 
-/// The pure framing decision, re-exported only under the `__fuzz` feature for
-/// the fuzz harness (`fuzz/fuzz_targets/framing_arithmetic.rs`). Not part of
-/// the stable API.
+/// The pure framing decision, re-exported only under the `__fuzz` feature for the fuzz harness
+/// (`fuzz/fuzz_targets/framing_arithmetic.rs`). Not part of the stable API.
 #[cfg(feature = "__fuzz")]
 pub use io::{FrameStep, frame_step};
 
@@ -38,12 +35,10 @@ use crate::uring::engine::Engine;
 use crate::uring::sys::*;
 use std::sync::atomic::Ordering;
 
-/// Every stream-level timeout pad the kernel reads asynchronously
-/// (per-connection buffers live in `Connection`; the wake eventfd's landing
-/// pad lives in the [`Engine`]), in one boxed block so the addresses stay
-/// stable for in-flight ops no matter where the owning reactor moves. The
-/// timespecs for optional features exist unconditionally; arming them stays
-/// gated by `cfg`.
+/// Every stream-level timeout pad the kernel reads asynchronously (per-connection buffers live in `Connection`; the
+/// wake eventfd's landing pad lives in the [`Engine`]), in one boxed block so the addresses stay stable for in-flight
+/// ops no matter where the owning reactor moves. The timespecs for optional features exist unconditionally; arming them
+/// stays gated by `cfg`.
 pub(crate) struct KernelPads {
     /// Grace-period deadline (written by `begin_drain` before arming).
     pub(crate) deadline: KernelTimespec,
@@ -53,36 +48,29 @@ pub(crate) struct KernelPads {
     pub(crate) idle_timeout: KernelTimespec,
     /// Relative send timeout - meaningful iff `cfg.send_timeout` is set.
     pub(crate) send_timeout: KernelTimespec,
-    /// Relative request-receive timeout - meaningful iff `cfg.request_timeout`
-    /// is set.
+    /// Relative request-receive timeout - meaningful iff `cfg.request_timeout` is set.
     pub(crate) request_timeout: KernelTimespec,
-    /// Relative total-receipt budget for one message - meaningful iff
-    /// `cfg.max_receipt_time` is set.
+    /// Relative total-receipt budget for one message - meaningful iff `cfg.max_receipt_time` is set.
     pub(crate) max_receipt_time: KernelTimespec,
-    /// Relative kTLS handshake timeout - meaningful iff
-    /// `cfg.tls_handshake_timeout` is set (bounds the parked-handshake slot).
+    /// Relative kTLS handshake timeout - meaningful iff `cfg.tls_handshake_timeout` is set (bounds the parked-handshake
+    /// slot).
     pub(crate) tls_handshake: KernelTimespec,
-    /// Backoff before retrying a recv parked on an exhausted buffer pool --
-    /// meaningful iff `cfg.recv_shortage_retry` is set.
+    /// Backoff before retrying a recv parked on an exhausted buffer pool -- meaningful iff `cfg.recv_shortage_retry` is
+    /// set.
     pub(crate) recv_retry: KernelTimespec,
-    /// The periodic maintenance tick (`MAINTAIN_TICK`) - the observation
-    /// quiet pools get, since pressure rides completions and silence has
-    /// none.
+    /// The periodic maintenance tick (`MAINTAIN_TICK`) - the observation quiet pools get, since pressure rides
+    /// completions and silence has none.
     pub(crate) maintain: KernelTimespec,
 }
 
-/// The stream reactor: the shared [`Engine`] plus the connection table and
-/// the state every stream stage shares. A role (`Server` or `Client`) embeds
-/// one as `core` and drives it with its own admission/connect/protocol code.
+/// The stream reactor: the shared [`Engine`] plus the connection table and the state every stream stage shares. A role
+/// (`Server` or `Client`) embeds one as `core` and drives it with its own admission/connect/protocol code.
 ///
-/// Field order is load-bearing: `table` is declared before `engine` so the
-/// connection buffers drop first - freed before the engine's ring is unmapped
-/// and its pool descriptors close (the kernel must never touch a freed
-/// buffer).
+/// Field order is load-bearing: `table` is declared before `engine` so the connection buffers drop first - freed before
+/// the engine's ring is unmapped and its pool descriptors close (the kernel must never touch a freed buffer).
 pub(crate) struct Reactor<U> {
-    /// The connection table: one typed state machine per pool slot, with the
-    /// generation that makes recycled-slot tokens stale. Declared first so it
-    /// drops before `engine` (whose last field is the ring).
+    /// The connection table: one typed state machine per pool slot, with the generation that makes recycled-slot tokens
+    /// stale. Declared first so it drops before `engine` (whose last field is the ring).
     pub(crate) table: ConnTable<U>,
     /// The engine-read tuning knobs a role config projects in.
     pub(crate) cfg: CoreConfig,
@@ -90,92 +78,63 @@ pub(crate) struct Reactor<U> {
     pub(crate) stats: Arc<StatsInner>,
     /// Kernel-touched stream timeout pads (stable boxed addresses).
     pub(crate) pads: Box<KernelPads>,
-    /// Optional close hook, invoked once per connection as it begins closing.
-    /// Lives here (not on the role's handlers) so the whole teardown path is
-    /// core.
+    /// Optional close hook, invoked once per connection as it begins closing. Lives here (not on the role's handlers)
+    /// so the whole teardown path is core.
     pub(crate) on_close: Option<CloseHook<U>>,
-    /// The loop-local state a graceful request transitions into: stop
-    /// accepting, stop starting requests, finish in-flight work under a
-    /// Deadline timer that escalates to a hard stop.
+    /// The loop-local state a graceful request transitions into: stop accepting, stop starting requests, finish
+    /// in-flight work under a Deadline timer that escalates to a hard stop.
     pub(crate) draining: bool,
-    /// Work a graceful drain must wait for beyond the connection
-    /// table - the fs reactor's live tasks, when one is embedded. A
-    /// task can be pending with no connection and no op in flight, so
-    /// counting connections alone would stop the loop with its work
-    /// unfinished. Zero for a server with no fs reactor.
+    /// Work a graceful drain must wait for beyond the connection table - the fs reactor's live tasks, when one is
+    /// embedded. A task can be pending with no connection and no op in flight, so counting connections alone would stop
+    /// the loop with its work unfinished. Zero for a server with no fs reactor.
     pub(crate) pending_tasks: std::rc::Rc<std::cell::Cell<usize>>,
-    /// Set by `reclaim_slot` whenever a pool slot is freed, drained by the
-    /// role loop (`take_pool_freed`) to re-arm any listener parked on a full
-    /// pool. A flag rather than a role-side call keeps slot reclamation core.
+    /// Set by `reclaim_slot` whenever a pool slot is freed, drained by the role loop (`take_pool_freed`) to re-arm any
+    /// listener parked on a full pool. A flag rather than a role-side call keeps slot reclamation core.
     pub(crate) pool_freed: bool,
-    /// Connections `(slot, generation)` that began closing this dispatch and
-    /// carry an embedded fs pool: the server drains this after the reap loop to
-    /// sweep any fs files they left open (`FsCore::close_owned_by`). Recorded
-    /// in `close_conn` (once per connection); a server-only concern, so it is
-    /// gated on the combined feature.
+    /// Connections `(slot, generation)` that began closing this dispatch and carry an embedded fs pool: the server
+    /// drains this after the reap loop to sweep any fs files they left open (`FsCore::close_owned_by`). Recorded in
+    /// `close_conn` (once per connection); a server-only concern, so it is gated on the combined feature.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fs_closed: Vec<(u32, u64)>,
-    /// Whether this reactor actually has an fs pool to sweep. Only a server
-    /// built with `fs_ops > 0` sets it; a client (which drains nothing) and a
-    /// pool-less server leave it false, so `close_conn` never records into
-    /// `fs_closed` for them - otherwise a client would grow that Vec unbounded.
+    /// Whether this reactor actually has an fs pool to sweep. Only a server built with `fs_ops > 0` sets it; a client
+    /// (which drains nothing) and a pool-less server leave it false, so `close_conn` never records into `fs_closed` for
+    /// them - otherwise a client would grow that Vec unbounded.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) has_fs_pool: bool,
-    /// Recv buffers drawn from a registered ring rather than owned per
-    /// connection.
+    /// Recv buffers drawn from a registered ring rather than owned per connection.
     ///
-    /// A connection takes one when data actually arrives and gives it back
-    /// once its message is consumed, so a keep-alive connection parked on an
-    /// idle recv holds nothing - `IOSQE_BUFFER_SELECT` has the kernel pick a
-    /// buffer at *completion* rather than at submit, which is the whole
-    /// reason this is a provided-buffer ring and not a free list.
-    ///
-    /// Declared after `table` so connections drop first: a claim points into
-    /// this pool's storage.
+    /// A provided-buffer ring and not a free list, since `IOSQE_BUFFER_SELECT` has the kernel pick at completion, so a
+    /// keep-alive connection parked on an idle recv holds nothing. Declared after `table` so connections drop first,
+    /// since a claim points into this pool's storage.
     #[cfg(feature = "net-server")]
     pub(crate) recv_bufs: Option<BufPool>,
-    /// Ring-owned storage for placed and promoted request bodies - the
-    /// recv-side sibling of the chunk ring's rule that buffers belong to
-    /// the ring, not a connection. `Rc`, because the consumer's
-    /// [`BodyRecycler`](crate::net::core::bodypool::BodyRecycler) closes
-    /// the loop from outside the reactor borrow.
+    /// Ring-owned storage for placed and promoted request bodies - the recv-side sibling of the chunk ring's rule that
+    /// buffers belong to the ring, not a connection. `Rc`, because the consumer's
+    /// [`BodyRecycler`](crate::net::core::bodypool::BodyRecycler) closes the loop from outside the reactor borrow.
     #[cfg(feature = "net-server")]
-    pub(crate) body_pool: Option<
-        std::rc::Rc<std::cell::RefCell<crate::net::core::bodypool::BodyPool>>,
-    >,
-    /// Buffers a file-sourced response body is read into, on their own
-    /// group. Ring-global: every connection on this reactor draws from it,
-    /// so the memory tracks bodies in flight rather than the connection
-    /// table. Declared beside `recv_bufs` and after `table` for the same
-    /// reason - a queued send segment points into it.
+    pub(crate) body_pool: Option<std::rc::Rc<std::cell::RefCell<crate::net::core::bodypool::BodyPool>>>,
+    /// Buffers a file-sourced response body is read into, on their own group. Ring-global: every connection on this
+    /// reactor draws from it, so the memory tracks bodies in flight rather than the connection table. Declared beside
+    /// `recv_bufs` and after `table` for the same reason - a queued send segment points into it.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) body_bufs: Option<BufPool>,
-    /// The held read the server is letting go on now, which the check
-    /// passes even with others still waiting behind it. The reads held
-    /// back wait in the body pool's queue, beside the consumer's turns
-    /// (`BodyPool::hold_back`).
+    /// The held read the server is letting go on now, which the check passes even with others still waiting behind it.
+    /// The reads held back wait in the body pool's queue, beside the consumer's turns (`BodyPool::hold_back`).
     #[cfg(feature = "net-server")]
     pub(crate) held_turn: Option<u32>,
-    /// This server's place in a spread of rings on one port, with the count
-    /// of slots it holds a connection in, which every ring of the spread
-    /// reads when it accepts.
+    /// This server's place in a spread of rings on one port, with the count of slots it holds a connection in, which
+    /// every ring of the spread reads when it accepts.
     #[cfg(feature = "net-server")]
     pub(crate) spread: Option<crate::net::server::spread::Joined>,
-    /// The shared io_uring engine (ring, in-flight accounting, wake, stop
-    /// flags). Declared last so the ring drops after `table`'s buffers.
+    /// The shared io_uring engine (ring, in-flight accounting, wake, stop flags). Declared last so the ring drops after
+    /// `table`'s buffers.
     pub(crate) engine: Engine,
 }
 
 impl<U> Reactor<U> {
-    /// Assemble a reactor around an already-built engine. The stream tag
-    /// vocabulary ([`Op`]) and the teardown fd sweep are supplied by the thin
-    /// wrappers below; everything mechanical lives in the engine.
-    pub(crate) fn from_parts(
-        engine: Engine,
-        pool_size: u32,
-        cfg: CoreConfig,
-        pads: Box<KernelPads>,
-    ) -> Reactor<U> {
+    /// Assemble a reactor around an already-built engine. The stream tag vocabulary ([`Op`]) and the teardown fd sweep
+    /// are supplied by the thin wrappers below; everything mechanical lives in the engine.
+    pub(crate) fn from_parts(engine: Engine, pool_size: u32, cfg: CoreConfig, pads: Box<KernelPads>) -> Reactor<U> {
         Reactor {
             pending_tasks: std::rc::Rc::new(std::cell::Cell::new(0)),
             table: ConnTable::new(pool_size),
@@ -204,23 +163,12 @@ impl<U> Reactor<U> {
     }
 
     /// Stage one SQE (setting its `user_data`) and count it as in-flight.
-    pub(crate) fn stage<Fill: FnOnce(&mut IoUringSqe)>(
-        &mut self,
-        user_data: u64,
-        fill: Fill,
-    ) -> errno::Result<()> {
+    pub(crate) fn stage<Fill: FnOnce(&mut IoUringSqe)>(&mut self, user_data: u64, fill: Fill) -> errno::Result<()> {
         self.engine.stage(user_data, fill)
     }
 
-    /// Stage an `IO_LINK` head plus its trailing `LINK_TIMEOUT` as one
-    /// contiguous pair; see [`Engine::stage_linked`].
-    pub(crate) fn stage_linked<H, T>(
-        &mut self,
-        head_ud: u64,
-        head: H,
-        tail_ud: u64,
-        tail: T,
-    ) -> errno::Result<()>
+    /// Stage an `IO_LINK` head plus its trailing `LINK_TIMEOUT` as one contiguous pair; see [`Engine::stage_linked`].
+    pub(crate) fn stage_linked<H, T>(&mut self, head_ud: u64, head: H, tail_ud: u64, tail: T) -> errno::Result<()>
     where
         H: FnOnce(&mut IoUringSqe),
         T: FnOnce(&mut IoUringSqe),
@@ -228,46 +176,28 @@ impl<U> Reactor<U> {
         self.engine.stage_linked(head_ud, head, tail_ud, tail)
     }
 
-    /// Cancel every outstanding op, then reap until nothing is in flight --
-    /// [`Engine::cancel_and_reap_all`] under the stream tag vocabulary, with
-    /// the stream-specific sweep: a `FIXED_FD_INSTALL` (kTLS handshake or
-    /// detach) that completed during this non-dispatching drain never reaches
-    /// `on_fd_install`/`on_detach_install`, which own the furnished fd's
-    /// close - so close it here, or a teardown racing an install leaks a real
-    /// process fd (it survives the ring's own close; matters when the process
-    /// outlives the owner).
-    pub(crate) fn cancel_and_reap_all(
-        &mut self,
-        other: &mut dyn FnMut(&IoUringCqe),
-    ) -> errno::Result<()> {
-        self.engine
-            .cancel_and_reap_all(pack(Op::Cancel, 0, 0), |cqe| {
-                let (op, _, _) = unpack(cqe.user_data);
-                if matches!(op, Some(Op::FdInstall | Op::DetachInstall))
-                    && cqe.res >= 0
-                {
-                    // SAFETY: `res` is a freshly installed owned process fd
-                    // that no handler will take ownership of on this teardown
-                    // path.
-                    unsafe { libc::close(cqe.res) };
-                }
-                // Anything not the reactor's own. A host sharing this ring
-                // (the server's fs op table) owns completions the reactor
-                // cannot classify, and this drain does not dispatch - so
-                // without routing them an `openat2` that completes here
-                // leaks a real process fd, which survives the ring's close
-                // and matters whenever the process outlives the server. The
-                // tag vocabularies are disjoint (`TAG_FS_DOMAIN`), so each
-                // side ignores the other's.
-                other(cqe);
-            })
+    /// Cancel every outstanding op, then reap until nothing is in flight -- [`Engine::cancel_and_reap_all`] under the
+    /// stream tag vocabulary, with the stream-specific sweep: a `FIXED_FD_INSTALL` (kTLS handshake or detach) that
+    /// completed during this non-dispatching drain never reaches `on_fd_install`/`on_detach_install`, which own the
+    /// furnished fd's close - so close it here, or a teardown racing an install leaks a real process fd (it survives
+    /// the ring's own close; matters when the process outlives the owner).
+    pub(crate) fn cancel_and_reap_all(&mut self, other: &mut dyn FnMut(&IoUringCqe)) -> errno::Result<()> {
+        self.engine.cancel_and_reap_all(pack(Op::Cancel, 0, 0), |cqe| {
+            let (op, _, _) = unpack(cqe.user_data);
+            if matches!(op, Some(Op::FdInstall | Op::DetachInstall)) && cqe.res >= 0 {
+                // SAFETY: `res` is a freshly installed owned process fd that no handler will take ownership of on this
+                // teardown path.
+                unsafe { libc::close(cqe.res) };
+            }
+            // Anything not the reactor's own goes to the host sharing this ring, since this drain does not dispatch and
+            // an `openat2` completing here would leak a process fd. Tags are disjoint (`TAG_FS_DOMAIN`).
+            other(cqe);
+        })
     }
 
-    /// Empty a fully-reaped slot (bumping its generation) and account a
-    /// closed connection if one was serving there.
+    /// Empty a fully-reaped slot (bumping its generation) and account a closed connection if one was serving there.
     pub(crate) fn free_slot(&mut self, slot: u32) {
-        // Before the connection goes away, so its buffer can be reissued
-        // and its group can eventually be retired.
+        // Before the connection goes away, so its buffer can be reissued and its group can eventually be retired.
         #[cfg(feature = "net-server")]
         if let Some(claim) = self.table.forfeit_recv_claim(slot)
             && let Some(pool) = self.recv_bufs.as_mut()
@@ -275,12 +205,8 @@ impl<U> Reactor<U> {
             pool.release(claim.bid);
             self.sync_recv_buf_stats();
         }
-        // The dying connection's placed and promoted body storage goes
-        // home too - with the held licences their claims recorded - for
-        // the pool to retain or free under its byte law. Dropped on the
-        // floor instead, every abandoned large upload took one warm
-        // buffer out of the loop, for the cost of a Content-Length
-        // header and a disconnect, no authentication required.
+        // The dying connection's placed and promoted body storage goes home too, with its held licences. Dropped
+        // instead, every abandoned large upload would take a warm buffer out of the loop at no cost to the peer.
         #[cfg(feature = "net-server")]
         if let Some(pool) = self.body_pool.as_ref() {
             let (placed, owned) = self.table.forfeit_body_storage(slot);
@@ -292,8 +218,7 @@ impl<U> Reactor<U> {
                 pool.give_held(v, ticket);
             }
         }
-        // Segments still queued name ring buffers; the connection is about
-        // to go away and they are owed back.
+        // Segments still queued name ring buffers; the connection is about to go away and they are owed back.
         #[cfg(all(feature = "net-server", feature = "uring-fs"))]
         {
             let bids = self.table.drain_pooled_send_bids(slot);
@@ -306,10 +231,9 @@ impl<U> Reactor<U> {
                 self.sync_recv_buf_stats();
             }
         }
-        // Every slot a server holds came through an accept it kept, which
-        // counted it in the spread, so its release takes it off whatever
-        // state it reached. A slot it shed or handed away was never counted
-        // and is still empty here.
+        // Every slot a server holds came through an accept it kept, which counted it in the spread, so its release
+        // takes it off whatever state it reached. A slot it shed or handed away was never counted and is still empty
+        // here.
         #[cfg(feature = "net-server")]
         if !self.table.is_empty(slot)
             && let Some(joined) = self.spread.as_mut()
@@ -328,30 +252,17 @@ impl<U> Reactor<U> {
         self.engine.stopping()
     }
 
-    /// Teardown drain for a role's `Drop`: cancel and reap every in-flight op
-    /// so the kernel holds no reference to a connection buffer before the
-    /// buffers are freed. If the drain itself fails - a hard `io_uring_enter`
-    /// error (not `EBUSY`/`EAGAIN`, which are retried) that returns with ops
-    /// still in flight - leak the kernel-visible buffers instead of freeing
-    /// them: the ring fd still closes as the engine drops (cancelling the ops),
-    /// but now against permanently-valid memory. Mirrors the `mem::forget` the
-    /// peercred probe uses when `io_uring_enter` fails under it.
-    /// Returns `true` if the drain failed and the buffers were leaked - an
-    /// embedding host with its own kernel-visible buffers on this ring (the
-    /// server's fs op table) must then leak those too.
-    /// `other` is called with every reaped CQE, so a host sharing this ring
-    /// (the server's fs op table) can route its own domain's completions --
-    /// freeing what they carry - as they land. A role with nothing else on
-    /// the ring passes a no-op.
-    pub(crate) fn drain_or_leak(
-        &mut self,
-        other: &mut dyn FnMut(&IoUringCqe),
-    ) -> bool {
+    /// Teardown drain for a role's `Drop`: cancel and reap every in-flight op so the kernel holds no reference to a
+    /// connection buffer before the buffers are freed. If the drain fails with ops still in flight, leak the
+    /// kernel-visible buffers instead, so the ring's close cancels the ops against memory that stays valid.
+    ///
+    /// Returns `true` if the buffers were leaked, and a host with its own kernel-visible buffers on this ring must then
+    /// leak those too. `other` is called with every reaped CQE, so such a host can route its own completions.
+    pub(crate) fn drain_or_leak(&mut self, other: &mut dyn FnMut(&IoUringCqe)) -> bool {
         if self.cancel_and_reap_all(other).is_err() {
             self.table.leak();
-            // Registered recv buffers are kernel-visible on this same ring:
-            // an op still in flight names one by index, so unmapping the
-            // group would hand the kernel freed pages to write into.
+            // Registered recv buffers are kernel-visible on this same ring: an op still in flight names one by index,
+            // so unmapping the group would hand the kernel freed pages to write into.
             #[cfg(feature = "net-server")]
             if let Some(pool) = self.recv_bufs.take() {
                 std::mem::forget(pool);
@@ -367,9 +278,8 @@ impl<U> Reactor<U> {
         }
     }
 
-    /// Take and clear the `pool_freed` flag: `true` if `reclaim_slot` freed a
-    /// slot since the last check, so the role loop can re-arm any listener
-    /// parked on a full pool.
+    /// Take and clear the `pool_freed` flag: `true` if `reclaim_slot` freed a slot since the last check, so the role
+    /// loop can re-arm any listener parked on a full pool.
     pub(crate) fn take_pool_freed(&mut self) -> bool {
         std::mem::take(&mut self.pool_freed)
     }

@@ -1,9 +1,5 @@
-//! The per-connection request data plane's ROLE half: the header-framer pump
-//! skeleton, the recv/send/splice completion wrappers (their heavy bookkeeping
-//! is core - see [`Reactor`](crate::net::core::reactor)), request delivery to
-//! the body handler, and the detach install/handoff. What stays here is exactly
-//! the code that runs consumer closures (the framer, the body handler, the
-//! detach hook) or touches server-only fields (`handlers`, `mailbox`).
+//! The request data plane's role half, the code that runs consumer closures (the framer, the body handler, the detach
+//! hook) or touches server-only fields. The completion bookkeeping is core ([`Reactor`](crate::net::core::reactor)).
 
 use super::Server;
 use super::handles::{Detached, Responder};
@@ -15,78 +11,57 @@ use crate::net::core::conn::PendingFile;
 use crate::net::core::conn::{Op, pack};
 use crate::net::core::handles::{Token, stat};
 use crate::net::core::protocol::{CloseReason, Framing};
-use crate::net::core::reactor::{
-    Enacted, Gate, RecvStep, SendStep, SpliceStep,
-};
+use crate::net::core::reactor::{Enacted, Gate, RecvStep, SendStep, SpliceStep};
 use crate::net::server::protocol::{DetachContext, Request, Response};
 
 /// Which delivery [`Server::deliver_one`] is running.
 ///
-/// The two differ in what belongs to the message being delivered. A wire
-/// delivery owns the connection's current frame and the receipt budget armed
-/// for it; a redelivery owns neither - its bytes were consumed and its budget
-/// retired at its first delivery, and anything set on the connection now
-/// belongs to a *later* message the read-ahead has begun.
+/// The two differ in what belongs to the message being delivered. A wire delivery owns the connection's current frame
+/// and the receipt budget armed for it; a redelivery owns neither - its bytes were consumed and its budget retired at
+/// its first delivery, and anything set on the connection now belongs to a *later* message the read-ahead has begun.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Delivery {
     /// A message the framer just declared over what was read.
     FromWire,
-    /// A worker's re-entry for a request the protocol glue retained
-    /// ([`super::Deferred::redeliver`]).
+    /// A worker's re-entry for a request the protocol glue retained ([`super::Deferred::redeliver`]).
     Redelivery,
 }
 use crate::sync::Arc;
 use crate::uring::sys::*;
 
-// The stages that run the consumer's framer/body handler - the only bounds
-// this file needs (the accept handler never runs here).
+// The stages that run the consumer's framer/body handler - the only bounds this file needs (the accept handler never
+// runs here).
 impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn>
 where
     HeaderFn: FnMut(&[u8], &mut U) -> Framing,
     BodyFn: FnMut(Request<'_, U>) -> Response,
 {
-    /// The per-connection read/deliver pump: consult the header framer on the
-    /// accumulated bytes and either read more, deliver a buffered request, or
-    /// close. In pipelined mode it delivers every already-buffered request and
-    /// arms the next recv - up to the `max_in_flight_requests` cap - so a
-    /// deferred request doesn't stall reading the client's next ones.
-    ///
-    /// A thin skeleton over the core: [`Reactor::pump_gate`] runs the loop-top
-    /// busy/cap/drain/oversize guards and [`Reactor::enact_frame_step`] enacts
-    /// the framer's verdict; only the framer call (a role closure, reached via
-    /// the disjoint `self.core.table` + `self.handlers` borrows) and the
-    /// `Deliver` seam stay here.
-    pub(super) fn pump(
-        &mut self,
-        slot: u32,
-        generation: u32,
-    ) -> errno::Result<()> {
+    /// The per-connection read/deliver pump: consult the header framer on the accumulated bytes and either read more,
+    /// deliver a buffered request, or close. In pipelined mode it delivers every already-buffered request and arms the
+    /// next recv - up to the `max_in_flight_requests` cap - so a deferred request doesn't stall reading the client's
+    /// next ones.
+    pub(super) fn pump(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         loop {
             match self.core.pump_gate(slot, generation)? {
                 Gate::Stop => return Ok(()),
                 Gate::Proceed => {}
             }
             let verdict = {
-                // `self.core.table` and `self.handlers` are disjoint fields, so
-                // the framer can run while the connection is borrowed.
+                // `self.core.table` and `self.handlers` are disjoint fields, so the framer can run while the connection
+                // is borrowed.
                 let conn = self.core.table.conn_mut(slot);
                 let (buf, state) = conn.frame_parts();
                 (self.handlers.header)(buf, state)
             };
             match self.core.enact_frame_step(slot, generation, verdict)? {
                 Enacted::Done => return Ok(()),
-                Enacted::Deliver => {
-                    self.deliver_one(slot, generation, Delivery::FromWire)?
-                }
+                Enacted::Deliver => self.deliver_one(slot, generation, Delivery::FromWire)?,
             }
         }
     }
 
-    /// A recv completed; `op` says which kind (`RecvHeader`/`RecvBody`). All
-    /// the completion bookkeeping is core ([`Reactor::on_recv_complete`]); the
-    /// returned [`RecvStep`] drives the delivery/pump tail - a completed body
-    /// delivers then pumps, a completed header re-pumps, everything else is
-    /// self-contained.
+    /// A recv completed. The bookkeeping is core ([`Reactor::on_recv_complete`]), and the returned [`RecvStep`] says
+    /// whether to deliver, pump or stop.
     pub(super) fn on_recv(
         &mut self,
         slot: u32,
@@ -95,30 +70,23 @@ where
         cqe_flags: u32,
         op: Op,
     ) -> errno::Result<()> {
-        // A completion carrying `IORING_CQE_F_BUFFER` selected one from the
-        // pool: adopt it before the bytes are read, so the framer sees them
-        // where the kernel put them. A refused adopt means the completion
-        // names a buffer the pool cannot vouch for, so its bytes cannot be
-        // located and framing from the (never-installed) claim would read
-        // garbage as the peer's - fail the read instead.
+        // Adopt a pool buffer the completion selected before reading its bytes. A refused adopt names a buffer the pool
+        // cannot vouch for, so its bytes cannot be located and framing would read garbage as the peer's. Fail the read
+        // instead.
         if !self.core.adopt_recv_buffer(slot, generation, cqe_flags) {
             if !self.core.table.slot_matches_cqe(slot, generation) {
                 return Ok(()); // stale completion; the slot moved on
             }
-            // Retire the op before closing, exactly as a completion does.
-            // `close_conn` defers teardown while `ops` is charged, so
-            // skipping this leaves the slot, its fixed descriptor and the
-            // socket held for the reactor's life, with the peer getting
-            // neither a reply nor a FIN.
+            // Retire the op before closing, exactly as a completion does. `close_conn` defers teardown while `ops` is
+            // charged, so skipping this leaves the slot, its fixed descriptor and the socket held for the reactor's
+            // life, with the peer getting neither a reply nor a FIN.
             self.core.table.conn_mut(slot).recving = false;
             if !self.core.op_done(slot)? {
                 return Ok(()); // already tearing down
             }
-            return self.core.close_conn(
-                slot,
-                generation,
-                CloseReason::RecvError(errno::Errno::EIO),
-            );
+            return self
+                .core
+                .close_conn(slot, generation, CloseReason::RecvError(errno::Errno::EIO));
         }
         match self.core.on_recv_complete(slot, generation, res, op)? {
             RecvStep::Deliver => {
@@ -130,30 +98,16 @@ where
         }
     }
 
-    /// A parked read's pool-shortage backoff elapsed (`Op::RecvRetry`).
-    /// Re-pump the connection - the framer is pure over what is buffered,
-    /// so this re-arms exactly the read that found the pool dry, and a
-    /// pool still dry parks it again. The 10 ms window between park and
-    /// retry admits arbitrary progress on the connection - a deferred
-    /// reply resolving, a splice arming, a flush-close, teardown - and
-    /// `pump_gate` is the single authority on every one of those states,
-    /// so beyond clearing the timer's dedup flag this adds no gating of
-    /// its own (a stale slot is refused before the flag is touched; a
-    /// stopping reactor stages nothing new). Not counted in `conn.ops`,
-    /// exactly like the other standalone timers.
-    pub(super) fn on_recv_retry(
-        &mut self,
-        slot: u32,
-        generation: u32,
-    ) -> errno::Result<()> {
+    /// A parked read's pool-shortage backoff elapsed (`Op::RecvRetry`). Re-pump the connection, which re-arms exactly
+    /// the read that found the pool dry, or parks it again if the pool is still dry. `pump_gate` decides every state
+    /// the connection may have reached meanwhile, so this adds no gating beyond clearing the timer's flag. Not counted
+    /// in `conn.ops`, like the other standalone timers.
+    pub(super) fn on_recv_retry(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         if !self.core.table.slot_matches_cqe(slot, generation) {
-            // Left set, this flag reads to `recv_buffer_shortage` as "a
-            // timer is pending", so every later shortage parks the read
-            // with nothing able to wake it and the connection holds its
-            // slot with no op in flight. See `conn_at_cqe_mut`.
-            if let Some(conn) =
-                self.core.table.conn_at_cqe_mut(slot, generation)
-            {
+            // Left set, this flag reads to `recv_buffer_shortage` as "a timer is pending", so every later shortage
+            // parks the read with nothing able to wake it and the connection holds its slot with no op in flight. See
+            // `conn_at_cqe_mut`.
+            if let Some(conn) = self.core.table.conn_at_cqe_mut(slot, generation) {
                 conn.recv_retry_armed = false;
             }
             return Ok(());
@@ -165,13 +119,11 @@ where
         self.pump(slot, generation)
     }
 
-    /// Let what `ServerConfig::held_cap` holds back go on, the placed body
-    /// reads and the consumer's turns, in the order they came, while the
-    /// ring holds less than the cap. Checked again after each, since a read
-    /// claims its body and the held hook takes out what it lets go for a
-    /// turn, so the ring passes the cap by one at most. A stale read (the
-    /// connection closed, or its slot was recycled) is passed over. The
-    /// hook runs with no borrow of the pool, which it reaches itself.
+    /// Let what `ServerConfig::held_cap` holds back go on, the placed body reads and the consumer's turns, in the order
+    /// they came, while the ring holds less than the cap. Checked again after each, since a read claims its body and
+    /// the held hook takes out what it lets go for a turn, so the ring passes the cap by one at most. A stale read (the
+    /// connection closed, or its slot was recycled) is passed over. The hook runs with no borrow of the pool, which it
+    /// reaches itself.
     pub(super) fn redrive_held_reads(&mut self) -> errno::Result<()> {
         loop {
             if self.core.stopping() {
@@ -198,8 +150,7 @@ where
                 Some(conn) if conn.read_held => conn.read_held = false,
                 _ => continue, // closing, or no longer waiting
             }
-            // The pump frames the message again and reaches the same body
-            // read, which the check lets go on this once.
+            // The pump frames the message again and reaches the same body read, which the check lets go on this once.
             self.core.held_turn = Some(slot);
             let pumped = self.pump(slot, gen64 as u32);
             self.core.held_turn = None;
@@ -207,54 +158,27 @@ where
         }
     }
 
-    /// A body splice completed (`Op::SpliceRecv`). All the completion
-    /// bookkeeping is core ([`Reactor::on_splice_recv_complete`]); a fully moved
-    /// body pumps the next frame. The body never entered the buffer, so there is
-    /// **no** `deliver_one` - the framer that returned `SpliceBody` was the
-    /// per-frame consumer hook.
-    pub(super) fn on_splice_recv(
-        &mut self,
-        slot: u32,
-        generation: u32,
-        res: i32,
-    ) -> errno::Result<()> {
+    /// A body splice completed (`Op::SpliceRecv`), with the bookkeeping in [`Reactor::on_splice_recv_complete`]. The
+    /// body never entered the buffer, so there is no `deliver_one`.
+    pub(super) fn on_splice_recv(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
         match self.core.on_splice_recv_complete(slot, generation, res)? {
             SpliceStep::Pump => self.pump(slot, generation),
             SpliceStep::Done => Ok(()),
         }
     }
 
-    /// Run the body handler for the current message, drop the request from the
-    /// recv buffer, and act on the [`Response`]: queue a reply (and start
-    /// sending), park for a deferred reply, or close. Also the re-entry point
-    /// for [`Deferred::redeliver`] ([`Delivery::Redelivery`]), where the
-    /// handler works from its own retained state.
-    pub(super) fn deliver_one(
-        &mut self,
-        slot: u32,
-        generation: u32,
-        which: Delivery,
-    ) -> errno::Result<()> {
-        // A redelivery's message was consumed - and its budget retired - at
-        // its first delivery, so any budget armed now belongs to a *later*
-        // message still arriving on this connection. Retiring it here would
-        // restart the one bound progress is not supposed to restart. The
-        // wire-driven callers own that retirement, and only they.
-        //
-        // A redelivery's frame is likewise not its own: with a read-ahead cap
-        // above one the pump may already have framed the next request, and
-        // the handler must not be handed that message's extent (nor may
-        // `consume` below drop its header). Deliver against an empty frame --
-        // which is what `Deferred::redeliver` documents - and put the pending
-        // one back afterwards.
+    /// Run the body handler for the current message, drop the request from the recv buffer, and act on the
+    /// [`Response`]: queue a reply (and start sending), park for a deferred reply, or close. Also the re-entry point
+    /// for [`Deferred::redeliver`] ([`Delivery::Redelivery`]), where the handler works from its own retained state.
+    pub(super) fn deliver_one(&mut self, slot: u32, generation: u32, which: Delivery) -> errno::Result<()> {
+        // A redelivery owns neither the budget nor the frame (see `Delivery`). With a read-ahead cap above one the pump
+        // may already have framed the next request, which the handler must not be handed and `consume` must not drop,
+        // so deliver against an empty frame and put the pending one back afterwards.
         let saved = match which {
             Delivery::FromWire => {
-                // Receipt is over the moment the message is handed to the
-                // handler, so the budget is retired here rather than when the
-                // next read is armed. Anything later would clock the
-                // *handling* too, and a request offloaded with
-                // `Response::Defer` may legitimately run for as long as it
-                // likes.
+                // Receipt is over the moment the message is handed to the handler, so the budget is retired here rather
+                // than when the next read is armed. Anything later would clock the *handling* too, and a request
+                // offloaded with `Response::Defer` may legitimately run for as long as it likes.
                 self.core.cancel_receipt_deadline(slot, generation)?;
                 None
             }
@@ -265,11 +189,8 @@ where
                 Some(frame)
             }
         };
-        // Borrow-split: `self.handlers`, `self.core.table`, and `self.mailbox` are
-        // disjoint fields; within the connection, buf/addr (immutable) vs
-        // userdata (mutable). The Responder holds owned channel clones.
-        // The token carries the FULL u64 generation - a worker may retain it
-        // across recycles - whereas the kernel routing used the low 32 bits.
+        // The token carries the full u64 generation, since a worker may hold it across recycles, while kernel routing
+        // uses the low 32 bits.
         let gen64 = self.core.table.generation(slot);
         let (resp, req_id) = {
             let conn = self.core.table.conn_mut(slot);
@@ -283,42 +204,27 @@ where
                 tx: self.mailbox.inject_tx.clone(),
                 shared: Arc::clone(&self.core.engine.shared),
             };
-            // The leased form also hands out the recv claim, so a
-            // handler's `pwritev2_from` can write the body straight from
-            // the buffer.
+            // The leased form also hands out the recv claim, so a handler's `pwritev2_from` can write the body straight
+            // from the buffer.
             #[cfg(feature = "uring-fs")]
-            let (header, mut body, peer, state, lease, delivered) = conn
-                .deliver_parts_leased(self.core.cfg.body_placement_threshold);
+            let (header, mut body, peer, state, lease, delivered) =
+                conn.deliver_parts_leased(self.core.cfg.body_placement_threshold);
             #[cfg(not(feature = "uring-fs"))]
-            let (header, mut body, peer, state, delivered) =
-                conn.deliver_parts(self.core.cfg.body_placement_threshold);
-            // A placed body is leaving custody: its held licence joins
-            // the pool's windowed pot *before* the handler runs, so a
-            // recycle made inside the handler finds it spendable.
-            // Potted after the handler returned, the pool freed the
-            // storage the recycle handed back - the licence landed one
-            // step behind the give it existed to cover, every time.
-            // (`body_pool` is a sibling field of the table `conn`
-            // borrows, so the disjoint access is fine.) The storage itself
-            // goes home if the handler drops the body untaken.
+            let (header, mut body, peer, state, delivered) = conn.deliver_parts(self.core.cfg.body_placement_threshold);
+            // A placed body's licence joins the pool's windowed pot before the handler runs, so a recycle made inside
+            // the handler finds it spendable. The storage itself goes home if the handler drops the body untaken.
             if let Some(pool) = self.core.body_pool.as_ref() {
                 if delivered.licence > 0 {
                     pool.borrow_mut().receipt_done(delivered.licence);
                 }
                 body.set_home(pool, delivered.bytes);
             }
-            // The fs facade borrows the engine and the fs tables - fields
-            // disjoint from `self.core.table` (which `conn` holds) and
-            // `self.handlers`, so all three borrows coexist for the handler
-            // call. `None` when no fs pool was configured.
+            // The fs facade borrows the engine and the fs tables, disjoint from the table `conn` holds and from
+            // `self.handlers`.
             #[cfg(feature = "uring-fs")]
             let fs = self.fs.as_mut().map(|fc| {
-                crate::uring_fs::core::FsConn::new(
-                    fc,
-                    &mut self.core.engine,
-                    Some((slot, gen64)),
-                )
-                .with_recv_lease(lease)
+                crate::uring_fs::core::FsConn::new(fc, &mut self.core.engine, Some((slot, gen64)))
+                    .with_recv_lease(lease)
             });
             (
                 (self.handlers.body)(Request {
@@ -333,12 +239,11 @@ where
                 req_id,
             )
         };
-        // The handler has taken what it needs; drop the request from the recv
-        // buffer so the next request can be read into it. (A redelivery's
-        // frame is empty, so this drains nothing - see `take_body_handoff`.)
+        // The handler has taken what it needs; drop the request from the recv buffer so the next request can be read
+        // into it. (A redelivery's frame is empty, so this drains nothing - see `take_body_handoff`.)
         self.core.table.conn_mut(slot).consume();
-        // Nothing buffered means nothing to hold a buffer for: give it back
-        // so a connection waiting on its next request costs none.
+        // Nothing buffered means nothing to hold a buffer for: give it back so a connection waiting on its next request
+        // costs none.
         self.core.release_recv_buffer(slot);
         // Hand the read-ahead frame back to the message it describes.
         if let Some((header_len, body_len)) = saved
@@ -348,29 +253,16 @@ where
         }
         stat!(self.core, requests);
         match resp {
-            Response::Close => self.core.close_conn(
-                slot,
-                generation,
-                CloseReason::HandlerClosed,
-            ),
+            Response::Close => self.core.close_conn(slot, generation, CloseReason::HandlerClosed),
             Response::Defer(permit) => {
-                // The permit type proves defer() was called - but only its
-                // token proves it was called for THIS request. A stashed
-                // permit returned for a later request has no live Deferred
-                // carrying that request's id, so parking it would wedge the
-                // connection (and its pool slot) until shutdown. Verify, and
-                // close on a mismatch instead.
+                // Only the permit's token proves `defer()` ran for this request. A permit stashed from another request
+                // has no live `Deferred`, so parking would wedge the connection until shutdown.
                 let t = permit.token;
                 if (t.slot, t.generation, t.req_id) != (slot, gen64, req_id) {
-                    return self.core.close_conn(
-                        slot,
-                        generation,
-                        CloseReason::HandlerClosed,
-                    );
+                    return self.core.close_conn(slot, generation, CloseReason::HandlerClosed);
                 }
-                // Reply arrives later via `inject_rx`; count it outstanding and
-                // record the open request so exactly one Deferred outcome can
-                // resolve it (stale/duplicate ones are dropped at drain time).
+                // Reply arrives later via `inject_rx`; count it outstanding and record the open request so exactly one
+                // Deferred outcome can resolve it (stale/duplicate ones are dropped at drain time).
                 let conn = self.core.table.conn_mut(slot);
                 conn.outstanding += 1;
                 conn.open_deferred(req_id);
@@ -378,26 +270,18 @@ where
                 Ok(())
             }
             Response::Detach(permit) => {
-                // Like Defer: the permit type proves detach() ran, but only its
-                // token proves it ran for THIS request.
+                // Like Defer: the permit type proves detach() ran, but only its token proves it ran for THIS request.
                 let t = permit.token;
                 if (t.slot, t.generation, t.req_id) != (slot, gen64, req_id) {
-                    return self.core.close_conn(
-                        slot,
-                        generation,
-                        CloseReason::HandlerClosed,
-                    );
+                    return self.core.close_conn(slot, generation, CloseReason::HandlerClosed);
                 }
-                // Detach hands the socket fd to a worker for a blocking op, so
-                // it is only safe on a fully settled connection: no other
-                // request in flight, and nothing buffered past this one (the raw
-                // stream that follows belongs to the fd, not the framer).
+                // Detach hands the socket fd to a worker for a blocking op, so it is only safe on a fully settled
+                // connection: no other request in flight, and nothing buffered past this one (the raw stream that
+                // follows belongs to the fd, not the framer).
                 let settled = {
                     let conn = self.core.table.conn(slot);
-                    // `closing`/`ops`: a teardown already in flight owns this
-                    // slot's remaining completions, and parking it as
-                    // `Detaching` would take it out of the state those
-                    // completions are accounted against.
+                    // `closing`/`ops`: a teardown already in flight owns this slot's remaining completions, and parking
+                    // it as `Detaching` would take it out of the state those completions are accounted against.
                     !conn.closing
                         && conn.ops == 0
                         && !conn.recving
@@ -409,19 +293,14 @@ where
                         && !conn.has_pending_send()
                 };
                 if !settled {
-                    return self.core.close_conn(
-                        slot,
-                        generation,
-                        CloseReason::HandlerClosed,
-                    );
+                    return self.core.close_conn(slot, generation, CloseReason::HandlerClosed);
                 }
-                // Park as `Detaching` and materialize the real fd; the parked
-                // connection resumes or closes when the worker signals.
+                // Park as `Detaching` and materialize the real fd; the parked connection resumes or closes when the
+                // worker signals.
                 self.submit_detach_install(slot, generation)
             }
-            // Answered inline with nothing to send (one-way message): the
-            // request is complete; keep reading. Any Deferred minted for it is
-            // now stale (its `req_id` was never opened).
+            // Answered inline with nothing to send (one-way message): the request is complete; keep reading. Any
+            // Deferred minted for it is now stale (its `req_id` was never opened).
             Response::Reply(bytes) if bytes.is_empty() => Ok(()),
             Response::Reply(bytes) => {
                 {
@@ -432,12 +311,8 @@ where
                 self.core.kick_send(slot, generation)
             }
             Response::ReplyClose(bytes) => {
-                // The server speaks last: queue the final PDU (nothing, when
-                // empty) and mark the flush-close. The pump gate retires the
-                // recv side - buffered pipelined requests are discarded --
-                // and the connection closes once the send queue drains
-                // (`drive_flush_close` now, or `on_send` when it empties).
-                // Reported as `HandlerClosed`, like `Response::Close`.
+                // The server speaks last. Queue the final PDU, if any, and mark the flush-close, so the pump gate
+                // retires the recv side and the connection closes once the send queue drains.
                 {
                     let conn = self.core.table.conn_mut(slot);
                     if !bytes.is_empty() {
@@ -448,11 +323,8 @@ where
                 }
                 self.core.drive_flush_close(slot, generation)
             }
-            // One logical reply sent as vectored segments (a header + payload
-            // the protocol handed over separately). Mirrors Reply/ReplyClose:
-            // bump `outstanding` once iff any bytes are queued - the segment
-            // helper flags only the last non-empty segment, so the retire
-            // count stays one - then keep serving or flush-close on `close`.
+            // Bump `outstanding` once if any bytes are queued, since the segment helper flags only the last non-empty
+            // segment, then keep serving or flush-close.
             Response::ReplyVectored { segments, close } => {
                 let queued = {
                     let conn = self.core.table.conn_mut(slot);
@@ -473,11 +345,9 @@ where
                     Ok(())
                 }
             }
-            // A file-sourced body: queue the head as a non-final segment,
-            // install the tail, and issue the first read. The final chunk's
-            // `ReplyLast` retires the reply, so the read-ahead cap holds
-            // pipelined requests until the body completes and a flush-close
-            // waits for it (the dry checks are tail-guarded).
+            // A file-sourced body: queue the head as a non-final segment, install the tail, and issue the first read.
+            // The final chunk's `ReplyLast` retires the reply, so the read-ahead cap holds pipelined requests until the
+            // body completes and a flush-close waits for it (the dry checks are tail-guarded).
             #[cfg(feature = "uring-fs")]
             Response::ReplyFile {
                 head,
@@ -485,26 +355,16 @@ where
                 offset,
                 len,
                 close,
-            } => self.begin_file_reply(
-                slot, generation, head, file, offset, len, close,
-            ),
+            } => self.begin_file_reply(slot, generation, head, file, offset, len, close),
         }
     }
 
-    /// A send completed (`Op::Send`). All the completion bookkeeping - the
-    /// gather-advance accounting, the partial-send re-arm, the next-batch kick,
-    /// the flush-close finish - is core ([`Reactor::on_send_complete`]); a fully
-    /// flushed gather resumes the pump.
-    pub(super) fn on_send(
-        &mut self,
-        slot: u32,
-        generation: u32,
-        res: i32,
-    ) -> errno::Result<()> {
+    /// A send completed (`Op::Send`), with the bookkeeping in [`Reactor::on_send_complete`]. A fully flushed gather
+    /// resumes the pump.
+    pub(super) fn on_send(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
         let step = self.core.on_send_complete(slot, generation, res)?;
-        // Flushed tail chunks just recycled their buffers into the spare
-        // pool (`advance_sent`); a read that was waiting on one can go now.
-        // A no-op on a closed connection or without an active tail.
+        // Flushed tail chunks gave back their shares (`advance_sent`), so a read waiting on one can go now. A no-op on
+        // a closed connection or without an active tail.
         #[cfg(feature = "uring-fs")]
         self.drive_file_tail(slot, generation, false)?;
         match step {
@@ -514,62 +374,43 @@ where
     }
 }
 
-// Recv/send submission and transport checks - no handler runs here, so no
-// closure bounds.
+// Recv/send submission and transport checks - no handler runs here, so no closure bounds.
 impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
-    /// Materialize a real fd from the pool descriptor for a `body`-handler
-    /// **detach** and park the connection as `Detaching`. `on_detach_install`
-    /// then furnishes the fd (aliasing the pool socket) to the detach handler.
-    /// The SQE is staged before the state transition, so a stage failure leaves
-    /// the connection serving.
-    pub(super) fn submit_detach_install(
-        &mut self,
-        slot: u32,
-        generation: u32,
-    ) -> errno::Result<()> {
-        self.core.stage(
-            pack(Op::DetachInstall, slot, generation),
-            move |sqe| {
-                sqe.opcode = IORING_OP_FIXED_FD_INSTALL;
-                sqe.fd = slot as i32;
-                sqe.flags = IOSQE_FIXED_FILE;
-            },
-        )?;
+    /// Materialize a real fd from the pool descriptor for a `body`-handler **detach** and park the connection as
+    /// `Detaching`. `on_detach_install` then furnishes the fd (aliasing the pool socket) to the detach handler. The SQE
+    /// is staged before the state transition, so a stage failure leaves the connection serving.
+    pub(super) fn submit_detach_install(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
+        self.core.stage(pack(Op::DetachInstall, slot, generation), move |sqe| {
+            sqe.opcode = IORING_OP_FIXED_FD_INSTALL;
+            sqe.fd = slot as i32;
+            sqe.flags = IOSQE_FIXED_FILE;
+        })?;
         self.core.table.begin_detach(slot);
         Ok(())
     }
 
-    /// A detach `FIXED_FD_INSTALL` completed (`Op::DetachInstall`): `res` is the
-    /// furnished real fd (aliasing the pool socket) or `-errno`. Hand the fd and
-    /// a [`Detached`] to the detach handler and park the connection; on install
+    /// A detach `FIXED_FD_INSTALL` completed (`Op::DetachInstall`): `res` is the furnished real fd (aliasing the pool
+    /// socket) or `-errno`. Hand the fd and a [`Detached`] to the detach handler and park the connection; on install
     /// failure, during drain, or with no handler registered, close it instead.
-    pub(super) fn on_detach_install(
-        &mut self,
-        slot: u32,
-        generation: u32,
-        res: i32,
-    ) -> errno::Result<()> {
-        // Kernel completion -> low 32 bits. The slot is `Detaching`, not
-        // `Serving`, so `slot_matches_cqe` doesn't apply - check directly.
+    pub(super) fn on_detach_install(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
+        // Kernel completion -> low 32 bits. The slot is `Detaching`, not `Serving`, so `slot_matches_cqe` doesn't
+        // apply - check directly.
         if self.core.table.generation_low(slot) != generation {
             if res >= 0 {
-                // The kernel furnished the fd before the slot was recycled, so
-                // declining it here still leaks it unless we close it. Every
-                // path that does not hand the fd to a `Detached` owns closing
-                // it - this one included.
-                // SAFETY: `res` is the freshly installed fd, owned by us and
-                // consumed by nobody (the pool socket survives on the direct
-                // descriptor).
+                // The kernel furnished the fd before the slot was recycled. Every path that does not hand the fd to a
+                // `Detached` closes it.
+                // SAFETY: `res` is the freshly installed fd, owned by us and consumed by nobody (the pool socket
+                // survives on the direct descriptor).
                 unsafe { libc::close(res) };
             }
             return Ok(()); // slot recycled under a stale completion
         }
-        // Close instead of handing off on: install failure/cancel, shutdown, or
-        // a missing handler (a body handler returned Detach with none set).
+        // Close instead of handing off on: install failure/cancel, shutdown, or a missing handler (a body handler
+        // returned Detach with none set).
         if res < 0 || self.core.draining || self.handlers.detach.is_none() {
             if res >= 0 {
-                // SAFETY: `res` is the freshly installed fd; close the alias we
-                // won't use (the pool socket survives on the direct descriptor).
+                // SAFETY: `res` is the freshly installed fd; close the alias we won't use (the pool socket survives on
+                // the direct descriptor).
                 unsafe { libc::close(res) };
             }
             // Reattach to `Serving` so close_conn/active reuse the serving path.
@@ -579,18 +420,17 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 } else if self.core.draining {
                     CloseReason::ShuttingDown
                 } else {
-                    // No detach handler registered (a body handler returned
-                    // Response::Detach without set_detach_handler): a misconfig.
+                    // No detach handler registered (a body handler returned Response::Detach without
+                    // set_detach_handler): a misconfig.
                     CloseReason::HandlerClosed
                 };
                 return self.core.close_conn(slot, generation, reason);
             }
             return Ok(()); // no longer detaching (stale)
         }
-        // Hand off. Park first, then run the handler against the parked slot,
-        // as the kTLS install->park does (`park_tls` precedes its handshake
-        // handler): the connection must not leave the table across consumer
-        // code - see `park_detached_in_place`.
+        // Hand off. Park first, then run the handler against the parked slot, as the kTLS install->park does
+        // (`park_tls` precedes its handshake handler): the connection must not leave the table across consumer code -
+        // see `park_detached_in_place`.
         let gen64 = self.core.table.generation(slot);
         let Some(conn) = self.core.table.park_detached_in_place(slot) else {
             // No longer detaching (stale): nobody will consume the fd.
@@ -620,17 +460,13 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         Ok(())
     }
 
-    /// Enact [`Response::ReplyFile`]: queue the head, install the tail, and
-    /// issue the first read. Refusals are loud - a close, never a short body:
-    /// no fs pool to read on, or a range whose arithmetic wrapped.
+    /// Enact [`Response::ReplyFile`]. Queue the head, install the tail, and issue the first read. With no fs pool to
+    /// read on, or a range whose arithmetic wrapped, the connection closes, never a short body.
     ///
-    /// A body already streaming is NOT a refusal, and must not become one.
-    /// One tail at a time is structural (two tails' chunks would interleave on
-    /// the wire), but by the time a second arrives the first response is
-    /// committed - its head and `Content-Length` are on the wire - so shedding
-    /// the connection destroys that one too, and it is the one that did
-    /// nothing wrong. The second queues behind the current body through the
-    /// same diversion every other PDU uses, and installs when it retires.
+    /// A body already streaming is not a refusal and must not become one. Two tails' chunks would interleave on the
+    /// wire, but the first response's head is already sent, so shedding the connection would destroy the response that
+    /// did nothing wrong. The second queues behind the current body through the diversion every other PDU uses, and
+    /// installs when it retires.
     #[cfg(feature = "uring-fs")]
     #[allow(clippy::too_many_arguments)] // a Response variant unpacked
     pub(super) fn begin_file_reply(
@@ -644,14 +480,12 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         close: bool,
     ) -> errno::Result<()> {
         if self.fs.is_none() {
-            return self.core.close_conn(
-                slot,
-                generation,
-                CloseReason::FileBody(Errno::EOPNOTSUPP),
-            );
+            return self
+                .core
+                .close_conn(slot, generation, CloseReason::FileBody(Errno::EOPNOTSUPP));
         }
-        // Nothing to stream: the head is the whole reply (mirrors the
-        // ReplyVectored disposition, including the empty one-way case).
+        // Nothing to stream: the head is the whole reply (mirrors the ReplyVectored disposition, including the empty
+        // one-way case).
         if len == 0 {
             let queued = {
                 let conn = self.core.table.conn_mut(slot);
@@ -673,38 +507,20 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 Ok(())
             };
         }
-        // Every offset this tail submits lands in `sqe.off_addr2`, which the
-        // kernel reads as a signed `loff_t`, so the range has to be bounded
-        // here - the one place an untrusted one enters. `u64::MAX` is `-1`,
-        // io_uring's "use the file's own position" sentinel: for a regular
-        // file `io_kiocb_update_pos` (linux `io_uring/rw.c:484-490`) would set
-        // `REQ_F_CUR_POS`, read `f_pos` in place of the offset asked for, and
-        // `rw.c:670-671` would write the new position back - a read that
-        // SUCCEEDS from the wrong place, mutating a position shared with every
-        // other holder of the descriptor, behind a correctly framed
-        // `Content-Length`. ZFS sets neither `FMODE_STREAM` nor
-        // `FMODE_UNSIGNED_OFFSET`, so neither kernel escape applies. Anything
-        // else past `i64::MAX` is refused by `rw_verify_area`
-        // (`fs/read_write.c:463`) - after the head has committed.
+        // Bound the range here, the one place an untrusted one enters, never in the submit path. The kernel reads each
+        // offset as a signed `loff_t`. `u64::MAX` is `-1`, the use-the-file-position sentinel, so on a regular file
+        // `io_kiocb_update_pos` (`io_uring/rw.c`) would read from `f_pos` in place of the offset asked for and write
+        // the new position back, a read that succeeds from the wrong place behind a correctly framed `Content-Length`.
+        // ZFS sets neither `FMODE_STREAM` nor `FMODE_UNSIGNED_OFFSET`, and anything else past `i64::MAX` fails
+        // `rw_verify_area` (`fs/read_write.c`) after the head has committed.
         //
-        // A suffix range is how a wrapped value arrives: `bytes=-N` past the
-        // object size is legal, and computing the start as `size - N` wraps in
-        // `u64` rather than clamping at zero. The SUM is bounded, not just the
-        // start, because `next_offset` walks to `offset + len` - which is also
-        // what keeps the advance in `on_pump_read` from wrapping.
-        //
-        // The check belongs here and not in the submit path: down there
-        // `u64::MAX` is the correct idiom for a stream file with no position,
-        // which `cancel_owned_by_reaches_a_pump_read` reads a pipe with.
-        if offset
-            .checked_add(len)
-            .is_none_or(|end| end > i64::MAX as u64)
-        {
-            return self.core.close_conn(
-                slot,
-                generation,
-                CloseReason::FileBody(Errno::EINVAL),
-            );
+        // The sum is bounded, not just the start. A suffix range past the object's size wraps `size - N`, and the tail
+        // walks to `offset + len`, which this also keeps from wrapping in `on_pump_read`. In the submit path `u64::MAX`
+        // is the right idiom for a stream file with no position (`cancel_owned_by_reaches_a_pump_read`).
+        if offset.checked_add(len).is_none_or(|end| end > i64::MAX as u64) {
+            return self
+                .core
+                .close_conn(slot, generation, CloseReason::FileBody(Errno::EINVAL));
         }
         let next = PendingFile {
             head,
@@ -713,43 +529,36 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             len,
             close,
         };
-        // Counted outstanding here rather than at install, so it is counted
-        // exactly once either way: the read-ahead cap must see an answered
-        // request whether its body starts now or waits its turn.
+        // Counted outstanding here rather than at install, so it is counted exactly once either way: the read-ahead cap
+        // must see an answered request whether its body starts now or waits its turn.
         let conn = self.core.table.conn_mut(slot);
         conn.outstanding += 1;
         if conn.tail_active() {
-            // A body is already streaming: hold this one behind it, in
-            // arrival order with the PDUs the same diversion is holding.
+            // A body is already streaming: hold this one behind it, in arrival order with the PDUs the same diversion
+            // is holding.
             conn.defer_file_reply(next);
             return Ok(());
         }
         self.install_file_reply(slot, generation, next)
     }
 
-    /// Queue a file reply's head, install its tail, and issue the first read.
-    /// The count against the read-ahead cap is the caller's - a body deferred
-    /// behind another was counted when it was deferred.
+    /// Queue a file reply's head, install its tail, and issue the first read. The count against the read-ahead cap is
+    /// the caller's - a body deferred behind another was counted when it was deferred.
     #[cfg(feature = "uring-fs")]
-    fn install_file_reply(
-        &mut self,
-        slot: u32,
-        generation: u32,
-        next: PendingFile,
-    ) -> errno::Result<()> {
+    fn install_file_reply(&mut self, slot: u32, generation: u32, next: PendingFile) -> errno::Result<()> {
         let close = next.close;
         {
             let conn = self.core.table.conn_mut(slot);
-            // Head first - the diversion is not yet on - then the tail; its
-            // chunks follow as reads complete, the last one `ReplyLast`.
+            // Head first - the diversion is not yet on - then the tail; its chunks follow as reads complete, the last
+            // one `ReplyLast`.
             conn.enqueue_reply_head(next.head);
             conn.install_file_tail(next.file, next.offset, next.len);
             if close {
                 conn.close_on_flush = Some(CloseReason::HandlerClosed);
             }
         }
-        // The dry checks are tail-guarded, so a flush-close armed here waits
-        // for the last chunk rather than truncating the body.
+        // The dry checks are tail-guarded, so a flush-close armed here waits for the last chunk rather than truncating
+        // the body.
         if close {
             self.core.drive_flush_close(slot, generation)?;
         } else {
@@ -758,30 +567,18 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         self.drive_file_tail(slot, generation, false)
     }
 
-    /// Issue the tail's next read when it is idle, bytes remain, and both a
-    /// chunk buffer and an fs op slot are free - at install, after each read
-    /// completes, and after sends flush (which recycle buffers). Reads are
-    /// clamped to `min(fs_body_chunk, unread)`.
+    /// Issue the tail's next read when it is idle, bytes remain, and both a chunk buffer and an fs op slot are free, at
+    /// install, after each read completes and after sends flush. Reads are clamped to `min(fs_body_chunk, unread)`.
     ///
-    /// Neither shortage is fatal, and deliberately so: they are the same kind
-    /// of transient. A missing buffer waits for a flush to recycle one - that
-    /// wait is the body's memory bound - and a full op table parks the
-    /// connection in `parked_tails` for the next completing fs op to re-drive.
-    /// Severing a multi-GB transfer because a handler fan-out momentarily took
-    /// the last slot would make the one shortage fatal and the other free.
-    /// A staging failure (the ring itself refused the SQE) still sheds THIS
-    /// connection ([`CloseReason::FileBody`]), never the server.
+    /// Neither shortage is fatal. A missing buffer waits for a flush, which is the body's memory bound, and a full op
+    /// table parks the connection in `parked_tails` for the next completing fs op, since severing a large transfer
+    /// because a handler fan-out took the last slot would make one shortage fatal and the other free. Only a staging
+    /// failure sheds the connection ([`CloseReason::FileBody`]), never the server.
     ///
-    /// `owned` forces the read to bring its own buffer instead of selecting
-    /// from the ring - the retry path for a shortage the pool could not
-    /// grow past, so progress never waits on the pool.
+    /// `owned` makes the read bring its own buffer instead of selecting from the ring, the retry for a shortage the
+    /// pool could not grow past.
     #[cfg(feature = "uring-fs")]
-    pub(super) fn drive_file_tail(
-        &mut self,
-        slot: u32,
-        generation: u32,
-        owned: bool,
-    ) -> errno::Result<()> {
+    pub(super) fn drive_file_tail(&mut self, slot: u32, generation: u32, owned: bool) -> errno::Result<()> {
         let chunk = self.cfg.fs_body_chunk;
         {
             let Some(conn) = self.core.table.get_conn_mut(slot) else {
@@ -797,23 +594,11 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 return Ok(()); // busy, or the last chunk is already queued
             }
         }
-        // The pool's shrink cadence is the maintenance tick (`Op::Maintain`
-        // in `net/server/mod.rs`), not here. Growth is answered where the
-        // kernel reports pressure (`-ENOBUFS` in `on_pump_read`), and
-        // shrink only needs to notice quiet within a second or two, which
-        // the tick already does every `MAINTAIN_TICK_SECS`. Reading the
-        // clock on every chunk this path drives bought no earlier a
-        // shrink than the tick gives for free.
+        // Shrinking is the maintenance tick's job (`Op::Maintain`), so this path reads no clock.
         let gen64 = self.core.table.generation(slot);
-        // Before a buffer is committed to it: a submit that fails on a full
-        // table would drop the buffer with the op entry, and this path must be
-        // able to retry.
-        if !self
-            .fs
-            .as_ref()
-            .expect("tail exists only with a pool")
-            .has_free_op()
-        {
+        // Before a buffer is committed to it: a submit that fails on a full table would drop the buffer with the op
+        // entry, and this path must be able to retry.
+        if !self.fs.as_ref().expect("tail exists only with a pool").has_free_op() {
             let conn = self.core.table.conn_mut(slot);
             let tail = conn.file_tail.as_mut().expect("checked above");
             if !tail.parked {
@@ -825,20 +610,14 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         if !self.core.table.conn_mut(slot).tail_claim_chunk() {
             return Ok(()); // this body's share is out; a flush frees one
         }
-        // The ring picks the buffer when the read completes. Without one
-        // registered the read supplies its own, freed when the chunk
-        // flushes - the same degradation the recv path takes.
+        // The ring picks the buffer when the read completes. Without one registered the read supplies its own, freed
+        // when the chunk flushes - the same degradation the recv path takes.
         let dest = match (&self.core.body_bufs, owned) {
-            (Some(_), false) => crate::uring_fs::core::PumpDest::Group(
-                crate::uring::bufring::BGID_FILE_BODY,
-            ),
-            _ => crate::uring_fs::core::PumpDest::Owned(Vec::with_capacity(
-                chunk,
-            )),
+            (Some(_), false) => crate::uring_fs::core::PumpDest::Group(crate::uring::bufring::BGID_FILE_BODY),
+            _ => crate::uring_fs::core::PumpDest::Owned(Vec::with_capacity(chunk)),
         };
         let staged = {
-            // Disjoint fields: `self.fs`, `self.core.engine`,
-            // `self.core.table` - the same split `deliver_one` relies on.
+            // Disjoint fields, the same split `deliver_one` relies on.
             let fs = self.fs.as_mut().expect("tail exists only with a pool");
             let conn = self.core.table.conn_mut(slot);
             let tail = conn.file_tail.as_mut().expect("checked above");
@@ -854,37 +633,27 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             if r.is_ok() {
                 tail.reading = true;
             }
-            // `parked` is NOT cleared here: it is the parked list's dedup
-            // key, and this connection's entry is still queued. Clearing it
-            // without removing the entry would let the same connection be
-            // pushed a second time. `redrive_parked_tail` pops and clears
-            // together; the entry it then drives finds `reading` set and
-            // returns, which is the ordinary no-op.
+            // `parked` is NOT cleared here: it is the parked list's dedup key, and this connection's entry is still
+            // queued. Clearing it without removing the entry would let the same connection be pushed a second time.
+            // `redrive_parked_tail` pops and clears together; the entry it then drives finds `reading` set and returns,
+            // which is the ordinary no-op.
             r
         };
         if let Err(e) = staged {
             // The claim was taken for a read that never went out.
             self.core.table.conn_mut(slot).tail_release_chunk();
-            return self.core.close_conn(
-                slot,
-                generation,
-                CloseReason::FileBody(e),
-            );
+            return self.core.close_conn(slot, generation, CloseReason::FileBody(e));
         }
         Ok(())
     }
 
-    /// Re-drive the connection at the head of `parked_tails` - the one that
-    /// found the op table full. Stale entries (the connection closed or its
-    /// slot was recycled) are discarded on the way past.
+    /// Re-drive the connection at the head of `parked_tails`, the one that found the op table full, discarding stale
+    /// entries on the way.
     ///
-    /// Called once per completing fs-domain CQE, which is **not** the same as
-    /// once per freed slot: `FsCore::on_cqe` returns early for a cancel
-    /// completion and for a stale-generation miss, and neither frees
-    /// anything. So the free-slot check comes first - popping the
-    /// longest-waiting connection when there is nothing to give it would
-    /// re-park it at the back and hand its turn to whoever is behind it,
-    /// which is the starvation this list exists to prevent.
+    /// This runs once per fs-domain CQE, which is not once per freed slot, since `FsCore::on_cqe` frees nothing for a
+    /// cancel completion or a stale-generation miss. So the free-slot check comes first, or the longest-waiting
+    /// connection would be popped with nothing to give it and re-parked at the back, the starvation this list exists to
+    /// prevent.
     #[cfg(feature = "uring-fs")]
     pub(super) fn redrive_parked_tail(&mut self) -> errno::Result<()> {
         if !self.fs.as_ref().is_some_and(|fs| fs.has_free_op()) {
@@ -896,8 +665,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             }
             match self.core.table.get_conn_mut(slot) {
                 Some(conn) if conn.file_tail.is_some() => {
-                    conn.file_tail.as_mut().expect("checked is_some").parked =
-                        false;
+                    conn.file_tail.as_mut().expect("checked is_some").parked = false;
                 }
                 _ => continue, // parked, freed, or the tail is already shed
             }
@@ -906,12 +674,8 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         Ok(())
     }
 
-    /// A pump read completed ([`ReapedFs`](crate::uring_fs::core::ReapedFs)
-    /// `::Pump`): advance the tail and queue the chunk. A stale owner - the
-    /// connection closed or its slot recycled while the read was in flight
-    /// (the closed-connection sweep's cancel, or a completion racing
-    /// teardown) - is dropped; the op entry already freed and its parked fd
-    /// clone dropped with it.
+    /// A pump read completed. Advance the tail and queue the chunk. A stale owner, whose connection closed or slot was
+    /// recycled while the read was in flight, is dropped, its op entry and fd clone already freed.
     #[cfg(feature = "uring-fs")]
     pub(super) fn on_pump_read(
         &mut self,
@@ -920,12 +684,9 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         bid: Option<u16>,
     ) -> errno::Result<()> {
         let (slot, gen64) = owner;
-        // The kernel consumed this completion's descriptor whatever happens
-        // below (`requeue_body_bid`'s doc has the citation), so every exit
-        // that does not queue the buffer into a send segment owes it back
-        // first - the aborted-download path (`conn.closing`) is the routine
-        // one, and it is exactly the exit a leak turns into a slow drain of
-        // the whole ring, one cancelled GET at a time.
+        // The kernel consumed this completion's descriptor whatever happens below (see `requeue_body_bid`), so every
+        // exit that does not queue the buffer for send gives it back first. An aborted download (`conn.closing`) is the
+        // routine one, and a leak there drains the ring one cancelled read at a time.
         if self.core.table.generation(slot) != gen64 {
             self.core.requeue_body_bid(bid);
             return Ok(()); // slot recycled under the read
@@ -936,10 +697,9 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 self.core.requeue_body_bid(bid);
                 return Ok(()); // parked (detaching) or already freed
             };
-            // Only `closing` stops the tail - deliberately NOT
-            // `teardown_owns_slot()`: with `close_on_flush` set the tail IS
-            // the farewell body (the flush-close dry checks wait on it), so
-            // a pending flush-close must keep streaming, never drop chunks.
+            // Only `closing` stops the tail - deliberately NOT `teardown_owns_slot()`: with `close_on_flush` set the
+            // tail IS the farewell body (the flush-close dry checks wait on it), so a pending flush-close must keep
+            // streaming, never drop chunks.
             if conn.closing {
                 self.core.requeue_body_bid(bid);
                 return Ok(()); // teardown owns the slot; the sweep cancelled us
@@ -952,79 +712,53 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             done.raw_result()
         };
         let n = match res {
-            // A dry ring is pressure, not a failed transfer: the read never
-            // started and nothing was lost. Doubling converges on the burst
-            // in a few round trips; a pool that cannot grow further - its
-            // ceiling is already the physical bound, so only an allocation
-            // failure - re-issues the read with an owned buffer, so
-            // progress never waits on the pool.
+            // A dry ring is pressure, not a failed transfer, since the read never started. Grow the pool, and where it
+            // cannot grow, which at its physical bound means only an allocation failure, re-issue the read with an
+            // owned buffer so progress never waits on the pool.
             Err(errno::Errno::ENOBUFS) => {
                 stat!(self.core, buf_shortages);
-                let armed =
-                    self.fs.as_ref().map_or(0, |fs| fs.pump_selecting());
-                let grew =
-                    self.core.body_bufs.as_mut().is_some_and(|p| p.grow(armed));
+                let armed = self.fs.as_ref().map_or(0, |fs| fs.pump_selecting());
+                let grew = self.core.body_bufs.as_mut().is_some_and(|p| p.grow(armed));
                 self.core.sync_recv_buf_stats();
                 self.core.table.conn_mut(slot).tail_release_chunk();
                 return self.drive_file_tail(slot, generation, !grew);
             }
             Err(e) => {
                 self.core.requeue_body_bid(bid);
-                return self.core.close_conn(
-                    slot,
-                    generation,
-                    CloseReason::FileBody(e),
-                );
+                return self.core.close_conn(slot, generation, CloseReason::FileBody(e));
             }
             Ok(n) => n as u64,
         };
         if n == 0 {
-            // EOF before the declared length: the file shrank after the
-            // header committed to a Content-Length. The framing cannot
-            // renegotiate, so close mid-body - the peer sees a truncated
-            // transfer, never a short body presented as complete.
+            // EOF before the declared length: the file shrank after the header committed to a Content-Length. The
+            // framing cannot renegotiate, so close mid-body - the peer sees a truncated transfer, never a short body
+            // presented as complete.
             self.core.requeue_body_bid(bid);
-            return self.core.close_conn(
-                slot,
-                generation,
-                CloseReason::FileBodyTruncated,
-            );
+            return self.core.close_conn(slot, generation, CloseReason::FileBodyTruncated);
         }
         let seg = match bid {
-            // The kernel filled a ring buffer and named it. The segment
-            // borrows it and the id goes back when the chunk flushes.
+            // The kernel filled a ring buffer and named it. The segment borrows it and the id goes back when the chunk
+            // flushes.
             Some(bid) => {
-                // The verified pick: refused for an id the pool does not
-                // hold `Posted` - a descriptor desync. Nothing of the
-                // pool's is behind such an id, so there is nothing to
-                // requeue; the chunk's bytes cannot be located, so the
-                // body cannot continue.
-                let Some((ptr, _cap)) =
-                    self.core.body_bufs.as_mut().and_then(|p| p.take_lent(bid))
-                else {
-                    return self.core.close_conn(
-                        slot,
-                        generation,
-                        CloseReason::FileBody(errno::Errno::EIO),
-                    );
+                // The verified pick: refused for an id the pool does not hold `Posted` - a descriptor desync. Nothing
+                // of the pool's is behind such an id, so there is nothing to requeue; the chunk's bytes cannot be
+                // located, so the body cannot continue.
+                let Some((ptr, _cap)) = self.core.body_bufs.as_mut().and_then(|p| p.take_lent(bid)) else {
+                    return self
+                        .core
+                        .close_conn(slot, generation, CloseReason::FileBody(errno::Errno::EIO));
                 };
                 // The loan may have grown the pool.
                 self.core.sync_recv_buf_stats();
-                // SAFETY: `n` bytes of buffer `bid`, which stays lent until
-                // the chunk flushes and `advance_sent` hands the id back.
-                unsafe {
-                    crate::net::core::protocol::SendBuf::pooled(
-                        ptr, n as usize, bid,
-                    )
-                }
+                // SAFETY: `n` bytes of buffer `bid`, which stays lent until the chunk flushes and `advance_sent` hands
+                // the id back.
+                unsafe { crate::net::core::protocol::SendBuf::pooled(ptr, n as usize, bid) }
             }
             None => {
                 let mut bufs = done.into_bufs();
-                let mut buf =
-                    bufs.pop().expect("a pump read carries exactly one buf");
-                // SAFETY: the op's iovec targeted this Vec's spare capacity
-                // with `iov_len >= n`, and the CQE count proves the kernel
-                // initialized the first `n` bytes.
+                let mut buf = bufs.pop().expect("a pump read carries exactly one buf");
+                // SAFETY: the op's iovec targeted this Vec's spare capacity with `iov_len >= n`, and the CQE count
+                // proves the kernel initialized the first `n` bytes.
                 unsafe { buf.set_len(n as usize) };
                 crate::net::core::protocol::SendBuf::from(buf)
             }
@@ -1034,10 +768,9 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         if !last {
             return self.drive_file_tail(slot, generation, false);
         }
-        // The retired tail may have been holding a file body that arrived
-        // behind it; install it now that the wire is free. A flush-close armed
-        // for the body that just finished makes that farewell final, so a body
-        // still queued behind it is dropped rather than sent after it.
+        // The retired tail may have been holding a file body that arrived behind it; install it now that the wire is
+        // free. A flush-close armed for the body that just finished makes that farewell final, so a body still queued
+        // behind it is dropped rather than sent after it.
         let next = {
             let conn = self.core.table.conn_mut(slot);
             if conn.close_on_flush.is_some() {

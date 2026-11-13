@@ -1,19 +1,16 @@
-//! What a daemon says about itself. A record has a level and named fields,
-//! a sink keeps it, and a [`Logger`] is the handle code reports through.
+//! What a daemon says about itself. A record has a level and named fields, a sink keeps it, and a [`Logger`] is the
+//! handle code reports through.
 //!
-//! A record is structured rather than a line, because the journal it lands
-//! in indexes fields and an operator asks it by field
-//! (`journalctl PEER=192.0.2.7`). The message is for a reader and the fields
-//! are for a query, and a value is in both only when a reader needs it.
+//! A record is structured rather than a line, because the journal it lands in indexes fields and an operator asks it by
+//! field (`journalctl PEER=192.0.2.7`). The message is for a reader and the fields are for a query, and a value is in
+//! both only when a reader needs it.
 //!
-//! The handle is passed in and never global, the way a clock is. Code under
-//! test is handed a [`capture::Capture`], and the test asserts on what was
-//! said. Nothing is formatted until the sink has said the level is on, so a
-//! record below the threshold costs one load and one compare.
+//! The handle is passed in and never global, the way a clock is. Code under test is handed a [`capture::Capture`], and
+//! the test asserts on what was said. Nothing is formatted until the sink has said the level is on, so a record below
+//! the threshold costs one load and one compare.
 //!
-//! [`journal::Journal`] is the sink of a daemon, which never blocks the
-//! thread that logs. What must never be said, such as a secret, is a rule of
-//! the code that holds the value, not of this module.
+//! [`journal::Journal`] is the sink of a daemon, which never blocks the thread that logs. What must never be said, such
+//! as a secret, is a rule of the code that holds the value, not of this module.
 #![deny(unsafe_code)]
 
 pub mod capture;
@@ -23,10 +20,8 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-/// How serious a record is, numbered as the journal numbers its
-/// priorities, so the two never need a table between them. They are
-/// ordered from most to least serious, so a threshold keeps everything up
-/// to itself.
+/// How serious a record is, numbered as the journal numbers its priorities, so the two never need a table between them.
+/// They are ordered from most to least serious, so a threshold keeps everything up to itself.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[repr(u8)]
 pub enum Level {
@@ -34,8 +29,7 @@ pub enum Level {
     Error = 3,
     /// Something degraded that the daemon is living with.
     Warning = 4,
-    /// A lifecycle event, such as a start, a reload or a stop. It is the
-    /// threshold a daemon gets without asking.
+    /// A lifecycle event, such as a start, a reload or a stop. It is the threshold a daemon gets without asking.
     #[default]
     Notice = 5,
     /// A request served, when an access log is wanted.
@@ -46,13 +40,7 @@ pub enum Level {
 
 impl Level {
     /// Every level, most serious first.
-    pub const ALL: [Level; 5] = [
-        Level::Error,
-        Level::Warning,
-        Level::Notice,
-        Level::Info,
-        Level::Debug,
-    ];
+    pub const ALL: [Level; 5] = [Level::Error, Level::Warning, Level::Notice, Level::Info, Level::Debug];
 
     /// The name a configuration file uses.
     pub const fn as_str(self) -> &'static str {
@@ -115,8 +103,7 @@ impl FromStr for Level {
     }
 }
 
-/// Where in the source a record was made, for the journal's `CODE_FILE=`
-/// and `CODE_LINE=`.
+/// Where in the source a record was made, for the journal's `CODE_FILE=` and `CODE_LINE=`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Source {
     /// `file!()` at the call.
@@ -133,11 +120,9 @@ pub struct Field<'a> {
 }
 
 impl<'a> Field<'a> {
-    /// A field. The name must be one the journal takes, which is uppercase
-    /// letters, digits and underscores, at most 64 of them, starting with a
-    /// letter, since a name starting with an underscore is the journal's
-    /// own. The journal enforces this when a record arrives, so it is
-    /// checked here, where a mistake fails a test rather than leaving a
+    /// A field. The name must be one the journal takes, which is uppercase letters, digits and underscores, at most 64
+    /// of them, starting with a letter, since a name starting with an underscore is the journal's own. The journal
+    /// enforces this when a record arrives, so it is checked here, where a mistake fails a test rather than leaving a
     /// silent gap.
     pub fn new(name: &'static str, value: &'a dyn fmt::Display) -> Self {
         debug_assert!(is_field_name(name), "bad field name {name:?}");
@@ -167,9 +152,9 @@ pub fn is_field_name(name: &str) -> bool {
     match bytes.first() {
         Some(first) if first.is_ascii_uppercase() => {
             bytes.len() <= 64
-                && bytes.iter().all(|c| {
-                    c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_'
-                })
+                && bytes
+                    .iter()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_')
         }
         _ => false,
     }
@@ -190,9 +175,8 @@ pub struct Event<'a> {
 
 /// Where records go.
 ///
-/// A sink is called from any thread, the ones that serve requests among
-/// them, so it must not block. It sends, or it counts what it could not
-/// send. `enabled` is asked before a record is formatted.
+/// A sink is called from any thread, the ones that serve requests among them, so it must not block. It sends, or it
+/// counts what it could not send. `enabled` is asked before a record is formatted.
 pub trait Sink: Send + Sync + fmt::Debug {
     /// Whether a record at `level` would be kept.
     fn enabled(&self, level: Level) -> bool;
@@ -201,8 +185,8 @@ pub trait Sink: Send + Sync + fmt::Debug {
     fn emit(&self, event: &Event<'_>);
 }
 
-/// The handle code reports through. It is cheap to clone and to pass,
-/// which is how it reaches the code that has something to say.
+/// The handle code reports through. It is cheap to clone and to pass, which is how it reaches the code that has
+/// something to say.
 #[derive(Clone, Debug)]
 pub struct Logger {
     sink: Arc<dyn Sink>,
@@ -219,21 +203,13 @@ impl Logger {
         Self::new(Arc::new(Silent))
     }
 
-    /// Whether a record at `level` would be kept. Ask before building one
-    /// that costs anything to build.
+    /// Whether a record at `level` would be kept. Ask before building one that costs anything to build.
     pub fn enabled(&self, level: Level) -> bool {
         self.sink.enabled(level)
     }
 
-    /// Keep a record, if its level is on. [`log!`](crate::log!) is the
-    /// usual way to make one.
-    pub fn emit(
-        &self,
-        level: Level,
-        source: Option<Source>,
-        message: fmt::Arguments<'_>,
-        fields: &[Field<'_>],
-    ) {
+    /// Keep a record, if its level is on. [`log!`](crate::log!) is the usual way to make one.
+    pub fn emit(&self, level: Level, source: Option<Source>, message: fmt::Arguments<'_>, fields: &[Field<'_>]) {
         if self.sink.enabled(level) {
             self.sink.emit(&Event {
                 level,
@@ -257,8 +233,8 @@ impl Sink for Silent {
     fn emit(&self, _: &Event<'_>) {}
 }
 
-/// Make a record with a logger, a level, a bracketed list of `NAME = value`
-/// fields if there are any, and then a format string and its arguments.
+/// Make a record with a logger, a level, a bracketed list of `NAME = value` fields if there are any, and then a format
+/// string and its arguments.
 ///
 /// ```
 /// use truenas_ros::log::{Level, Logger};
@@ -269,9 +245,8 @@ impl Sink for Silent {
 /// truenas_ros::log!(logger, Level::Notice, "stopped");
 /// ```
 ///
-/// A field value is anything `Display`, and `&format_args!("{x:?}")` gives
-/// a `Debug` one. Nothing is formatted when the level is off. The file and
-/// the line of the call go with the record as its source.
+/// A field value is anything `Display`, and `&format_args!("{x:?}")` gives a `Debug` one. Nothing is formatted when the
+/// level is off. The file and the line of the call go with the record as its source.
 #[macro_export]
 macro_rules! log {
     (
@@ -342,10 +317,9 @@ mod tests {
         assert!(!is_field_name(&"A".repeat(65)));
     }
 
-    /// The guard is a `debug_assert!`, which a release build leaves out, so
-    /// this test is for debug builds alone. A field name is never data of a
-    /// request, since `log!` makes each one with `stringify!` and a direct
-    /// `Field::new` passes a literal, so a bad one is a mistake in the code.
+    /// The guard is a `debug_assert!`, which a release build leaves out, so this test is for debug builds alone. A
+    /// field name is never data of a request, since `log!` makes each one with `stringify!` and a direct `Field::new`
+    /// passes a literal, so a bad one is a mistake in the code.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "bad field name")]
@@ -353,8 +327,7 @@ mod tests {
         let _ = Field::new("lower", &1);
     }
 
-    /// In a release build the bad name gets through, and the journal is
-    /// what refuses it.
+    /// In a release build the bad name gets through, and the journal is what refuses it.
     #[test]
     #[cfg(not(debug_assertions))]
     fn a_bad_field_name_gets_through_a_release_build() {
@@ -405,12 +378,7 @@ mod tests {
         let capture = Capture::new();
         let logger = capture.logger();
         let signal = Some(15);
-        crate::log!(
-            logger,
-            Level::Notice,
-            [SIGNAL = format_args!("{signal:?}")],
-            "signal"
-        );
+        crate::log!(logger, Level::Notice, [SIGNAL = format_args!("{signal:?}")], "signal");
         assert_eq!(capture.take()[0].field("SIGNAL"), Some("Some(15)"));
     }
 

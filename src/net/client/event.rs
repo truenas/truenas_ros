@@ -1,6 +1,5 @@
-//! The client's public event vocabulary: connection/request identifiers, the
-//! [`Event`] the caller drains from [`next_event`](super::Client::next_event),
-//! and the per-connect [`ConnectOpts`].
+//! The client's public event vocabulary: connection/request identifiers, the [`Event`] the caller drains from
+//! [`next_event`](super::Client::next_event), and the per-connect [`ConnectOpts`].
 
 use crate::errno::Errno;
 use crate::net::core::protocol::{Body, CloseReason};
@@ -8,20 +7,15 @@ use crate::uring::personality::Personality;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// The 24-bit pool slot a `ConnId`/`RequestId` packs, mirroring the codec's
-/// `SLOT_MASK`.
+/// The 24-bit pool slot a `ConnId`/`RequestId` packs, mirroring the codec's `SLOT_MASK`.
 const SLOT_BITS: u32 = 24;
 const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 
-/// A stale-safe handle to one client connection: its pool slot plus the slot's
-/// generation, so a handle retained past the connection's close never aliases a
-/// later connection recycled into the same slot.
+/// A stale-safe handle to one client connection: its pool slot plus the slot's generation, so a handle retained past
+/// the connection's close never aliases a later connection recycled into the same slot.
 ///
-/// Packed into a `u64` - the slot in the low 24 bits (identical to the kernel
-/// routing codec) and the generation above it. The generation is the
-/// full loop-side counter (used for the `slot_matches` liveness check); a
-/// client runs on one thread and never approaches 2^40 recycles on a single
-/// slot, so the high-bit truncation is unobservable.
+/// Packed into a `u64` with the slot in the low 24 bits and the generation above it. Dropping the generation's top 24
+/// bits is unobservable, since no slot reaches 2^40 recycles.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ConnId(u64);
 
@@ -36,75 +30,61 @@ impl ConnId {
     }
 }
 
-/// A client-global monotonic request identifier, assigned by
-/// [`send`](super::Client::send) and echoed back in the matching
-/// [`Event::Reply`] so a caller can correlate replies (the client itself
-/// correlates a connection's replies to its sent requests in FIFO order).
+/// A client-global monotonic request identifier, assigned by [`send`](super::Client::send) and echoed back in the
+/// matching [`Event::Reply`] so a caller can correlate replies (the client itself correlates a connection's replies to
+/// its sent requests in FIFO order).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Debug)]
 pub struct RequestId(pub(super) u64);
 
 impl RequestId {
-    /// The id reported for a reply that arrived with no request awaiting it on
-    /// its connection - an unsolicited server push (only expected when
-    /// [`ClientConfig::expect_server_push`](super::ClientConfig::expect_server_push)
-    /// is set).
+    /// The id reported for a reply that arrived with no request awaiting it on its connection - an unsolicited server
+    /// push (only expected when [`ClientConfig::expect_server_push`](super::ClientConfig::expect_server_push) is set).
     pub const UNSOLICITED: RequestId = RequestId(u64::MAX);
 }
 
 /// A completion the caller drains from [`next_event`](super::Client::next_event).
-///
-/// `#[non_exhaustive]`: further variants (e.g. a spliced-body notification)
-/// slot in without a breaking change - destructure with `..`.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Event {
-    /// An outbound connect completed: the connection is now serving and can be
-    /// sent requests.
+    /// An outbound connect completed: the connection is now serving and can be sent requests.
     Connected {
         /// The connection that came up.
         conn: ConnId,
     },
-    /// An outbound connect failed (refused, timed out, unreachable, ...); its
-    /// slot has been reclaimed and the [`ConnId`] is now stale.
+    /// An outbound connect failed (refused, timed out, unreachable, ...); its slot has been reclaimed and the
+    /// [`ConnId`] is now stale.
     ConnectFailed {
         /// The connection that failed to come up.
         conn: ConnId,
         /// The failure errno (`ETIMEDOUT` when a `connect_timeout` fired).
         err: Errno,
     },
-    /// A framed reply arrived. `header` is the framer-declared header bytes and
-    /// `body` the owned body (a zero-copy move when the body was placed).
+    /// A framed reply arrived. `header` is the framer-declared header bytes and `body` the owned body (a zero-copy move
+    /// when the body was placed).
     Reply {
         /// The connection the reply arrived on.
         conn: ConnId,
-        /// The request this reply answers (FIFO-correlated), or
-        /// [`RequestId::UNSOLICITED`] for a server push.
+        /// The request this reply answers (FIFO-correlated), or [`RequestId::UNSOLICITED`] for a server push.
         id: RequestId,
         /// The frame header bytes.
         header: Vec<u8>,
         /// The owned reply body.
         body: Body<'static>,
     },
-    /// A framed reply whose **body** was spliced straight to the caller's sink
-    /// fd (a framer returned [`Framing`](crate::net::Framing)`::SpliceBody`)
-    /// instead of read into a buffer - zero-copy. The body never enters an
-    /// event; it already went to the sink fd (a blocking pipe write end the
-    /// caller stashed in `U`). `header` is the buffered header bytes and
-    /// `body_len` the number of bytes moved to the sink.
+    /// A framed reply whose body was spliced straight to the caller's sink fd, a blocking pipe write end stashed in
+    /// `U`, because a framer returned [`Framing`](crate::net::Framing)`::SpliceBody`.
     Splice {
         /// The connection the reply arrived on.
         conn: ConnId,
-        /// The request this reply answers (FIFO-correlated), or
-        /// [`RequestId::UNSOLICITED`] for a server push.
+        /// The request this reply answers (FIFO-correlated), or [`RequestId::UNSOLICITED`] for a server push.
         id: RequestId,
         /// The frame header bytes (the body was spliced, not delivered here).
         header: Vec<u8>,
         /// The number of body bytes moved to the sink fd.
         body_len: usize,
     },
-    /// A connection finished closing (peer EOF, a transport error, or a local
-    /// [`close`](super::Client::close)); its slot is reclaimed and the
-    /// [`ConnId`] is now stale.
+    /// A connection finished closing (peer EOF, a transport error, or a local [`close`](super::Client::close)); its
+    /// slot is reclaimed and the [`ConnId`] is now stale.
     Closed {
         /// The connection that closed.
         conn: ConnId,
@@ -113,58 +93,39 @@ pub enum Event {
     },
 }
 
-/// Per-connect options. `Default` connects immediately with no timeout, no
-/// local bind, and no TLS.
+/// Per-connect options. `Default` connects immediately with no timeout, no local bind, and no TLS.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectOpts {
-    /// Bound on how long the `IORING_OP_CONNECT` may take before it is
-    /// cancelled (a linked timeout); the connect then fails with
-    /// [`Event::ConnectFailed`]. `None` uses the kernel's own connect timeout.
+    /// Bound on how long the `IORING_OP_CONNECT` may take before it is cancelled (a linked timeout); the connect then
+    /// fails with [`Event::ConnectFailed`]. `None` uses the kernel's own connect timeout.
     pub connect_timeout: Option<Duration>,
-    /// Bind the client socket to this local address before connecting (source
-    /// address/port selection). `None` lets the kernel pick.
+    /// Bind the client socket to this local address before connecting (source address/port selection). `None` lets the
+    /// kernel pick.
     pub local_addr: Option<SocketAddr>,
-    /// Layer kernel TLS over the connection once the TCP connect completes: the
-    /// client furnishes a real fd to the
-    /// [`set_tls_handshake`](super::Client::set_tls_handshake) worker, which
-    /// runs the TLS handshake (installing kTLS) and hands the connection back.
-    /// Requires a handshake handler and a kernel with
-    /// `IORING_OP_FIXED_FD_INSTALL` (Linux >= 6.8) + the TLS ULP; a `tls`
-    /// connect without them fails cleanly. `false` (the default) is plain TCP.
+    /// Layer kernel TLS over the connection once the TCP connect completes, through the
+    /// [`set_tls_handshake`](super::Client::set_tls_handshake) handler. Without that handler, or on a kernel lacking
+    /// `IORING_OP_FIXED_FD_INSTALL` or the TLS ULP, the connect fails cleanly. `false` (the default) is plain TCP.
     pub tls: bool,
-    /// Run the `IORING_OP_CONNECT` under this registered personality: the
-    /// kernel resolves the id at SQE init and wraps the whole connect -
-    /// io-wq punts included - in that identity's credentials. For an
-    /// `AF_UNIX` dial that identity is what the connect leaves behind: the
-    /// accepting side's `SO_PEERCRED` reports the personality's euid/egid
-    /// (the pid stays this process's), and the socket file's `MAY_WRITE`
-    /// permission check runs under it too. Only the connect is stamped -
-    /// peer credentials and path DAC are captured at `connect(2)` time, and
-    /// send/recv on a connected stream check neither - so later I/O runs
-    /// unstamped by design.
+    /// Run the `IORING_OP_CONNECT` under this registered personality, io-wq punts included. For an `AF_UNIX` dial the
+    /// accepting side's `SO_PEERCRED` reports the personality's euid and egid, and the socket file's `MAY_WRITE` check
+    /// runs under it. Only the connect is stamped, since peer credentials and path DAC are captured at `connect(2)` and
+    /// later send and recv check neither. `None` (the default) connects under the loop thread's own credentials.
     ///
-    /// `None` (the default) connects under the loop thread's ambient
-    /// credentials, exactly as before.
-    ///
-    /// **The id must come from the ring this client runs on** (a client
-    /// built with [`with_ring`](super::Client::with_ring) on a ring the
-    /// credential broker inherited, or another registration on that same
-    /// ring). An id from a different ring silently names whatever *this*
-    /// ring registered under that number - see the [`Personality`] type
-    /// docs for why that cannot be caught here.
+    /// **The id must come from the ring this client runs on**, as with [`with_ring`](super::Client::with_ring) on a
+    /// ring the credential broker inherited. An id from another ring silently names whatever this ring registered under
+    /// that number (see [`Personality`]).
     pub personality: Option<Personality>,
 }
 
 impl ConnectOpts {
-    /// Layer kernel TLS over this connection (see [`tls`](ConnectOpts::tls)).
-    /// Requires [`Client::set_tls_handshake`](super::Client::set_tls_handshake).
+    /// Layer kernel TLS over this connection (see [`tls`](ConnectOpts::tls)). Requires
+    /// [`Client::set_tls_handshake`](super::Client::set_tls_handshake).
     pub fn tls(mut self) -> ConnectOpts {
         self.tls = true;
         self
     }
 
-    /// Dial under a registered personality (see
-    /// [`personality`](ConnectOpts::personality)).
+    /// Dial under a registered personality (see [`personality`](ConnectOpts::personality)).
     pub fn personality(mut self, who: Personality) -> ConnectOpts {
         self.personality = Some(who);
         self

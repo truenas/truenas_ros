@@ -1,20 +1,18 @@
 //! The [`Errno`] error-number type and its `errno`-based [`Result`] (Linux-only).
 //!
-//! Low-level syscall wrappers in this crate return [`Result<T>`] - an alias for
-//! `Result<T, Errno>`. The rich crate-level [`crate::Error`] wraps `Errno` via
-//! `From` so `?` bridges the two layers.
+//! Low-level syscall wrappers in this crate return [`Result<T>`] - an alias for `Result<T, Errno>`. The rich
+//! crate-level [`crate::Error`] wraps `Errno` via `From` so `?` bridges the two layers.
 
 use libc::c_void;
 use std::{error, fmt, io};
 
-/// The result type used by low-level syscall wrappers: `Ok(value)` or a raw
-/// [`Errno`].
+/// The result type used by low-level syscall wrappers: `Ok(value)` or a raw [`Errno`].
 pub type Result<T> = std::result::Result<T, Errno>;
 
 /// A platform error number.
 ///
-/// The variants are the standard Linux `errno` values. [`Errno::UnknownErrno`]
-/// is used for any value not otherwise recognised.
+/// The variants are the standard Linux `errno` values. [`Errno::UnknownErrno`] is used for any value not otherwise
+/// recognised.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(i32)]
 #[non_exhaustive]
@@ -170,8 +168,7 @@ impl Errno {
 
     /// Returns the current raw `i32` value of `errno`.
     pub fn last_raw() -> i32 {
-        // SAFETY: `__errno_location` returns a valid pointer to the
-        // thread-local errno.
+        // SAFETY: `__errno_location` returns a valid pointer to the thread-local errno.
         unsafe { *libc::__errno_location() }
     }
 
@@ -182,8 +179,7 @@ impl Errno {
 
     /// Sets the raw `i32` value of `errno`.
     pub fn set_raw(errno: i32) {
-        // SAFETY: `__errno_location` returns a valid pointer to the
-        // thread-local errno.
+        // SAFETY: `__errno_location` returns a valid pointer to the thread-local errno.
         unsafe {
             *libc::__errno_location() = errno;
         }
@@ -194,15 +190,13 @@ impl Errno {
         Self::set_raw(0)
     }
 
-    /// Maps a raw `i32` to an [`Errno`], returning [`Errno::UnknownErrno`] for
-    /// unrecognised values.
+    /// Maps a raw `i32` to an [`Errno`], returning [`Errno::UnknownErrno`] for unrecognised values.
     pub const fn from_raw(err: i32) -> Errno {
         from_raw(err)
     }
 
-    /// Returns `Ok(value)` unless `value` equals the failure sentinel for its
-    /// type (usually `-1`), in which case the current `errno` is returned as
-    /// the error.
+    /// Returns `Ok(value)` unless `value` equals the failure sentinel for its type (usually `-1`), in which case the
+    /// current `errno` is returned as the error.
     #[inline]
     pub fn result<S: ErrnoSentinel + PartialEq<S>>(value: S) -> Result<S> {
         if value == S::sentinel() {
@@ -245,9 +239,8 @@ impl ErrnoSentinel for *mut c_void {
 
 /// Runs `f`, retrying while it fails with [`Errno::EINTR`].
 ///
-/// This mirrors the syscall loop in the `truenas_os` C extension. Unlike those
-/// Python bindings we have no interpreter signal check to poll, so - like the
-/// Rust standard library - we simply retry `EINTR` unconditionally.
+/// There is no interpreter signal check to poll, so like the Rust standard library this retries `EINTR`
+/// unconditionally.
 #[inline]
 #[allow(dead_code)] // unused only when no feature module is compiled
 pub(crate) fn retry_on_eintr<S, F>(mut f: F) -> Result<S>
@@ -275,15 +268,8 @@ mod tests {
         -1
     }
 
-    /// `retry_on_eintr` retries `EINTR` and **nothing else**.
-    ///
-    /// It is the single retry primitive under the audit socket, the signal
-    /// fd's `ppoll`, the xattr calls, `openat2`, the credential broker's
-    /// request round trip and the atomic-write staging - every one of them
-    /// running in a daemon under signal load, which is exactly the traffic
-    /// no other test produces. Getting it wrong in one direction surfaces
-    /// spurious `EINTR` to all of them; in the other it spins forever on a
-    /// real error, so the call count is asserted as well as the result.
+    /// `retry_on_eintr` retries `EINTR` and **nothing else**. A retried real error would spin forever, so the call
+    /// count is asserted as well as the result.
     #[test]
     fn eintr_is_retried_and_nothing_else_is() {
         let calls = Cell::new(0);

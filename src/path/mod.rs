@@ -1,14 +1,10 @@
-//! Paths: handing them to syscalls, and deciding which ones may be handed
-//! at all.
+//! Paths: handing them to syscalls, and deciding which ones may be handed at all.
 //!
-//! [`TnPath`] converts `str`/`OsStr`/`Path`/`[u8]`/`CStr` into a
-//! NUL-terminated `CStr` with a stack buffer for short paths and a heap
-//! fallback for long ones, then hands it to a closure. An interior NUL byte
-//! yields [`Errno::EINVAL`].
+//! [`TnPath`] converts `str`/`OsStr`/`Path`/`[u8]`/`CStr` into a NUL-terminated `CStr` with a stack buffer for short
+//! paths and a heap fallback for long ones, then hands it to a closure. An interior NUL byte yields [`Errno::EINVAL`].
 //!
-//! [`component_defect`] and [`relative_defect`] are the shape rules the
-//! `*at` opcodes need, since none of them honours a `RESOLVE_*` flag. See
-//! [`Defect`] for what each refuses and why there is no normalisation here.
+//! [`component_defect`] and [`relative_defect`] are the shape rules the `*at` opcodes need, since none of them honours
+//! a `RESOLVE_*` flag. See [`Defect`] for what each refuses, and `shape.rs` for why nothing is normalised.
 
 use crate::errno::{Errno, Result};
 
@@ -99,8 +95,7 @@ impl TnPath for [u8] {
     where
         F: FnOnce(&CStr) -> T,
     {
-        // Paths shorter than a page are stack-allocated to avoid a heap
-        // allocation on the syscall hot path.
+        // Paths under 1 KiB are stack-allocated to avoid a heap allocation on the syscall hot path.
         const MAX_STACK_ALLOCATION: usize = 1024;
 
         if self.len() >= MAX_STACK_ALLOCATION {
@@ -110,17 +105,14 @@ impl TnPath for [u8] {
         let mut buf = MaybeUninit::<[u8; MAX_STACK_ALLOCATION]>::uninit();
         let buf_ptr = buf.as_mut_ptr().cast();
 
-        // SAFETY: `self.len() < MAX_STACK_ALLOCATION`, so the copy plus the NUL
-        // terminator fit within `buf`.
+        // SAFETY: `self.len() < MAX_STACK_ALLOCATION`, so the copy plus the NUL terminator fit within `buf`.
         unsafe {
             ptr::copy_nonoverlapping(self.as_ptr(), buf_ptr, self.len());
             buf_ptr.add(self.len()).write(0);
         }
 
         // SAFETY: we just initialised `self.len() + 1` bytes ending in NUL.
-        match CStr::from_bytes_with_nul(unsafe {
-            slice::from_raw_parts(buf_ptr, self.len() + 1)
-        }) {
+        match CStr::from_bytes_with_nul(unsafe { slice::from_raw_parts(buf_ptr, self.len() + 1) }) {
             Ok(s) => Ok(f(s)),
             Err(_) => Err(Errno::EINVAL),
         }
@@ -173,9 +165,8 @@ impl TnPath for PathBuf {
     }
 }
 
-/// Convert a `&str` into a `CString`, mapping an interior NUL to
-/// [`Errno::EINVAL`]. Used for non-path C-string arguments (xattr names,
-/// filesystem names, config keys).
+/// Convert a `&str` into a `CString`, mapping an interior NUL to [`Errno::EINVAL`]. Used for non-path C-string
+/// arguments (xattr names, filesystem names, config keys).
 #[allow(dead_code)] // unused only when no feature module is compiled
 pub(crate) fn cstr(s: &str) -> Result<CString> {
     CString::new(s).map_err(|_| Errno::EINVAL)

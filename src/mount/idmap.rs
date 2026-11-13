@@ -1,17 +1,13 @@
 //! Idmapped-mount user namespaces.
 //!
-//! [`create_idmap_userns`] builds a user namespace populated with the given
-//! uid/gid maps and returns an owning fd that pins it - suitable for
-//! `mount_setattr(MOUNT_ATTR_IDMAP)`. [`IdmapCache`] adds a caller-owned cache
-//! so the (relatively expensive) namespace creation happens at most once per
-//! distinct map set.
+//! [`create_idmap_userns`] builds a user namespace populated with the given uid/gid maps and returns an owning fd that
+//! pins it - suitable for `mount_setattr(MOUNT_ATTR_IDMAP)`. [`IdmapCache`] adds a caller-owned cache so the
+//! (relatively expensive) namespace creation happens at most once per distinct map set.
 //!
-//! Creation uses a plain `clone3` fork (no `CLONE_VM`): the parent writes the
-//! privileged `/proc/<pid>/{setgroups,uid_map,gid_map}` files (the new-userns
-//! child lacks `CAP_SETUID` in the parent namespace) and then grabs the
-//! namespace via `PIDFD_GET_USER_NAMESPACE`. All allocation and formatting
-//! happen in the parent; the child only `pause()`s (async-signal-safe) until it
-//! is killed.
+//! Creation uses a plain `clone3` fork (no `CLONE_VM`): the parent writes the privileged
+//! `/proc/<pid>/{setgroups,uid_map,gid_map}` files (the new-userns child lacks `CAP_SETUID` in the parent namespace)
+//! and then grabs the namespace via `PIDFD_GET_USER_NAMESPACE`. All allocation and formatting happen in the parent; the
+//! child only `pause()`s (async-signal-safe) until it is killed.
 
 use crate::errno::{self, Errno, retry_on_eintr};
 use crate::error::{Error, Result};
@@ -26,8 +22,8 @@ use std::sync::Mutex;
 // PIDFD_GET_USER_NAMESPACE = _IO(0xFF, 9). Requires Linux >= 6.9.
 const PIDFD_GET_USER_NAMESPACE: libc::c_ulong = 0xFF09;
 
-/// A single uid/gid mapping range: `length` consecutive ids starting at
-/// `outside` in the parent namespace map to `inside` in the new namespace.
+/// A single uid/gid mapping range: `length` consecutive ids starting at `outside` in the parent namespace map to
+/// `inside` in the new namespace.
 ///
 /// Field ordering matches a `/proc/<pid>/uid_map` line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -38,22 +34,18 @@ pub struct IdmapEntry {
 }
 
 impl IdmapEntry {
-    /// Construct a validated mapping. `length` must be at least 1, and neither
-    /// `inside + length` nor `outside + length` may exceed 2^3^2.
+    /// Construct a validated mapping. `length` must be at least 1, and neither `inside + length` nor `outside + length`
+    /// may exceed 2^3^2.
     pub fn new(inside: u32, outside: u32, length: u32) -> Result<Self> {
         if length == 0 {
             return Err(Error::Validation("length must be >= 1".into()));
         }
         let end = |base: u32| base as u64 + length as u64;
         if end(inside) > u32::MAX as u64 + 1 {
-            return Err(Error::Validation(
-                "inside + length overflows the u32 id range".into(),
-            ));
+            return Err(Error::Validation("inside + length overflows the u32 id range".into()));
         }
         if end(outside) > u32::MAX as u64 + 1 {
-            return Err(Error::Validation(
-                "outside + length overflows the u32 id range".into(),
-            ));
+            return Err(Error::Validation("outside + length overflows the u32 id range".into()));
         }
         Ok(IdmapEntry {
             inside,
@@ -76,16 +68,11 @@ impl IdmapEntry {
     }
 }
 
-/// Create a new user namespace populated with `uid_map` / `gid_map` and return
-/// an owning fd that pins it.
+/// Create a new user namespace populated with `uid_map` / `gid_map` and return an owning fd that pins it.
 ///
-/// Both maps must be non-empty. Writing arbitrary (non-identity) maps requires
-/// `CAP_SETUID`/`CAP_SETGID` in the parent user namespace (root in the initial
-/// namespace qualifies).
-pub fn create_idmap_userns(
-    uid_map: &[IdmapEntry],
-    gid_map: &[IdmapEntry],
-) -> Result<OwnedFd> {
+/// Both maps must be non-empty. Writing arbitrary (non-identity) maps requires `CAP_SETUID`/`CAP_SETGID` in the parent
+/// user namespace (root in the initial namespace qualifies).
+pub fn create_idmap_userns(uid_map: &[IdmapEntry], gid_map: &[IdmapEntry]) -> Result<OwnedFd> {
     if uid_map.is_empty() {
         return Err(Error::Validation("uid_map must be non-empty".into()));
     }
@@ -109,18 +96,12 @@ fn format_map(entries: &[IdmapEntry]) -> String {
 
 fn create_userns_fd(uid_text: &str, gid_text: &str) -> Result<OwnedFd> {
     let mut pidfd: RawFd = -1;
-    // SAFETY: `create_idmap_userns` documents the single-threaded-at-fork
-    // precondition; the child below runs only `pause()` (async-signal-safe).
-    let pid = unsafe {
-        crate::clone3::clone3_fork(
-            crate::clone3::CLONE_NEWUSER,
-            libc::SIGCHLD as u64,
-            &mut pidfd,
-        )
-    }?;
+    // SAFETY: the child below runs only `pause()`, which is async-signal-safe, so a lock another thread held at the
+    // fork cannot deadlock it.
+    let pid = unsafe { crate::clone3::clone3_fork(crate::clone3::CLONE_NEWUSER, libc::SIGCHLD as u64, &mut pidfd) }?;
     if pid == 0 {
-        // CHILD: async-signal-safe only - no allocation, no locks, no panics.
-        // Block until the parent SIGKILLs us (uncatchable, bypasses pause()).
+        // CHILD: async-signal-safe only - no allocation, no locks, no panics. Block until the parent SIGKILLs us
+        // (uncatchable, bypasses pause()).
         loop {
             // SAFETY: pause() is async-signal-safe.
             unsafe { libc::pause() };
@@ -134,15 +115,12 @@ fn create_userns_fd(uid_text: &str, gid_text: &str) -> Result<OwnedFd> {
         write_proc(pid, "uid_map", uid_text.as_bytes())?;
         write_proc(pid, "gid_map", gid_text.as_bytes())?;
         // The third ioctl arg must be a literal 0 (the kernel rejects non-zero).
-        let nsfd = retry_on_eintr(|| unsafe {
-            libc::ioctl(pidfd, PIDFD_GET_USER_NAMESPACE, 0)
-        })?;
+        let nsfd = retry_on_eintr(|| unsafe { libc::ioctl(pidfd, PIDFD_GET_USER_NAMESPACE, 0) })?;
         // SAFETY: the ioctl returned a fresh owned namespace fd.
         Ok(unsafe { owned_from_raw(nsfd as RawFd) })
     })();
 
-    // Tear the child down regardless of outcome. pidfd_send_signal is
-    // PID-reuse-safe; SIGKILL is uncatchable.
+    // Tear the child down regardless of outcome. pidfd_send_signal is PID-reuse-safe; SIGKILL is uncatchable.
     unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -153,8 +131,7 @@ fn create_userns_fd(uid_text: &str, gid_text: &str) -> Result<OwnedFd> {
         );
     }
     // SAFETY: waitpid on our own child; a NULL status pointer is allowed.
-    let _ =
-        retry_on_eintr(|| unsafe { libc::waitpid(pid, ptr::null_mut(), 0) });
+    let _ = retry_on_eintr(|| unsafe { libc::waitpid(pid, ptr::null_mut(), 0) });
     // SAFETY: closing our owned pidfd.
     unsafe { libc::close(pidfd) };
 
@@ -163,19 +140,14 @@ fn create_userns_fd(uid_text: &str, gid_text: &str) -> Result<OwnedFd> {
 
 /// Open `/proc/<pid>/<file>` write-only and write `data` in full.
 fn write_proc(pid: libc::pid_t, file: &str, data: &[u8]) -> errno::Result<()> {
-    let path = CString::new(format!("/proc/{pid}/{file}"))
-        .map_err(|_| Errno::EINVAL)?;
-    let fd = retry_on_eintr(|| unsafe {
-        libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
-    })?;
+    let path = CString::new(format!("/proc/{pid}/{file}")).map_err(|_| Errno::EINVAL)?;
+    let fd = retry_on_eintr(|| unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) })?;
     // SAFETY: `open` returned a fresh owned fd.
     let fd = unsafe { owned_from_raw(fd as RawFd) };
     let raw = fd.as_raw_fd();
     let mut off = 0;
     while off < data.len() {
-        let n = retry_on_eintr(|| unsafe {
-            libc::write(raw, data[off..].as_ptr().cast(), data.len() - off)
-        })?;
+        let n = retry_on_eintr(|| unsafe { libc::write(raw, data[off..].as_ptr().cast(), data.len() - off) })?;
         off += n as usize;
     }
     Ok(())
@@ -185,26 +157,20 @@ type MapKey = Vec<(u32, u32, u32)>;
 type CacheKey = (MapKey, MapKey);
 
 fn key_of(map: &[IdmapEntry]) -> MapKey {
-    map.iter()
-        .map(|e| (e.inside, e.outside, e.length))
-        .collect()
+    map.iter().map(|e| (e.inside, e.outside, e.length)).collect()
 }
 
 fn dup(fd: &OwnedFd) -> Result<OwnedFd> {
-    fd.try_clone().map_err(|e| {
-        Errno::from_raw(e.raw_os_error().unwrap_or(libc::EBADF)).into()
-    })
+    fd.try_clone()
+        .map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(libc::EBADF)).into())
 }
 
-/// A caller-owned cache of idmapped user namespaces, keyed by their
-/// `(uid_map, gid_map)`.
+/// A caller-owned cache of idmapped user namespaces, keyed by their `(uid_map, gid_map)`.
 ///
-/// Creating a user namespace is comparatively expensive; an `IdmapCache` runs
-/// [`create_idmap_userns`] at most once per distinct map set and hands out
-/// independent `dup`s of the pinned namespace fd. A returned fd therefore
-/// outlives its cache entry - dropping it never affects the cache or other
-/// callers, and [`IdmapCache::clear`] (or dropping the whole cache) releases the
-/// originals without disturbing fds already handed out.
+/// Creating a user namespace is comparatively expensive; an `IdmapCache` runs [`create_idmap_userns`] at most once per
+/// distinct map set and hands out independent `dup`s of the pinned namespace fd. A returned fd therefore outlives its
+/// cache entry - dropping it never affects the cache or other callers, and [`IdmapCache::clear`] (or dropping the whole
+/// cache) releases the originals without disturbing fds already handed out.
 #[derive(Debug, Default)]
 pub struct IdmapCache {
     entries: Mutex<HashMap<CacheKey, OwnedFd>>,
@@ -216,40 +182,30 @@ impl IdmapCache {
         Self::default()
     }
 
-    /// Return an idmapped user-namespace fd for `(uid_map, gid_map)`, creating
-    /// and caching it via [`create_idmap_userns`] on first use.
+    /// Return an idmapped user-namespace fd for `(uid_map, gid_map)`, creating and caching it via
+    /// [`create_idmap_userns`] on first use.
     ///
     /// The returned fd is an independent `dup` of the cached one.
-    pub fn get_or_create(
-        &self,
-        uid_map: &[IdmapEntry],
-        gid_map: &[IdmapEntry],
-    ) -> Result<OwnedFd> {
+    pub fn get_or_create(&self, uid_map: &[IdmapEntry], gid_map: &[IdmapEntry]) -> Result<OwnedFd> {
         let key = (key_of(uid_map), key_of(gid_map));
-        // Hold the map lock only for the O(1) lookup, never across the mint:
-        // a slow namespace creation for one key must not block a lookup of
-        // any other, and must not wedge every idmapped mount if it stalls.
+        // Hold the map lock only for the O(1) lookup, never across the mint: a slow namespace creation for one key must
+        // not block a lookup of any other, and must not wedge every idmapped mount if it stalls.
         {
             let guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(fd) = guard.get(&key) {
                 return dup(fd);
             }
         }
-        // Minting outside the lock lets two callers race the same key; both
-        // create a namespace, and the keep-the-winner insert drops the
-        // loser's fd, reclaiming its namespace. Redundant creation is rare
-        // and bounded - the key space is a handful of mount configs.
+        // Two callers may race the same key and both create a namespace. The keep-the-winner insert drops the loser's
+        // fd, and the key space is a handful of mount configs.
         let fd = create_idmap_userns(uid_map, gid_map)?;
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         dup(guard.entry(key).or_insert(fd))
     }
 
-    /// Drop every cached namespace. Fds returned earlier stay valid; the next
-    /// [`IdmapCache::get_or_create`] for a given map set recreates it.
+    /// Drop every cached namespace. Fds returned earlier stay valid; the next [`IdmapCache::get_or_create`] for a given
+    /// map set recreates it.
     pub fn clear(&self) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }

@@ -7,9 +7,8 @@ pub(crate) const NFS4_ACL_XATTR: &str = "system.nfs4_acl_xdr";
 
 const HDR_SZ: usize = 8;
 const ACE_SZ: usize = 20;
-// The `iflag` bit that marks a special principal (`OWNER@`/`GROUP@`/
-// `EVERYONE@`). ZFS tests this bit alone and ignores the rest of the word,
-// so the decoder must too.
+// The `iflag` bit that marks a special principal (`OWNER@`/`GROUP@`/ `EVERYONE@`). ZFS tests this bit alone and ignores
+// the rest of the word, so the decoder must too.
 const ACEI4_SPECIAL_WHO: u32 = 1;
 
 tn_enum! {
@@ -29,8 +28,8 @@ tn_enum! {
 tn_enum! {
     /// The principal an NFS4 ACE applies to.
     ///
-    /// `Named` corresponds to a numeric uid/gid (`iflag == 0` on the wire); the
-    /// others are the special principals (`iflag == 1`).
+    /// `Named` corresponds to a numeric uid/gid (`iflag == 0` on the wire); the others are the special principals
+    /// (`iflag == 1`).
     pub enum Nfs4Who: u32 {
         /// A named uid/gid (see [`Nfs4Ace::who_id`]).
         Named = 0,
@@ -106,18 +105,14 @@ impl Nfs4Flag {
         .union(Nfs4Flag::NO_PROPAGATE_INHERIT)
         .union(Nfs4Flag::INHERIT_ONLY);
     /// The two "inheritable to a child" bits.
-    const INHERITABLE: Nfs4Flag =
-        Nfs4Flag::FILE_INHERIT.union(Nfs4Flag::DIRECTORY_INHERIT);
-    /// The audit/alarm qualifiers ZFS cannot represent: it masks these two
-    /// out of the on-disk ACE flags on both encode and decode, so a set bit
-    /// is silently lost on write.
-    const UNREPRESENTABLE: Nfs4Flag =
-        Nfs4Flag::SUCCESSFUL_ACCESS.union(Nfs4Flag::FAILED_ACCESS);
+    const INHERITABLE: Nfs4Flag = Nfs4Flag::FILE_INHERIT.union(Nfs4Flag::DIRECTORY_INHERIT);
+    /// The audit/alarm qualifiers ZFS cannot represent: it masks these two out of the on-disk ACE flags on both encode
+    /// and decode, so a set bit is silently lost on write.
+    const UNREPRESENTABLE: Nfs4Flag = Nfs4Flag::SUCCESSFUL_ACCESS.union(Nfs4Flag::FAILED_ACCESS);
 }
 
 tn_bitflags! {
-    /// ACL-level flags (the 4-byte XDR header). `ACL_IS_TRIVIAL`/`ACL_IS_DIR`
-    /// are ZFS on-disk extensions.
+    /// ACL-level flags (the 4-byte XDR header). `ACL_IS_TRIVIAL`/`ACL_IS_DIR` are ZFS on-disk extensions.
     pub struct Nfs4AclFlag: u32 {
         /// Automatic inheritance is enabled.
         AUTO_INHERIT = 0x0000_0001;
@@ -148,8 +143,7 @@ pub struct Nfs4Ace {
 }
 
 impl Nfs4Ace {
-    /// Construct an ACE. `who_id` is ignored (stored as `-1`) unless
-    /// `who_type` is [`Nfs4Who::Named`].
+    /// Construct an ACE. `who_id` is ignored (stored as `-1`) unless `who_type` is [`Nfs4Who::Named`].
     pub fn new(
         ace_type: Nfs4AceType,
         ace_flags: Nfs4Flag,
@@ -157,11 +151,7 @@ impl Nfs4Ace {
         who_type: Nfs4Who,
         who_id: i64,
     ) -> Self {
-        let who_id = if who_type == Nfs4Who::Named {
-            who_id
-        } else {
-            -1
-        };
+        let who_id = if who_type == Nfs4Who::Named { who_id } else { -1 };
         Nfs4Ace {
             ace_type,
             ace_flags,
@@ -183,38 +173,25 @@ pub struct Nfs4Acl {
 
 /// Read the XDR wire's big-endian word at `i`.
 ///
-/// Deliberately local, and not worth folding together with the readers in
-/// `acl::posix`, `sync_fs::iter`, `sync_fs::fhandle` or `uring_fs::query_tree`
-/// even though all five look alike. They do not agree on byte order - this one
-/// is big-endian because XDR is, the POSIX xattr is little-endian because the
-/// kernel writes it that way, and the resume tokens are native-endian because
-/// nothing outside the host reads them - so a shared reader is three readers,
-/// which is what these already are. It would also have to live somewhere all
-/// of `acl`, `fsiter`, `fhandle` and `uring-fs` can reach, and each of those
-/// is required to build on its own.
+/// Kept local rather than shared with the look-alike readers in `acl::posix`, `sync_fs::iter`, `sync_fs::fhandle` and
+/// `uring_fs::query_tree`, since they differ in byte order and each of those features must build on its own.
 #[inline]
 fn be32(b: &[u8], i: usize) -> u32 {
     u32::from_be_bytes(b[i..i + 4].try_into().unwrap())
 }
 
-/// The wire `who` word for a `Named` ACE. The field is 32 bits wide and ZFS
-/// stores it verbatim as a `uid_t`, so every `u32` is a valid named id. A `who_id` outside `0..=u32::MAX` cannot
-/// be represented and is rejected; a `Named` ACE never carries a negative id,
-/// since the decoder maps special principals to `-1`.
+/// The wire `who` word for a `Named` ACE. The field is 32 bits wide and ZFS stores it verbatim as a `uid_t`, so every
+/// `u32` is a valid named id. A `who_id` outside `0..=u32::MAX` cannot be represented and is rejected; a `Named` ACE
+/// never carries a negative id, since the decoder maps special principals to `-1`.
 fn named_who(who_id: i64) -> Result<u32> {
-    u32::try_from(who_id).map_err(|_| {
-        Error::Validation(format!(
-            "named NFS4 ACE id {who_id} is not a valid uid/gid"
-        ))
-    })
+    u32::try_from(who_id).map_err(|_| Error::Validation(format!("named NFS4 ACE id {who_id} is not a valid uid/gid")))
 }
 
 impl Nfs4Acl {
     /// Decode from the raw big-endian XDR bytes of `system.nfs4_acl_xdr`.
     ///
-    /// An empty buffer is the "present but empty" sentinel from `fgetacl` and
-    /// decodes to a trivial ACL. A non-empty buffer shorter than the 8-byte
-    /// header is a truncated blob and is rejected.
+    /// An empty buffer is the "present but empty" sentinel from `fgetacl` and decodes to a trivial ACL. A non-empty
+    /// buffer shorter than the 8-byte header is a truncated blob and is rejected.
     pub fn from_xattr(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
             return Ok(Nfs4Acl {
@@ -223,23 +200,16 @@ impl Nfs4Acl {
             });
         }
         if data.len() < HDR_SZ {
-            return Err(Error::Parse(format!(
-                "NFS4 ACL truncated: {} bytes",
-                data.len()
-            )));
+            return Err(Error::Parse(format!("NFS4 ACL truncated: {} bytes", data.len())));
         }
         let acl_flags = Nfs4AclFlag::from_bits_retain(be32(data, 0));
         let naces = be32(data, 4) as usize;
-        // `naces` is attacker-controlled (from the xattr blob); compute the
-        // required length with checked arithmetic so a huge count cannot wrap
-        // `usize` and slip past the truncation guard (a 32-bit-target hazard).
-        let need = naces
-            .checked_mul(ACE_SZ)
-            .and_then(|n| n.checked_add(HDR_SZ));
-        // ZFS requires the blob to be exactly header + naces*ACE_SZ
-        // (`nfsacl41i_to_zfsacl`), so require the same length: a trailing
-        // remainder or a count that under-declares the ACEs on the wire would
-        // otherwise decode and re-encode to a different blob.
+        // `naces` is attacker-controlled (from the xattr blob); compute the required length with checked arithmetic so
+        // a huge count cannot wrap `usize` and slip past the truncation guard (a 32-bit-target hazard).
+        let need = naces.checked_mul(ACE_SZ).and_then(|n| n.checked_add(HDR_SZ));
+        // ZFS requires the blob to be exactly header + naces*ACE_SZ (`nfsacl41i_to_zfsacl`), so require the same
+        // length: a trailing remainder or a count that under-declares the ACEs on the wire would otherwise decode and
+        // re-encode to a different blob.
         if need != Some(data.len()) {
             return Err(Error::Parse(format!(
                 "NFS4 ACL is {} bytes for a declared {naces} ACEs",
@@ -249,24 +219,21 @@ impl Nfs4Acl {
         let mut aces = Vec::with_capacity(naces);
         for i in 0..naces {
             let p = HDR_SZ + i * ACE_SZ;
-            let ace_type = Nfs4AceType::try_from(be32(data, p))
-                .map_err(|_| Error::Parse("invalid NFS4 ACE type".into()))?;
+            let ace_type =
+                Nfs4AceType::try_from(be32(data, p)).map_err(|_| Error::Parse("invalid NFS4 ACE type".into()))?;
             let ace_flags = Nfs4Flag::from_bits_retain(be32(data, p + 4));
             let iflag = be32(data, p + 8);
             let access_mask = Nfs4Perm::from_bits_retain(be32(data, p + 12));
             let who_raw = be32(data, p + 16);
-            // ZFS decides "special principal" from bit 0 of `iflag` alone; a
-            // word with other bits set but bit 0 clear is a named id, so read
-            // it the same way.
+            // ZFS decides "special principal" from bit 0 of `iflag` alone; a word with other bits set but bit 0 clear
+            // is a named id, so read it the same way.
             let (who_type, who_id) = if iflag & ACEI4_SPECIAL_WHO != 0 {
                 let w = match who_raw {
                     1 => Nfs4Who::Owner,
                     2 => Nfs4Who::Group,
                     3 => Nfs4Who::Everyone,
                     _ => {
-                        return Err(Error::Parse(
-                            "invalid NFS4 special principal".into(),
-                        ));
+                        return Err(Error::Parse("invalid NFS4 special principal".into()));
                     }
                 };
                 (w, -1)
@@ -284,9 +251,8 @@ impl Nfs4Acl {
         Ok(Nfs4Acl { acl_flags, aces })
     }
 
-    /// Build an ACL from ACEs, re-sorting them into Windows-canonical order
-    /// (explicit-deny, explicit-allow, inherited-deny, inherited-allow) with a
-    /// stable sort, matching the C `from_aces`.
+    /// Build an ACL from ACEs, re-sorting them into Windows-canonical order (explicit-deny, explicit-allow,
+    /// inherited-deny, inherited-allow) with a stable sort.
     pub fn from_aces<I>(aces: I, acl_flags: Nfs4AclFlag) -> Self
     where
         I: IntoIterator<Item = Nfs4Ace>,
@@ -298,8 +264,7 @@ impl Nfs4Acl {
 
     /// Encode to the raw big-endian XDR bytes (ACEs in stored order, no sort).
     ///
-    /// Errors if a `Named` ACE's [`who_id`](Nfs4Ace::who_id) is not a valid
-    /// uid/gid.
+    /// Errors if a `Named` ACE's [`who_id`](Nfs4Ace::who_id) is not a valid uid/gid.
     pub fn to_xattr(&self) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(HDR_SZ + self.aces.len() * ACE_SZ);
         out.extend_from_slice(&self.acl_flags.bits().to_be_bytes());
@@ -319,8 +284,7 @@ impl Nfs4Acl {
         Ok(out)
     }
 
-    /// True if the on-disk `ACL_IS_TRIVIAL` bit is set (the ACL is equivalent
-    /// to the mode bits).
+    /// True if the on-disk `ACL_IS_TRIVIAL` bit is set (the ACL is equivalent to the mode bits).
     pub fn trivial(&self) -> bool {
         self.acl_flags.contains(Nfs4AclFlag::ACL_IS_TRIVIAL)
     }
@@ -329,16 +293,9 @@ impl Nfs4Acl {
     ///
     /// Errors if no ACE is inheritable for the given child type.
     ///
-    /// **A correct prediction is not always a writable ACL.** This answers
-    /// what ZFS would create, and ZFS creates ACLs the write path refuses:
-    /// a parent ACE carrying `NO_PROPAGATE_INHERIT` yields a child ACE with
-    /// every inheritance bit stripped, so a child *directory* whose parent
-    /// had no other inheritable ACE gets an ACL with nothing inheritable in
-    /// it - which the structural check [`fsetacl`] runs rejects, exactly as
-    /// it rejects the trivial directory ACL ZFS synthesises from the mode
-    /// bits. A get-parent, predict, set-child caller sees the refusal
-    /// rather than a silently over-propagating grant, which is the safer of
-    /// the two answers and not an obvious one; do not reconcile it by
+    /// **A correct prediction is not always a writable ACL.** A parent ACE carrying `NO_PROPAGATE_INHERIT` yields a
+    /// child ACE with every inheritance bit stripped, so a child directory can get an ACL with nothing inheritable,
+    /// which [`fsetacl`] refuses as it refuses the trivial directory ACL ZFS synthesises. Do not reconcile this by
     /// widening what this predicts.
     ///
     /// [`fsetacl`]: crate::sync_fs::acl::fsetacl
@@ -354,8 +311,7 @@ impl Nfs4Acl {
             .collect();
         if aces.is_empty() {
             return Err(Error::Validation(
-                "parent ACL has no inheritable ACEs for this object type"
-                    .into(),
+                "parent ACL has no inheritable ACEs for this object type".into(),
             ));
         }
         let acl_flags = if is_dir {
@@ -366,7 +322,7 @@ impl Nfs4Acl {
         Ok(Nfs4Acl { acl_flags, aces })
     }
 
-    /// Structural validation (matching the C `nfs4acl_valid`).
+    /// Structural validation.
     pub(crate) fn validate(&self, is_dir: bool) -> Result<()> {
         let mut has_propagate = false;
         let mut has_inheritable = false;
@@ -382,14 +338,9 @@ impl Nfs4Acl {
                         .into(),
                 ));
             }
-            // AUDIT and ALARM are NFSv4.1 types this crate can represent
-            // and ZFS will not store: it answers `-EINVAL` for any type but
-            // ALLOW and DENY. Refused here so the failure names
-            // itself instead of arriving as a bare `EINVAL` from `setxattr`
-            // with nothing to attribute it to. Only the write path: the
-            // decoder keeps accepting them, so an ACL read from a
-            // filesystem that does store them still round-trips through
-            // this type.
+            // AUDIT and ALARM are representable here, and ZFS answers `-EINVAL` for them, so they are refused by name
+            // rather than as a bare `EINVAL` from `setxattr`. The decoder still accepts them, so an ACL read from
+            // elsewhere round-trips.
             if matches!(a.ace_type, Nfs4AceType::Audit | Nfs4AceType::Alarm) {
                 return Err(Error::Validation(format!(
                     "{:?} entries cannot be stored: ZFS implements only \
@@ -406,9 +357,7 @@ impl Nfs4Acl {
                         .into(),
                 ));
             }
-            if is_dir
-                && a.ace_flags.contains(Nfs4Flag::INHERIT_ONLY)
-                && !a.ace_flags.intersects(Nfs4Flag::INHERITABLE)
+            if is_dir && a.ace_flags.contains(Nfs4Flag::INHERIT_ONLY) && !a.ace_flags.intersects(Nfs4Flag::INHERITABLE)
             {
                 return Err(Error::Validation(
                     "INHERIT_ONLY requires FILE_INHERIT or DIRECTORY_INHERIT \
@@ -441,11 +390,9 @@ impl Nfs4Acl {
             ));
         }
         if is_dir && !has_inheritable {
-            // ZFS's own trivial directory ACL carries no inheritance flags, so
-            // it lands here - a get-modify-set of a stock directory fails at
-            // the set. Say so, rather than restating the rule: the caller has
-            // to add an inheritable ACE, and needs to know the bytes it just
-            // read cannot simply be written back.
+            // ZFS's own trivial directory ACL carries no inheritance flags, so it lands here - a get-modify-set of a
+            // stock directory fails at the set. Say so, rather than restating the rule: the caller has to add an
+            // inheritable ACE, and needs to know the bytes it just read cannot simply be written back.
             return Err(Error::Validation(if self.trivial() {
                 "directory ACL must contain at least one ACE with \
                  FILE_INHERIT or DIRECTORY_INHERIT; this is the trivial ACL \
@@ -469,9 +416,8 @@ fn bucket_key(a: &Nfs4Ace) -> u8 {
     inherited * 2 + is_allow
 }
 
-/// Whether a child of this type inherits an ACE carrying `flags` - a port of
-/// ZFS's own inheritance arithmetic, which is what this predicts and
-/// therefore the only definition that counts:
+/// Whether a child of this type inherits an ACE carrying `flags` - a port of ZFS's own inheritance arithmetic, which is
+/// what this predicts and therefore the only definition that counts:
 ///
 /// ```text
 /// if (S_ISDIR(obj_mode) && (iflags & ACE_DIRECTORY_INHERIT_ACE))
@@ -482,14 +428,8 @@ fn bucket_key(a: &Nfs4Ace) -> u8 {
 /// return (0);
 /// ```
 ///
-/// The `NO_PROPAGATE_INHERIT` term is load-bearing for exactly one input: a
-/// child **directory** whose parent ACE carries `FILE_INHERIT` without
-/// `DIRECTORY_INHERIT`. ZFS does not pass that one down - the ACE was meant
-/// for files, and the flag says "not to grandchildren" - and a predicate
-/// that answers on the two inheritable bits alone reports a grant the
-/// filesystem will not create. `validate` admits the combination (it refuses
-/// `NO_PROPAGATE_INHERIT` only with *no* inheritable flag set), so it is
-/// reachable. For a child file the two forms agree on every input.
+/// The `NO_PROPAGATE_INHERIT` term matters for one input, a child **directory** whose parent ACE carries `FILE_INHERIT`
+/// without `DIRECTORY_INHERIT`, which ZFS does not pass down and `validate` admits.
 fn ace_is_inheritable(flags: Nfs4Flag, is_dir: bool) -> bool {
     if is_dir && flags.contains(Nfs4Flag::DIRECTORY_INHERIT) {
         true
@@ -500,24 +440,8 @@ fn ace_is_inheritable(flags: Nfs4Flag, is_dir: bool) -> bool {
     }
 }
 
-/// `aclinherit` is deliberately not a parameter, and the reason is the
-/// product's rather than the library's: TrueNAS sets `aclinherit=passthrough`
-/// on every NFSv4 dataset it creates, and passthrough is the one value under
-/// which `zfs_acl_inherit` leaves the access mask alone. Its other arms all
-/// alter what the child gets - `discard` inherits nothing, `noallow` drops
-/// ALLOW ACEs, `passthrough-x` strips `ACE_EXECUTE` from a non-directory,
-/// `restricted` clears `RESTRICTED_CLEAR` (`ACE_WRITE_ACL|ACE_WRITE_OWNER`) -
-/// so a predictor that ignored the property would be wrong under any of
-/// them. It is right under the one the product uses, and taking the
-/// property as an argument would pessimize the library for configurations
-/// that do not occur. A dataset built by hand with `zfs create` takes ZFS's
-/// own default of `restricted` and reads `SOURCE=default`, which looks
-/// stock and is not what the product produces.
-///
-/// Rewrite an ACE's flags for a newly-created child - the second half of
-/// ZFS's inheritance arithmetic, which is what this predicts and therefore
-/// the only definition that counts (`zfs_acl_inherit`,
-/// `module/os/linux/zfs/zfs_acl.c`):
+/// Rewrite an ACE's flags for a newly-created child - the second half of ZFS's inheritance arithmetic, which is what
+/// this predicts and therefore the only definition that counts (`zfs_acl_inherit`, `module/os/linux/zfs/zfs_acl.c`):
 ///
 /// ```text
 /// zfs_set_ace(aclp, acep, access_mask, type, who, iflags|ACE_INHERITED_ACE);
@@ -536,17 +460,15 @@ fn ace_is_inheritable(flags: Nfs4Flag, is_dir: bool) -> bool {
 /// ace_flags_set(acep, newflags|ACE_INHERITED_ACE);
 /// ```
 ///
-/// `ALL_INHERIT` is all four inheritance bits plus `INHERITED`
-/// (`zfs_acl.c:86`), so the first branch leaves a child ACE that is not
-/// inheritable any further - which is the whole meaning of
-/// `NO_PROPAGATE_INHERIT`. Both of the non-propagating cases - a child file,
-/// and a child directory whose parent ACE says stop - take it, which is why
-/// they are one arm here rather than two.
+/// `ALL_INHERIT` is all four inheritance bits plus `INHERITED` (`zfs_acl.c:86`), so a child file and a child directory
+/// whose parent ACE says stop share one arm and get an ACE that is not inheritable any further.
 ///
-/// The `(iflags & (FILE|DIRECTORY)) == FILE` test reduces to "no
-/// `DIRECTORY_INHERIT`" for anything that reaches this function, since
-/// [`ace_is_inheritable`] admits a child directory only when one of the two
-/// bits is set.
+/// `aclinherit` is not a parameter. TrueNAS sets `aclinherit=passthrough` on every NFSv4 dataset, the one value under
+/// which `zfs_acl_inherit` leaves the access mask alone, so this is right there and wrong under the others. A dataset
+/// made by hand with `zfs create` gets ZFS's default of `restricted`.
+///
+/// The `(iflags & (FILE|DIRECTORY)) == FILE` test reduces to "no `DIRECTORY_INHERIT`" for anything that reaches this
+/// function, since [`ace_is_inheritable`] admits a child directory only when one of the two bits is set.
 fn inherited_flags(f: Nfs4Flag, is_dir: bool) -> Nfs4Flag {
     use Nfs4Flag as F;
     if is_dir && !f.contains(F::NO_PROPAGATE_INHERIT) {
@@ -580,11 +502,8 @@ mod tests {
 
     /// AUDIT and ALARM are representable here and unstorable there.
     ///
-    /// ZFS answers `-EINVAL` for any ACE type but ALLOW and DENY, so
-    /// writing one
-    /// reached the kernel and came back as a bare `EINVAL` from `setxattr`
-    /// with nothing naming the cause. The decoder still accepts them - only
-    /// the write path refuses - so an ACL read from elsewhere round-trips.
+    /// ZFS answers `-EINVAL` for any ACE type but ALLOW and DENY, so the write path refuses them by name. The decoder
+    /// still accepts them, so an ACL read from elsewhere round-trips.
     #[test]
     fn validate_rejects_ace_types_zfs_will_not_store() {
         for t in [Nfs4AceType::Audit, Nfs4AceType::Alarm] {
@@ -612,15 +531,9 @@ mod tests {
         );
     }
 
-    /// `ace_is_inheritable` is a prediction of `zfs_ace_can_use`, so the
-    /// whole truth table is the property - a row that disagrees is an ACL
-    /// this crate says a child will have and the filesystem will not give
-    /// it.
-    ///
-    /// The row that used to disagree is a child **directory** whose parent
-    /// ACE carries `FILE_INHERIT` without `DIRECTORY_INHERIT` and with
-    /// `NO_PROPAGATE_INHERIT`: the ACE was meant for files and the flag
-    /// says "not to grandchildren", so ZFS does not pass it down.
+    /// `ace_is_inheritable` is a prediction of `zfs_ace_can_use`, so the whole truth table is the property, including a
+    /// child **directory** whose parent ACE carries `FILE_INHERIT` and `NO_PROPAGATE_INHERIT` without
+    /// `DIRECTORY_INHERIT`, which ZFS does not pass down.
     #[test]
     fn inheritance_matches_zfs_ace_can_use() {
         use Nfs4Flag as F;
@@ -645,20 +558,17 @@ mod tests {
                 );
             }
         }
-        // And the row itself, spelled out, so a rewrite that keeps the
-        // loop green by changing both sides still has to face it.
+        // And the row itself, spelled out, so a rewrite that keeps the loop green by changing both sides still has to
+        // face it.
         let nope = F::FILE_INHERIT | F::NO_PROPAGATE_INHERIT;
         assert!(
             !ace_is_inheritable(nope, true),
             "a FILE_INHERIT|NO_PROPAGATE ACE is not passed to a child dir"
         );
-        assert!(
-            ace_is_inheritable(nope, false),
-            "but a child file still gets it"
-        );
+        assert!(ace_is_inheritable(nope, false), "but a child file still gets it");
 
-        // Reached through the public entry point, on an ACL `validate`
-        // admits - which is what makes the row reachable at all.
+        // Reached through the public entry point, on an ACL `validate` admits - which is what makes the row reachable
+        // at all.
         let mut acl = named_user(1000);
         acl.acl_flags = Nfs4AclFlag::ACL_IS_DIR;
         acl.aces[0].ace_flags = nope;
@@ -673,16 +583,12 @@ mod tests {
         );
     }
 
-    /// The *flags* half of the same prediction, which the sweep above does
-    /// not reach: it compares `ace_is_inheritable` only, so an ACE that ZFS
-    /// and this crate agree a child receives can still arrive carrying
-    /// different flags.
+    /// The *flags* half of the same prediction, which the sweep above does not reach: it compares `ace_is_inheritable`
+    /// only, so an ACE that ZFS and this crate agree a child receives can still arrive carrying different flags.
     ///
-    /// The row that disagreed is a child **directory** whose parent ACE
-    /// carries `NO_PROPAGATE_INHERIT` alongside `INHERIT_ONLY` and
-    /// `FILE_INHERIT`: ZFS strips every inheritance bit, and keeping them
-    /// hands the grandchildren a grant the parent ACE said to stop at one
-    /// level - and `validate` admits the result, so it is writable.
+    /// A child **directory** whose parent ACE carries `NO_PROPAGATE_INHERIT` alongside `INHERIT_ONLY` and
+    /// `FILE_INHERIT` must have every inheritance bit stripped, or the grandchildren get a grant meant to stop at one
+    /// level.
     #[test]
     fn inherited_flags_match_zfs_acl_inherit() {
         use Nfs4Flag as F;
@@ -694,8 +600,7 @@ mod tests {
             if !is_dir || f.contains(F::NO_PROPAGATE_INHERIT) {
                 return (newflags - all_inherit) | F::INHERITED;
             }
-            if f.intersects(F::INHERITABLE) && !f.contains(F::DIRECTORY_INHERIT)
-            {
+            if f.intersects(F::INHERITABLE) && !f.contains(F::DIRECTORY_INHERIT) {
                 newflags |= F::INHERIT_ONLY;
             } else {
                 newflags -= F::INHERIT_ONLY;
@@ -719,12 +624,9 @@ mod tests {
         }
         assert_eq!(reached, 18, "every inheriting row has to be compared");
 
-        // The row itself, through the public entry point, spelled out so a
-        // rewrite that keeps both sides in step still has to face it.
-        let stop = F::FILE_INHERIT
-            | F::DIRECTORY_INHERIT
-            | F::NO_PROPAGATE_INHERIT
-            | F::INHERIT_ONLY;
+        // The row itself, through the public entry point, spelled out so a rewrite that keeps both sides in step still
+        // has to face it.
+        let stop = F::FILE_INHERIT | F::DIRECTORY_INHERIT | F::NO_PROPAGATE_INHERIT | F::INHERIT_ONLY;
         let mut acl = named_user(1000);
         acl.acl_flags = Nfs4AclFlag::ACL_IS_DIR;
         acl.aces[0].ace_flags = stop;
@@ -739,27 +641,13 @@ mod tests {
         );
     }
 
-    /// The prediction is ZFS's, and `validate` is stricter than ZFS, so the
-    /// two can disagree - pinned here so the disagreement is a decision
-    /// rather than a surprise.
-    ///
-    /// A parent ACE flagged `FILE|DIRECTORY|NO_PROPAGATE|INHERIT_ONLY` hands
-    /// a child directory an ACE with every inheritance bit gone, which is
-    /// what `zfs_acl_inherit` does and what the filesystem then stores.
-    /// `validate(true)` refuses that ACL for having nothing inheritable in
-    /// it - the same rule that refuses the trivial directory ACL ZFS
-    /// synthesises. So a caller that predicts and writes gets a named
-    /// refusal where it used to get `Ok` and an ACE the grandchildren
-    /// inherit.
-    ///
-    /// The child *file* form is unaffected and still writes.
+    /// The prediction is ZFS's and `validate` is stricter, so the two can disagree, and this pins that as a decision. A
+    /// parent ACE flagged `FILE|DIRECTORY|NO_PROPAGATE|INHERIT_ONLY` hands a child directory an ACE with no inheritance
+    /// bit, which `validate(true)` refuses, while the child *file* form still writes.
     #[test]
     fn a_no_propagate_prediction_is_correct_and_unwritable() {
         use Nfs4Flag as F;
-        let stop = F::FILE_INHERIT
-            | F::DIRECTORY_INHERIT
-            | F::NO_PROPAGATE_INHERIT
-            | F::INHERIT_ONLY;
+        let stop = F::FILE_INHERIT | F::DIRECTORY_INHERIT | F::NO_PROPAGATE_INHERIT | F::INHERIT_ONLY;
         let mut acl = named_user(1000);
         acl.acl_flags = Nfs4AclFlag::ACL_IS_DIR;
         acl.aces[0].ace_flags = stop;
@@ -774,15 +662,15 @@ mod tests {
             "the refusal has to name the rule: {e}"
         );
 
-        // A child file takes the same stripped flags and validates, so the
-        // refusal above is the directory rule and not the strip.
+        // A child file takes the same stripped flags and validates, so the refusal above is the directory rule and not
+        // the strip.
         let child = acl.generate_inherited_acl(false).expect("inherits");
         assert_eq!(child.aces[0].ace_flags, F::INHERITED);
         child.validate(false).expect("a child file ACL is writable");
     }
 
-    /// ZFS masks SUCCESSFUL_ACCESS/FAILED_ACCESS out of the ACE flags it
-    /// writes, so accepting them means writing 0x30 and reading back 0x00.
+    /// ZFS masks SUCCESSFUL_ACCESS/FAILED_ACCESS out of the ACE flags it writes, so accepting them means writing 0x30
+    /// and reading back 0x00.
     #[test]
     fn validate_rejects_flags_zfs_cannot_store() {
         for f in [
@@ -801,9 +689,8 @@ mod tests {
         assert!(acl.validate(false).is_ok());
     }
 
-    /// The trivial directory ACL ZFS puts on every directory carries no
-    /// inheritance flags, so a get-modify-set fails at the set. The error must
-    /// say that, not just restate the rule.
+    /// The trivial directory ACL ZFS puts on every directory carries no inheritance flags, so a get-modify-set fails at
+    /// the set. The error must say that, not just restate the rule.
     #[test]
     fn trivial_directory_acl_is_rejected_with_a_specific_error() {
         let mut acl = named_user(1000);
@@ -867,8 +754,8 @@ mod tests {
         assert!(Nfs4Acl::from_xattr(&[0u8; 7]).is_err());
     }
 
-    // Build a raw NFS4 ACL blob: header (flags, count) then each ACE as five
-    // big-endian words [type, flag, iflag, access_mask, who].
+    // Build a raw NFS4 ACL blob: header (flags, count) then each ACE as five big-endian words [type, flag, iflag,
+    // access_mask, who].
     fn blob(acl_flags: u32, aces: &[[u32; 5]]) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&acl_flags.to_be_bytes());
@@ -883,8 +770,8 @@ mod tests {
 
     #[test]
     fn iflag_without_bit0_is_a_named_principal() {
-        // iflag=2 has bit 0 clear, so ZFS stores a named id; the decoder must
-        // read the same principal rather than treating the word as special.
+        // iflag=2 has bit 0 clear, so ZFS stores a named id; the decoder must read the same principal rather than
+        // treating the word as special.
         let acl = Nfs4Acl::from_xattr(&blob(0, &[[0, 0, 2, 0x1, 7]])).unwrap();
         assert_eq!(acl.aces.len(), 1);
         assert_eq!(acl.aces[0].who_type, Nfs4Who::Named);
@@ -910,8 +797,8 @@ mod tests {
         let mut long = ok.clone();
         long.extend_from_slice(&[0u8; 7]);
         assert!(Nfs4Acl::from_xattr(&long).is_err());
-        // Two ACEs on the wire under a header claiming one: the extra would be
-        // dropped and re-encoded away, so reject it.
+        // Two ACEs on the wire under a header claiming one: the extra would be dropped and re-encoded away, so reject
+        // it.
         let mut under = blob(0, &[[0, 0, 0, 0x1, 5], [0, 0, 0, 0x2, 6]]);
         under[4..8].copy_from_slice(&1u32.to_be_bytes());
         assert!(Nfs4Acl::from_xattr(&under).is_err());

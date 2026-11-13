@@ -1,21 +1,14 @@
 #![no_main]
 
-//! Fuzz the POSIX.1e ACL codec — the little-endian `system.posix_acl_access`
-//! and `system.posix_acl_default` blobs.
+//! Fuzz the POSIX.1e ACL codec, the little-endian `system.posix_acl_access` and `system.posix_acl_default` blobs.
 //!
-//! Same contract as the NFSv4 target: `parse_aces` indexes entries with
-//! unchecked `le16`/`le32` behind a version check and a
-//! `(len - HDR) % ACE_SZ == 0` check, and anything it accepts must be
-//! re-encodable. The interesting asymmetry here is the `e_id` field — the
-//! kernel writes `ACL_UNDEFINED_ID` for every non-USER/GROUP tag and ignores
-//! the field when reading one back (`fs/posix_acl.c`), so the decoder
-//! normalizes a special entry's id to -1 and rejects a named entry carrying the
-//! sentinel. Without that, `from_xattr` would accept blobs `access_bytes`
-//! either refuses outright or re-emits differently.
+//! `parse_aces` indexes entries with unchecked `le16` and `le32` reads behind a version check and a `(len - HDR) %
+//! ACE_SZ == 0` check, and anything it accepts must encode again. The kernel writes `ACL_UNDEFINED_ID` in `e_id` for
+//! every tag but USER and GROUP and ignores the field when reading one back (`fs/posix_acl.c`), so the decoder sets a
+//! special entry's id to -1 and rejects a named entry carrying the sentinel.
 //!
-//! Asserted as idempotence after one normalization pass, not byte equality: a
-//! special tag whose wire id is some stray value normalizes to the sentinel on
-//! the way out, which is correct.
+//! The round trip is idempotence after one normalization pass, not byte equality, since a special tag's stray wire id
+//! is written back as the sentinel.
 
 use libfuzzer_sys::fuzz_target;
 use truenas_ros::sync_fs::acl::PosixAcl;
@@ -26,10 +19,9 @@ const HDR_SZ: usize = 4;
 const ACE_SZ: usize = 8;
 
 fuzz_target!(|data: &[u8]| {
-    // Split one input into the access blob and the optional default blob, so
-    // a corpus entry is just the bytes of a real xattr pair. The leading byte
-    // chooses whether a default ACL is present at all — `None` and
-    // `Some(empty)` are different states, and both must round-trip.
+    // Split one input into the access blob and the optional default blob, so a corpus entry is just the bytes of a real
+    // xattr pair. The leading byte chooses whether a default ACL is present at all — `None` and `Some(empty)` are
+    // different states, and both must round-trip.
     let Some((&sel, rest)) = data.split_first() else {
         return;
     };
@@ -44,15 +36,11 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let aenc = acl
-        .access_bytes()
-        .expect("a decoded access ACL must be re-encodable");
-    let denc = acl
-        .default_bytes()
-        .expect("a decoded default ACL must be re-encodable");
+    let aenc = acl.access_bytes().expect("a decoded access ACL must be re-encodable");
+    let denc = acl.default_bytes().expect("a decoded default ACL must be re-encodable");
 
-    // An empty input decodes to an empty list and encodes back to a bare
-    // header; anything else is header + one record per entry.
+    // An empty input decodes to an empty list and encodes back to a bare header; anything else is header + one record
+    // per entry.
     assert_eq!(
         aenc.len(),
         HDR_SZ + ACE_SZ * acl.access.len(),
@@ -71,10 +59,7 @@ fuzz_target!(|data: &[u8]| {
         "the default ACL appeared or vanished across encoding"
     );
 
-    // Re-decoding the encoder's own output must reproduce the same ACL, and
-    // encoding it again must reproduce the same bytes.
-    let again = PosixAcl::from_xattr(&aenc, denc.as_deref())
-        .expect("re-encoded ACL must re-decode");
+    let again = PosixAcl::from_xattr(&aenc, denc.as_deref()).expect("re-encoded ACL must re-decode");
     assert_eq!(
         (&again.access, &again.default),
         (&acl.access, &acl.default),
@@ -86,31 +71,22 @@ fuzz_target!(|data: &[u8]| {
         "access encoding is not a fixed point"
     );
     assert_eq!(
-        again
-            .default_bytes()
-            .expect("re-decoded ACL must re-encode"),
+        again.default_bytes().expect("re-decoded ACL must re-encode"),
         denc,
         "default encoding is not a fixed point"
     );
 
-    // Inheritance needs a default ACL to draw from; erroring is a normal
-    // answer. What it returns must satisfy the same contract - at every
-    // create mode, since the mode is intersected into the result
-    // (`posix_acl_create_masq`) and a narrowed entry still has to encode.
+    // Inheritance needs a default ACL to draw from; erroring is a normal answer. What it returns must satisfy the same
+    // contract - at every create mode, since the mode is intersected into the result (`posix_acl_create_masq`) and a
+    // narrowed entry still has to encode.
     for is_dir in [false, true] {
         for mode in [0o000u32, 0o600, 0o700, 0o644, 0o755, 0o777] {
-            let Ok((child, _mode)) = acl.generate_inherited_acl(is_dir, mode)
-            else {
+            let Ok((child, _mode)) = acl.generate_inherited_acl(is_dir, mode) else {
                 continue;
             };
-            let cenc = child
-                .access_bytes()
-                .expect("an inherited ACL must be re-encodable");
-            let cdef = child
-                .default_bytes()
-                .expect("an inherited ACL must be re-encodable");
-            let redecoded = PosixAcl::from_xattr(&cenc, cdef.as_deref())
-                .expect("inherited ACL must re-decode");
+            let cenc = child.access_bytes().expect("an inherited ACL must be re-encodable");
+            let cdef = child.default_bytes().expect("an inherited ACL must be re-encodable");
+            let redecoded = PosixAcl::from_xattr(&cenc, cdef.as_deref()).expect("inherited ACL must re-decode");
             assert_eq!(
                 (&redecoded.access, &redecoded.default),
                 (&child.access, &child.default),

@@ -1,6 +1,5 @@
-//! Manual end-to-end check against a *real* middlewared. Not a CI test -
-//! the QEMU VM has no middlewared, so this is the by-hand proof on a real
-//! TrueNAS box (25.10 or 27.0).
+//! Manual end-to-end check against a *real* middlewared on a TrueNAS box. It is not a CI test, since the QEMU VM has no
+//! middlewared.
 //!
 //! ```text
 //! # As root (the daemon's own full-admin session):
@@ -13,15 +12,11 @@
 //! cargo run --example system_info -- --as-uid 3000 --as-gid 3000
 //! ```
 //!
-//! It calls `core.ping` (expect `"pong"`), `system.info`, and `auth.me`
-//! (who the session authenticated as), printing each. A demo bulk-style
-//! call is out of scope for a read-only probe; the point here is the
-//! transport, the handshake, and the identity.
+//! It calls `core.ping` (expect `"pong"`), `system.info`, and `auth.me` (who the session authenticated as), printing
+//! each.
 
 use std::time::Duration;
-use truenas_api_client::{
-    ApiClient, ApiConfig, AsUser, CredBroker, SessionOpts,
-};
+use truenas_api_client::{ApiClient, ApiConfig, AsUser, CredBroker, SessionOpts};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -33,17 +28,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..ApiConfig::default()
     };
 
-    // Root path: the client owns its ring, sessions dial ambient.
-    // Personality path: the ring predates the broker fork, the broker
-    // mints the uid on it, and the session dials under it.
+    // Root path: the client owns its ring, sessions dial ambient. Personality path: the ring predates the broker fork,
+    // the broker mints the uid on it, and the session dials under it.
     let (mut api, opts) = match uid {
         None => (ApiClient::new(cfg)?, SessionOpts::default()),
         Some(uid) => {
             let ring = ApiClient::setup_ring(&cfg)?;
             let broker = CredBroker::spawn(&[&ring])?;
-            let who = broker
-                .handle(0)?
-                .register(&AsUser::new(uid, gid.unwrap_or(uid)))?;
+            let who = broker.handle(0)?.register(&AsUser::new(uid, gid.unwrap_or(uid)))?;
             (
                 ApiClient::with_ring(cfg, ring)?,
                 SessionOpts::default().personality(who),

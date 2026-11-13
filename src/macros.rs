@@ -1,20 +1,15 @@
-//! Internal macros for defining flag and enum types from `libc` constants or
-//! explicit kernel-header values.
+//! Internal macros for defining flag and enum types from `libc` constants or explicit kernel-header values.
 //!
-//! Beyond a plain `bitflags!` / enum definition, they add a `= <literal>`
-//! form, because many constants we need (`STATMOUNT_*`, `LISTMOUNT_*`,
-//! `FSCONFIG_*`, `OPEN_TREE_*`, `MOVE_MOUNT_*`, newer `STATX_*`, ...) are not
-//! exposed by the `libc` crate and must be hardcoded from the kernel uapi
-//! headers.
+//! Beyond a plain `bitflags!` / enum definition, they add a `= <literal>` form, because many constants we need
+//! (`STATMOUNT_*`, `LISTMOUNT_*`, `FSCONFIG_*`, `OPEN_TREE_*`, `MOVE_MOUNT_*`, newer `STATX_*`, ...) are not exposed by
+//! the `libc` crate and must be hardcoded from the kernel uapi headers.
 
 /// Define a `bitflags`-based flag type.
 ///
 /// Each flag is written as one of:
 /// * `FLAG;` - value taken from `libc::FLAG`.
-/// * `FLAG = 0x1;` - explicit kernel-header value (annotate with a
-///   `// <header>:<line>` comment at the use site).
-/// * `FLAG as u64;` - `libc::FLAG` cast to the container type (for libc type
-///   mismatches).
+/// * `FLAG = 0x1;` - explicit kernel-header value (annotate with a `// <header>:<line>` comment at the use site).
+/// * `FLAG as u64;` - `libc::FLAG` cast to the container type (for libc type mismatches).
 #[allow(unused_macros)]
 macro_rules! tn_bitflags {
     (
@@ -44,9 +39,8 @@ macro_rules! tn_bitflags {
     (@value $Flag:ident) => { libc::$Flag };
 }
 
-/// Define a closed `#[repr($repr)]` enum with explicit values and a
-/// `TryFrom<$repr>` conversion that returns [`Errno::EINVAL`] for unknown
-/// values.
+/// Define a closed `#[repr($repr)]` enum with explicit values and a `TryFrom<$repr>` conversion that returns
+/// [`Errno::EINVAL`] for unknown values.
 ///
 /// [`Errno::EINVAL`]: crate::errno::Errno::EINVAL
 #[allow(unused_macros)]
