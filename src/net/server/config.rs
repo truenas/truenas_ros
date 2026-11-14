@@ -73,6 +73,14 @@ pub struct ServerConfig {
     /// wait in the queue holding neither. Default `uring_fs::core::LOOKUP_CEILING`.
     #[cfg(feature = "uring-fs")]
     pub lookup_offload_ceiling: usize,
+    /// Warm floor of the write lane, each ring's pool for `FsConn::offload_write_window` and `offload_write_owned`.
+    /// Per ring, and resident once the lane is first used. Default `uring_fs::core::WRITE_FLOOR`.
+    #[cfg(feature = "uring-fs")]
+    pub write_offload_floor: usize,
+    /// Ceiling the write lane grows to when every one of its workers is busy writing, past which writes queue. Per
+    /// ring. Default `uring_fs::core::WRITE_CEILING`.
+    #[cfg(feature = "uring-fs")]
+    pub write_offload_ceiling: usize,
     /// Chunk size for file-sourced reply bodies (`Response::ReplyFile`), and the size of each buffer in the file-body
     /// ring ([`fs_body_pool`](ServerConfig::fs_body_pool)). A connection has at most two chunks out, so
     /// `pool_size x 2 x fs_body_chunk` is the ceiling when every connection is mid-body. The count is fixed, since on
@@ -274,6 +282,10 @@ impl Default for ServerConfig {
             #[cfg(feature = "uring-fs")]
             lookup_offload_ceiling: crate::uring_fs::core::LOOKUP_CEILING,
             #[cfg(feature = "uring-fs")]
+            write_offload_floor: crate::uring_fs::core::WRITE_FLOOR,
+            #[cfg(feature = "uring-fs")]
+            write_offload_ceiling: crate::uring_fs::core::WRITE_CEILING,
+            #[cfg(feature = "uring-fs")]
             fs_body_chunk: 256 * 1024,
             #[cfg(feature = "uring-fs")]
             fs_body_pool: true,
@@ -369,6 +381,16 @@ impl ServerConfig {
             return Err(Error::Validation(format!(
                 "lookup_offload_floor must be in \
                  1..=lookup_offload_ceiling..={MAX_OFFLOAD_THREADS}"
+            )));
+        }
+        #[cfg(feature = "uring-fs")]
+        if self.write_offload_floor == 0
+            || self.write_offload_floor > self.write_offload_ceiling
+            || self.write_offload_ceiling > MAX_OFFLOAD_THREADS
+        {
+            return Err(Error::Validation(format!(
+                "write_offload_floor must be in \
+                 1..=write_offload_ceiling..={MAX_OFFLOAD_THREADS}"
             )));
         }
         // A chunk sizes one of two per-connection body buffers, and a read's result rides a CQE's i32 - bound both ends
@@ -559,10 +581,10 @@ mod tests {
     }
 
     /// The offload bounds spawn real threads on the reactor thread at first use, so they are bounded at construction
-    /// like every other sizing knob, for the file pool and the lookup lane alike.
+    /// like every other sizing knob, for every pool.
     #[cfg(feature = "uring-fs")]
     #[test]
-    fn validate_bounds_both_offload_pools() {
+    fn validate_bounds_every_offload_pool() {
         let a = addrs();
         assert!(ServerConfig::default().validate(&a).is_ok());
         for (floor, ceiling) in [
@@ -581,7 +603,17 @@ mod tests {
                 lookup_offload_ceiling: ceiling,
                 ..ServerConfig::default()
             };
-            for (cfg, knob) in [(file, "fs_offload_floor"), (lookup, "lookup_offload_floor")] {
+            let write = ServerConfig {
+                write_offload_floor: floor,
+                write_offload_ceiling: ceiling,
+                ..ServerConfig::default()
+            };
+            let knobs = [
+                (file, "fs_offload_floor"),
+                (lookup, "lookup_offload_floor"),
+                (write, "write_offload_floor"),
+            ];
+            for (cfg, knob) in knobs {
                 let e = cfg.validate(&a).unwrap_err().to_string();
                 assert!(
                     e.contains(knob),
@@ -589,6 +621,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A server's write lane takes its bounds from the config.
+    #[cfg(all(feature = "uring-fs", not(loom)))]
+    #[test]
+    fn a_servers_write_lane_takes_its_bounds_from_the_config() {
+        use crate::net::core::protocol::{Endian, PrefixWidth};
+        use crate::net::server::{Server, length_prefixed};
+        let cfg = ServerConfig {
+            fs_ops: 16,
+            write_offload_floor: 2,
+            write_offload_ceiling: 3,
+            ..ServerConfig::default()
+        };
+        let proto = length_prefixed(PrefixWidth::U32, Endian::Big, false, |_h, _b, _p| None);
+        let addr = ServerAddr::Tcp("127.0.0.1:0".parse().unwrap());
+        let server = match Server::with_config([addr], cfg, proto) {
+            Ok(s) => s,
+            Err(crate::Error::Errno(e)) if crate::uring::setup_unavailable(e) => return,
+            Err(e) => panic!("Server::with_config: {e}"),
+        };
+        let fs = server.fs.as_ref().expect("a server with an fs table");
+        assert_eq!(
+            fs.write_bounds(),
+            crate::uring_fs::OffloadBounds { floor: 2, ceiling: 3 }
+        );
     }
 
     /// `recv_buffer_bytes` is bounded, and a zero receipt window - which would renew a spliced body's budget on no

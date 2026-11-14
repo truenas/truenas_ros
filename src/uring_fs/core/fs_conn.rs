@@ -53,7 +53,7 @@ impl<'a> FsConn<'a> {
     /// the way. **The one shape every submit method here hands the core**, and the only way to build the share
     /// ([`armed`]).
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
-    fn waiter<F>(&mut self, on_done: F) -> FsWaiter
+    pub(super) fn waiter<F>(&mut self, on_done: F) -> FsWaiter
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {

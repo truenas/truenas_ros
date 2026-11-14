@@ -11,7 +11,7 @@
 //!   the two reads [`FsHandle::fgetxattr_as_root`] and [`FsHandle::fgetxattr_proc_as_root`], for metadata a server
 //!   checks itself and never hands to a request, the reopen [`FsHandle::reopen_proc_as_root`], for an access a server
 //!   has already decided, and the write allowlist of [`PrivilegedXattrs`]. The few calls that are not ring ops, such as
-//!   [`FsHandle::close`] and [`FsHandle::fremovexattr`], take none.
+//!   [`FsHandle::close`], [`FsHandle::fremovexattr`] and the write lane's ([`FsConn::offload_write_owned`]), take none.
 //! - **Resolution is anchored.** No call takes an absolute path. [`Anchor`] is a long-lived real directory fd; `open`
 //!   resolves a **relative**, multi-component path against it (confine it in-kernel with
 //!   [`ResolveFlag::RESOLVE_BENEATH`](crate::sync_fs::ResolveFlag)), and every subsequent operation is fd-based on the

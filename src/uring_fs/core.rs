@@ -14,7 +14,7 @@
 //!   frees only at its own single terminal CQE, so a stale / duplicate / wrong-tag completion is rejected.
 
 use super::file_lease::{FileLeaseId, FileLeases};
-use super::offload_pool::{FILE_WORKER, Job, LOOKUP_WORKER, OffloadBounds, SharedPool};
+use super::offload_pool::{FILE_WORKER, Job, LOOKUP_WORKER, OffloadBounds, SharedPool, WRITE_WORKER};
 use super::{
     Anchor, CONFINED_RESOLVE, File, FsOutcome, Leaf, Personality, PrivilegedXattrs, ReopenAccess, ReplyTo, RwFlags,
     statx_at_flags,
@@ -84,6 +84,11 @@ pub(crate) const LOOKUP_FLOOR: usize = 1;
 /// Default ceiling of the lookup lane, the same as [`OFFLOAD_CEILING`]. A job there may wait as long as a remote
 /// service's timeouts allow, holding a socket all the while, so this bounds the sockets as well as the threads.
 pub(crate) const LOOKUP_CEILING: usize = 64;
+/// Default warm floor of the write lane ([`FsConn::offload_write_owned`]). Four, so a burst of writes does not wait on
+/// a thread spawn, as growth is limited to one worker per millisecond.
+pub(crate) const WRITE_FLOOR: usize = 4;
+/// Default ceiling of the write lane, sixteen writes in flight on a ring before the rest queue.
+pub(crate) const WRITE_CEILING: usize = 16;
 /// Names per off-loop `readdir` batch in [`FsConn::next_batch`].
 const DIR_BATCH: usize = 256;
 
@@ -805,6 +810,13 @@ pub(crate) struct FsCore {
     lookup: Arc<SharedPool>,
     /// Jobs queued on the lookup lane since the last [`Self::flush_offloads`].
     pending_lookups: usize,
+    /// The write lane, a pool whose threads write without `CAP_FSETID` ([`FsConn::offload_write_owned`]). Spawned on
+    /// first use.
+    write: Arc<SharedPool>,
+    /// Jobs queued on the write lane since the last [`Self::flush_offloads`].
+    pending_writes: usize,
+    /// What a test makes each write of the lane do.
+    pub(crate) write_seam: offload::WriteSeam,
     /// Where workers push finished jobs; drained on the loop's wake.
     completions: Arc<Mutex<VecDeque<PoolCompletion>>>,
     /// Reactor-side continuations for in-flight offloads, keyed by token.
@@ -866,6 +878,15 @@ impl FsCore {
                 },
             ),
             pending_lookups: 0,
+            write: SharedPool::new(
+                WRITE_WORKER,
+                OffloadBounds {
+                    floor: WRITE_FLOOR,
+                    ceiling: WRITE_CEILING,
+                },
+            ),
+            pending_writes: 0,
+            write_seam: offload::WriteSeam::default(),
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
             next_offload: 0,

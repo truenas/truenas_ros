@@ -47,6 +47,29 @@ impl FsDone {
         }
     }
 
+    /// What a write of storage on the write lane answers ([`FsConn::offload_write_owned`]), its count, short or whole,
+    /// or its errno, with `buf` back.
+    pub(crate) fn owned_written(written: Result<usize, Errno>, buf: Vec<u8>) -> FsDone {
+        let mut done = FsDone::failed(Errno::EIO);
+        // A write moves at most `MAX_RW_COUNT` bytes a call (`include/linux/fs.h`), which an `i32` holds.
+        done.result = written.map(|n| n as i32);
+        done.value = Some(buf);
+        done
+    }
+
+    /// What a write of a window on the write lane answers ([`FsConn::offload_write_window`]), its count when whole, and
+    /// `EIO` with the count beside it when short, as a window written on the ring answers.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn window_written(written: Result<usize, Errno>, asked: usize) -> FsDone {
+        let mut done = FsDone::failed(Errno::EIO);
+        match written {
+            Ok(n) if n == asked => done.result = Ok(n as i32),
+            Ok(n) => done.short = Some(n),
+            Err(e) => done.result = Err(e),
+        }
+        done
+    }
+
     /// The recv-pool buffer a leased write borrowed, for the net server to hand back. Taken by the dispatch before the
     /// callback runs, so a consumer never sees it.
     #[cfg(feature = "net-server")]

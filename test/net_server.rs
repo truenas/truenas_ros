@@ -392,6 +392,11 @@ mod fs_conn;
 #[path = "net_server/fs_files.rs"]
 mod fs_files;
 
+// The helpers it shares with `fs_files` run no ring under loom.
+#[cfg(all(feature = "uring-fs", not(loom)))]
+#[path = "net_server/write_lane.rs"]
+mod write_lane;
+
 #[path = "net_server/fs_privilege.rs"]
 mod fs_privilege;
 
