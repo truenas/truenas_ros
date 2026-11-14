@@ -265,3 +265,57 @@ fn a_window_is_written_and_its_buffer_goes_home_after() {
     assert_eq!(std::fs::read(&path).unwrap(), b"..window..");
     assert_eq!(fs.take_pool_releases(), [9], "the buffer went home");
 }
+
+/// The count the continuation of the one write `submit` makes answers, and the references to its file's descriptor it
+/// finds. The lane's thread waits once its write has posted until the continuation has looked, or two seconds pass,
+/// so a job that still holds its file then is seen every time.
+fn refs_at_continuation(submit: impl FnOnce(&mut FsConn<'_>, File, EmbeddedCb) + 'static) -> (Option<i32>, usize) {
+    let (mut eng, mut fs, _me) = setup();
+    let looked = std::sync::Arc::new(AtomicBool::new(false));
+    let l = std::sync::Arc::clone(&looked);
+    fs.write_seam = WriteSeam {
+        after: Some(std::sync::Arc::new(move || {
+            let began = Instant::now();
+            while !l.load(Ordering::SeqCst) && began.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })),
+        ..WriteSeam::default()
+    };
+    let (_dir, _path, file) = a_written_file(b"..");
+    let kept = std::sync::Arc::clone(&file.fd);
+    let seen = Rc::new(Cell::new(None));
+    let s = seen.clone();
+    drive(
+        &mut eng,
+        &mut fs,
+        move |c| {
+            let on_done: EmbeddedCb = Box::new(move |d, _| {
+                s.set(Some((d.result().ok(), std::sync::Arc::strong_count(&kept))));
+                looked.store(true, Ordering::SeqCst);
+            });
+            submit(c, file, on_done);
+        },
+        || seen.get().is_some(),
+    );
+    seen.get().unwrap()
+}
+
+/// A write of storage or of a window that ran has let go of its file when its continuation runs, as a ring write has,
+/// so a caller that kept one reference holds the last and may close the descriptor on a thread of its choosing.
+#[test]
+fn a_lane_write_lets_go_of_its_file_before_its_continuation() {
+    let storage = refs_at_continuation(|c, f, on_done| {
+        c.offload_write_owned(f, b"ab".to_vec(), 0..2, 0, RwFlags::empty(), on_done);
+    });
+    assert_eq!(storage, (Some(2), 1), "a write of storage");
+    #[cfg(feature = "net-server")]
+    {
+        let (bytes, hold) = (b"cd".to_vec(), std::sync::Arc::new(LeaseHold::detached(9)));
+        let window = window_over(&bytes, &hold);
+        let written = refs_at_continuation(move |c, f, on_done| {
+            c.offload_write_window(f, window, 0, RwFlags::empty(), on_done);
+        });
+        assert_eq!(written, (Some(2), 1), "a write of a window");
+    }
+}

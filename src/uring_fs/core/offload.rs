@@ -181,12 +181,13 @@ impl FsCore {
     }
 }
 
-/// What a test makes each write of the write lane do, a call on its thread before it writes and a drop of `CAP_FSETID`
-/// that fails. Empty outside tests, so a write carries nothing.
+/// What a test makes each write of the write lane do. Empty outside tests, so a write carries nothing.
 #[derive(Clone, Default)]
 pub(crate) struct WriteSeam {
     #[cfg(test)]
     pub(crate) before: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    pub(crate) after: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     pub(crate) drop_fails: bool,
 }
@@ -196,6 +197,13 @@ impl WriteSeam {
         #[cfg(test)]
         if let Some(before) = &self.before {
             before();
+        }
+    }
+
+    pub(super) fn after_post(&self) {
+        #[cfg(test)]
+        if let Some(after) = &self.after {
+            after();
         }
     }
 
