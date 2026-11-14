@@ -888,9 +888,12 @@ impl<U> Reactor<U> {
         // than one observation window.
         let pool = self.body_pool.as_ref();
         let seed = || pool.map(|p| p.borrow_mut().claim_held(at.saturating_add(want)));
-        let Some(claim) = self.table.conn_mut(slot).promote_recv_buf(at, want, seed) else {
+        let conn = self.table.conn_mut(slot);
+        let Some(claim) = conn.promote_recv_buf(at, want, seed) else {
             return;
         };
+        // The message has taken storage of the body pool, so it was let in at the cap (`read_waits`).
+        conn.let_in = true;
         if let Some(pool) = self.recv_bufs.as_mut() {
             pool.release(claim.bid);
         }

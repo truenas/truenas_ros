@@ -119,11 +119,11 @@ where
         self.pump(slot, generation)
     }
 
-    /// Let what `ServerConfig::held_cap` holds back go on, the placed body reads and the consumer's turns, in the order
-    /// they came, while the ring holds less than the cap. Checked again after each, since a read claims its body and
-    /// the held hook takes out what it lets go for a turn, so the ring passes the cap by one at most. A stale read (the
-    /// connection closed, or its slot was recycled) is passed over. The hook runs with no borrow of the pool, which it
-    /// reaches itself.
+    /// Let what `ServerConfig::held_cap` holds back go on, the reads that would take storage of the body pool and the
+    /// consumer's turns, in the order they came, while the ring holds less than the cap. Checked again after each,
+    /// since a read claims its storage and the held hook takes out what it lets go for a turn, so what is held back
+    /// passes the cap by one at most. A stale read (the connection closed, or its slot was recycled) is passed over.
+    /// The hook runs with no borrow of the pool, which it reaches itself.
     pub(super) fn redrive_held_reads(&mut self) -> errno::Result<()> {
         loop {
             if self.core.stopping() {
@@ -150,7 +150,7 @@ where
                 Some(conn) if conn.read_held => conn.read_held = false,
                 _ => continue, // closing, or no longer waiting
             }
-            // The pump frames the message again and reaches the same body read, which the check lets go on this once.
+            // The pump frames the message again and reaches the same read, which the check lets go on this once.
             self.core.held_turn = Some(slot);
             let pumped = self.pump(slot, gen64 as u32);
             self.core.held_turn = None;

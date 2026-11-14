@@ -181,12 +181,25 @@ impl<U> Reactor<U> {
         })
     }
 
-    /// Whether the read of a placed body waits for the ring's held bytes to fall under `ServerConfig::held_cap`. It
-    /// waits while they are at or past the cap, and behind any read or turn of the consumer's already held back, so
-    /// that both go on in the order they came, and the server lets each go on in turn (`held_turn`). The connection
-    /// keeps its header and frame and claims no storage until then. The budget of its message is retired, since
-    /// handling is not clocked, and `submit_recv` arms a fresh one as the read goes on, so only the peer's own time
-    /// counts.
+    /// Whether a read of the message being framed waits at `ServerConfig::held_cap` ([`hold_back`](Self::hold_back)).
+    /// A message is let in at the cap once, before it first takes storage of the body pool, by the read of its placed
+    /// body or by one that would promote what it has buffered. No later read of a message let in waits
+    /// (`Connection::let_in`), since what it would wait on is its own bytes.
+    #[cfg(feature = "net-server")]
+    pub(super) fn read_waits(&mut self, slot: u32, generation: u32, place: bool, want: usize) -> errno::Result<bool> {
+        let conn = self.table.conn(slot);
+        if conn.let_in || !(place || conn.recv_outgrown_by(want)) {
+            return Ok(false);
+        }
+        self.hold_back(slot, generation)
+    }
+
+    /// Whether a read that would take storage of the body pool waits for the ring's held bytes to fall under
+    /// `ServerConfig::held_cap`. It waits while they are at or past the cap, and behind any read or turn of the
+    /// consumer's already held back, so that both go on in the order they came, and the server lets each go on in turn
+    /// (`held_turn`). The connection keeps what it has buffered, and its receive buffer, and claims no storage until
+    /// then. The budget of its message is retired, since handling is not clocked, and `submit_recv` arms a fresh one as
+    /// the read goes on, so only the peer's own time counts.
     #[cfg(feature = "net-server")]
     pub(super) fn hold_back(&mut self, slot: u32, generation: u32) -> errno::Result<bool> {
         if self.held_turn == Some(slot) {

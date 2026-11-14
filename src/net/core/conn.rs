@@ -398,6 +398,12 @@ impl RecvBuf {
         self.claim.take()
     }
 
+    /// Whether a read of `want` more bytes outgrows the pool buffer in hand, so that it promotes what is buffered first
+    /// ([`promote_for`](Self::promote_for)).
+    pub(crate) fn outgrown_by(&self, want: usize) -> bool {
+        self.claim.is_some_and(|c| self.filled.saturating_add(want) > c.cap)
+    }
+
     /// Make room for `want` bytes past `at`, and answer how many were granted.
     ///
     /// A claim cannot grow, so its grant is capped at what remains of it. The reactor never asks a claim for more,
@@ -857,11 +863,18 @@ pub(crate) struct Connection<U> {
     /// Budgets retired but not yet reaped - see [`Connection::splice_deadline_owed`], which this mirrors exactly.
     #[cfg(feature = "net-server")]
     pub receipt_deadline_owed: u32,
-    /// The read of this connection's placed body waits in the body pool's queue of what is held back for the ring's
-    /// held bytes to fall under `ServerConfig::held_cap`. The queue's dedup key, set as the read is held and cleared as
-    /// it is taken off the queue, and nowhere else.
+    /// A read of this connection's that would take storage of the body pool waits in the pool's queue of what is held
+    /// back for the ring's held bytes to fall under `ServerConfig::held_cap`. The queue's dedup key, set as the read is
+    /// held and cleared as it is taken off the queue, and nowhere else.
     #[cfg(feature = "net-server")]
     pub(crate) read_held: bool,
+    /// The message being framed was let in at `ServerConfig::held_cap`, by the promote that first took storage of the
+    /// body pool for it, so no later read of it waits there, since what it would wait on is its own bytes. Set by the
+    /// promote and cleared as the message is consumed. Neither the receive buffer nor the promoted storage can stand
+    /// for it, since promoted storage outlives its message while the next one's first bytes are buffered behind it, and
+    /// a connection that fell back to storage of its own holds some for good.
+    #[cfg(feature = "net-server")]
+    pub(crate) let_in: bool,
     // A push overflowed `max_send_backlog` while the connection was detached (its worker owns the raw stream, so it
     // cannot be torn down mid-detach): evict with `SendBacklog` when the worker resumes it.
     pub evict_on_resume: bool,

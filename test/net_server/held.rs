@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ---- the bytes a ring holds out of its body pool ---------------------------
 
@@ -198,6 +199,301 @@ fn promoted_storage_counts_what_it_grows_by() {
     server.serve_forever().expect("serve_forever");
     client.join().expect("thread join");
     assert_eq!(recycler.held(), 0, "and nothing once the ring is idle");
+}
+
+/// One message as the handler of [`at_the_cap`] saw it, its first byte, its length and the bytes held as it was
+/// delivered.
+type Went = (u8, usize, usize);
+
+/// Serve `header` at a cap of `cap` bytes and give what each message found as it was delivered, in the order they were,
+/// or `None` where io_uring is unavailable. A message that begins with `H` holds the count at the cap once delivered,
+/// as a consumer's own storage would, and each control message gives that back. `client` drives the server at its
+/// address with the count of messages delivered and the control handle, every message is answered `ok`, and the ring
+/// holds nothing once it stops.
+fn at_the_cap<U>(
+    cap: usize,
+    accept: impl FnMut(Incoming<'_>) -> Option<U>,
+    header: impl FnMut(&[u8], &mut U) -> Framing,
+    client: impl FnOnce(SocketAddrV4, Arc<AtomicUsize>, ControlHandle) -> io::Result<()> + Send + 'static,
+) -> Option<Vec<Went>> {
+    use std::cell::{OnceCell, RefCell};
+    use std::rc::Rc;
+    use truenas_ros::net::server::BodyRecycler;
+
+    let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
+    let went: Rc<RefCell<Vec<Went>>> = Rc::default();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let (h_seam, h_went, h_delivered) = (Rc::clone(&seam), Rc::clone(&went), Arc::clone(&delivered));
+    let proto = Protocol {
+        accept,
+        header,
+        body: move |req: Request<'_, U>| {
+            let r = h_seam.get().expect("filled before serving");
+            let tag = req.body.first().copied().unwrap_or(0);
+            h_went.borrow_mut().push((tag, req.body.len(), r.held()));
+            if tag == b'H' {
+                r.take_out(cap);
+            }
+            h_delivered.fetch_add(1, Ordering::SeqCst);
+            Response::Reply(echo_frame(b"ok"))
+        },
+    };
+    let cfg = ServerConfig {
+        max_request_bytes: 4 * 1024 * 1024,
+        held_cap: Some(cap),
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let recycler = server.body_recycler().expect("a server keeps a body pool");
+    seam.set(recycler.clone()).expect("set once");
+    let c_recycler = recycler.clone();
+    server.set_control_hook(move |_| c_recycler.give_back(cap));
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let control = server.control_handle();
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        client(v4, delivered, control).expect("client io");
+        stop.shutdown();
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    assert_eq!(recycler.held(), 0, "the ring holds nothing once it stops");
+    Some(went.take())
+}
+
+/// Wait for `count` to reach `n`, for ten seconds at most.
+fn wait_for(count: &AtomicUsize, n: usize, what: &str) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while count.load(Ordering::SeqCst) < n {
+        assert!(Instant::now() < until, "{what}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A record of several fragments whose first fragments outgrow a receive buffer and the cap is let in at the cap once,
+/// as it promotes them, so its last fragment, placed, goes on past the cap on a ring with nothing else to bring the
+/// count down, where it would wait for good on its own first fragments.
+#[test]
+fn a_record_whose_first_fragments_pass_the_cap_goes_through() {
+    // Past a receive buffer of the default size and past the cap.
+    const FIRST: usize = 300 * 1024;
+    // Past the placement threshold, so it is placed.
+    const LAST: usize = 512 * 1024;
+    let client = |addr: SocketAddrV4, _, _| -> io::Result<()> {
+        let mut s = connect_tcp(addr)?;
+        send_record(&mut s, &[&vec![1u8; FIRST], &vec![2u8; LAST]])?;
+        // Within the deadline of the client's socket, where it would wait for good.
+        assert_eq!(recv_framed(&mut s)?, b"ok");
+        Ok(())
+    };
+    let Some(went) = at_the_cap(128 * 1024, |_: Incoming<'_>| Some(()), fragments_header, client) else {
+        return;
+    };
+    let [(tag, len, held)] = went[..] else {
+        panic!("one record: {went:?}");
+    };
+    assert_eq!((tag, len), (2, LAST), "the last fragment is the body");
+    assert!(held >= FIRST + LAST, "the record counts all it holds: {held}");
+}
+
+/// A record whose first fragments outgrow a receive buffer waits at the cap to promote them, behind a placed body held
+/// back before it, and goes on in its turn once that body has gone on and been given back.
+#[test]
+fn a_promote_waits_its_turn_behind_a_held_body() {
+    const CAP: usize = 256 * 1024;
+    const FIRST: usize = 300 * 1024;
+    const BODY: usize = 512 * 1024;
+    // The placed bodies framed and the promotes due, which the client waits on, so the order is certain with no timing.
+    let (placed, promotes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (h_placed, h_promotes) = (Arc::clone(&placed), Arc::clone(&promotes));
+    let header = move |buf: &[u8], state: &mut ()| {
+        let framed = fragments_header(buf, state);
+        match framed {
+            Framing::Complete { body_len, .. } if body_len >= BODY => {
+                h_placed.fetch_add(1, Ordering::SeqCst);
+            }
+            Framing::NeedInMessage(more) if more > FIRST => {
+                h_promotes.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        framed
+    };
+    let client = move |addr: SocketAddrV4, delivered: Arc<AtomicUsize>, control: ControlHandle| -> io::Result<()> {
+        let mut s = connect_tcp(addr)?;
+        send_record(&mut s, &[b"H"])?;
+        assert_eq!(recv_framed(&mut s)?, b"ok");
+        let send = |fragments: Vec<Vec<u8>>| {
+            thread::spawn(move || -> io::Result<Vec<u8>> {
+                let mut s = connect_tcp(addr)?;
+                let fragments: Vec<&[u8]> = fragments.iter().map(Vec::as_slice).collect();
+                send_record(&mut s, &fragments)?;
+                recv_framed(&mut s)
+            })
+        };
+        let a = send(vec![vec![b'A'; BODY]]);
+        wait_for(&placed, 1, "body A was not framed");
+        let b = send(vec![vec![b'B'; FIRST], vec![b'B'; BODY]]);
+        wait_for(&promotes, 1, "record B did not reach its promote");
+        assert_eq!(delivered.load(Ordering::SeqCst), 1, "nothing goes on at the cap");
+        control.send(Box::new(()));
+        assert_eq!(a.join().expect("body A")?, b"ok");
+        assert_eq!(b.join().expect("record B")?, b"ok");
+        Ok(())
+    };
+    let Some(went) = at_the_cap(CAP, |_: Incoming<'_>| Some(()), header, client) else {
+        return;
+    };
+    let order: Vec<u8> = went.iter().map(|&(tag, _, _)| tag).collect();
+    assert_eq!(order, *b"HAB", "the promote went on in its turn");
+}
+
+/// A length prefix of four bytes whose body is read in chunks until it is all buffered, unless it is of `placed` bytes
+/// or more, when it is framed at once so that it is placed. A chunk read can take the first bytes of the next message
+/// with the last of this one.
+fn scanned_header(placed: usize) -> impl FnMut(&[u8], &mut ()) -> Framing {
+    move |buf: &[u8], _: &mut ()| {
+        let Some(prefix) = buf.first_chunk::<4>() else {
+            return if buf.is_empty() {
+                Framing::More
+            } else {
+                Framing::MoreInMessage
+            };
+        };
+        let len = u32::from_be_bytes(*prefix) as usize;
+        if len >= placed || buf.len() >= 4 + len {
+            Framing::Complete {
+                header_len: 4,
+                body_len: len,
+            }
+        } else {
+            Framing::MoreInMessage
+        }
+    }
+}
+
+/// A message whose first bytes are buffered behind a promoted one, in storage that outlives it, was never let in, so
+/// its placed body waits at the cap.
+#[test]
+fn the_next_message_behind_promoted_storage_waits_at_the_cap() {
+    // Past a receive buffer of the default size, so it is promoted as its chunks outgrow one.
+    const FIRST: usize = 300 * 1024;
+    const BODY: usize = 512 * 1024;
+    // Past what the promoted storage holds alone, so the body goes on once the count is given back.
+    const CAP: usize = 4 * 1024 * 1024;
+    let framed = Arc::new(AtomicUsize::new(0));
+    let h_framed = Arc::clone(&framed);
+    let mut scanned = scanned_header(BODY);
+    let header = move |buf: &[u8], state: &mut ()| {
+        let step = scanned(buf, state);
+        if matches!(step, Framing::Complete { body_len: BODY, .. }) {
+            h_framed.fetch_add(1, Ordering::SeqCst);
+        }
+        step
+    };
+    let client = move |addr: SocketAddrV4, delivered: Arc<AtomicUsize>, control: ControlHandle| -> io::Result<()> {
+        let mut s = connect_tcp(addr)?;
+        // The first message holds the count at the cap once delivered. All but its last byte, and then that byte with
+        // the length of the next message, so that one chunk read takes both.
+        let mut first = (FIRST as u32).to_be_bytes().to_vec();
+        first.resize(4 + FIRST, b'H');
+        s.write_all(&first[..first.len() - 1])?;
+        thread::sleep(Duration::from_millis(200));
+        let mut end = vec![b'H'];
+        end.extend_from_slice(&(BODY as u32).to_be_bytes());
+        s.write_all(&end)?;
+        assert_eq!(recv_framed(&mut s)?, b"ok");
+        wait_for(&framed, 1, "the next message was not framed");
+        let body = thread::spawn(move || -> io::Result<Vec<u8>> {
+            s.write_all(&vec![b'2'; BODY])?;
+            recv_framed(&mut s)
+        });
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            1,
+            "the next message went on at the cap"
+        );
+        control.send(Box::new(()));
+        assert_eq!(body.join().expect("the next message")?, b"ok");
+        Ok(())
+    };
+    let Some(went) = at_the_cap(CAP, |_: Incoming<'_>| Some(()), header, client) else {
+        return;
+    };
+    let [(b'H', FIRST, _), (b'2', BODY, held)] = went[..] else {
+        panic!("the first message and then the next: {went:?}");
+    };
+    assert!(
+        held >= FIRST + BODY,
+        "the promoted storage outlived its message: {held}"
+    );
+}
+
+/// A connection that fell back to storage of its own, for a read too large for a receive buffer in one exact step, has
+/// the placed body of its next message wait at the cap.
+#[test]
+fn a_message_on_storage_of_its_own_waits_at_the_cap() {
+    // Past a receive buffer of the default size, read in one exact step.
+    const FIRST: usize = 300 * 1024;
+    const BODY: usize = 512 * 1024;
+    const CAP: usize = 256 * 1024;
+    let framed = Arc::new(AtomicUsize::new(0));
+    let h_framed = Arc::clone(&framed);
+    // A connection's first message is `FIRST` bytes with no framing of its own, and its later ones records.
+    let header = move |buf: &[u8], first: &mut bool| {
+        if !*first {
+            let step = fragments_header(buf, &mut ());
+            if matches!(step, Framing::Complete { body_len: BODY, .. }) {
+                h_framed.fetch_add(1, Ordering::SeqCst);
+            }
+            return step;
+        }
+        match FIRST - buf.len() {
+            FIRST => Framing::Need(FIRST),
+            0 => {
+                *first = false;
+                Framing::Complete {
+                    header_len: 0,
+                    body_len: FIRST,
+                }
+            }
+            more => Framing::NeedInMessage(more),
+        }
+    };
+    let client = move |addr: SocketAddrV4, delivered: Arc<AtomicUsize>, control: ControlHandle| -> io::Result<()> {
+        let mut s = connect_tcp(addr)?;
+        // The first message holds the count at the cap once delivered.
+        s.write_all(&vec![b'H'; FIRST])?;
+        assert_eq!(recv_framed(&mut s)?, b"ok");
+        let body = thread::spawn(move || -> io::Result<Vec<u8>> {
+            send_record(&mut s, &[&vec![b'2'; BODY]])?;
+            recv_framed(&mut s)
+        });
+        wait_for(&framed, 1, "the next message was not framed");
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            1,
+            "the next message went on at the cap"
+        );
+        control.send(Box::new(()));
+        assert_eq!(body.join().expect("the next message")?, b"ok");
+        Ok(())
+    };
+    let Some(went) = at_the_cap(CAP, |_: Incoming<'_>| Some(true), header, client) else {
+        return;
+    };
+    let order: Vec<(u8, usize)> = went.iter().map(|&(tag, len, _)| (tag, len)).collect();
+    assert_eq!(order, [(b'H', FIRST), (b'2', BODY)]);
 }
 
 /// A reply given to `Deferred::reply_recycled` counts from that call, before the loop has it, and stays counted once

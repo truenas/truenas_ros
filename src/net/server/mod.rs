@@ -604,8 +604,8 @@ where
             // runs after every fs completion for those connections has been routed).
             #[cfg(feature = "uring-fs")]
             self.sweep_closed_fs();
-            // What this turn gave back may let what the cap holds back go on, the placed body reads and the consumer's
-            // turns, in the order they came.
+            // What this turn gave back may let what the cap holds back go on, the reads and the consumer's turns, in
+            // the order they came.
             self.redrive_held_reads()?;
             // A drain's quiescence, re-read where everything that can reach it has already run. `reclaim_slot` is
             // edge-triggered on connections and cannot see a task retire; see `maybe_finish_drain`. Inert unless
@@ -872,12 +872,12 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
 
     /// Install a hook that runs on the loop thread once for each turn the consumer queues with
     /// [`BodyRecycler::queue_turn`], as the loop reaches the turn with [`BodyRecycler::held`] under
-    /// [`held_cap`](ServerConfig::held_cap). Turns and the placed body reads the cap holds back go on in one queue in
-    /// the order they came, so a call held for bytes goes on with no tick and no poll, even when every connection
-    /// waits, and neither kind keeps the other back for good. The hook never runs inside [`BodyRecycler::queue_turn`]
-    /// or any other call of the consumer's. What it takes out ([`BodyRecycler::take_out`]) counts before the next thing
-    /// held back is looked at, so the ring passes the cap by one at most. A turn whose call the consumer no longer has
-    /// runs it with nothing to let go. A second call replaces the first hook.
+    /// [`held_cap`](ServerConfig::held_cap). Turns and the reads the cap holds back go on in one queue in the order
+    /// they came, so a call held for bytes goes on with no tick and no poll, even when every connection waits, and
+    /// neither kind keeps the other back for good. The hook never runs inside [`BodyRecycler::queue_turn`] or any other
+    /// call of the consumer's. What it takes out ([`BodyRecycler::take_out`]) counts before the next thing held back is
+    /// looked at, so what is held back passes the cap by one at most. A turn whose call the consumer no longer has runs
+    /// it with nothing to let go. A second call replaces the first hook.
     pub fn set_held_hook<F>(&mut self, hook: F)
     where
         F: FnMut() + 'static,

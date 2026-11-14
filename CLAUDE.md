@@ -353,23 +353,36 @@ Do not reopen these without a reason that is new.
   `held_bytes_follow_a_placed_body_and_a_recycled_reply`,
   `a_deferred_recycled_reply_counts_from_its_hand_off` and
   `promoted_storage_counts_what_it_grows_by`.
-- **At `held_cap` a placed body read and the consumer's turns wait in one
-  queue, in the order they came, and nothing else does.** The check sits
-  where the reactor decides to place a body, before it claims storage, so
-  a held connection keeps its header and frame and claims only when it
-  goes on. The queue is the body pool's (`HeldBack`), since the
-  consumer's `BodyRecycler` reaches the pool alone. A newcomer, a read or
-  a turn, waits behind anything held back (`may_go`), and the loop's turn
-  lets them go on in the order they came (`redrive_held_reads`,
-  `held_turn`), checking again after each, so the ring passes the cap by
-  one at most, a body larger than the cap still goes on, and neither a
-  stream of turns nor one of placed bodies keeps the other back for good.
-  Promoted storage counts but is never held back, since part of its
-  message has arrived. Pinned by
+- **At `held_cap` a message is let in once, and waits in one queue with the
+  consumer's turns, in the order they came.** It is let in before it first
+  takes storage of the body pool, at the read of its placed body or at one
+  that would promote what it has buffered, and the check sits where the
+  reactor decides that read, before it claims storage, so a held connection
+  keeps what it has buffered and claims only when it goes on (`read_waits`).
+  No later read of a message let in waits (`Connection::let_in`), since what
+  it would wait on is its own bytes, and a record whose first fragments
+  outgrew a receive buffer and the cap would wait for good. The mark belongs
+  to the message and ends as it is consumed, never to its storage, since
+  promoted storage outlives its message while the next one's first bytes are
+  buffered behind it, and a connection that fell back to storage of its own
+  keeps some for good. The queue is the body pool's (`HeldBack`), since the
+  consumer's `BodyRecycler` reaches the pool alone. A newcomer, a read or a
+  turn, waits behind anything held back (`may_go`), and the loop's turn lets
+  them go on in the order they came (`redrive_held_reads`, `held_turn`),
+  checking again after each, so what is held back passes the cap by one at
+  most, a body larger than the cap still goes on, and neither a stream of
+  turns nor one of reads keeps the other back for good. The ring passes the
+  cap further only by what the messages under way take as the rest of them
+  arrives, one message at most for each connection. Pinned by
   `placed_bodies_past_the_held_cap_wait_their_turn`,
   `a_new_body_read_waits_behind_held_ones`,
-  `a_call_may_go_only_under_the_cap_with_nothing_held_back` and
-  `turns_and_placed_bodies_go_on_in_the_order_they_came`.
+  `a_call_may_go_only_under_the_cap_with_nothing_held_back`,
+  `turns_and_placed_bodies_go_on_in_the_order_they_came`,
+  `a_record_whose_first_fragments_pass_the_cap_goes_through`,
+  `a_promote_waits_its_turn_behind_a_held_body`,
+  `the_next_message_behind_promoted_storage_waits_at_the_cap`,
+  `a_message_on_storage_of_its_own_waits_at_the_cap` and
+  `a_mark_ends_with_its_message_and_not_at_a_redelivery`.
 - **The held hook runs from the loop's turn, once for each turn the
   consumer queued.** It runs as the redrive reaches the turn under the cap,
   never inside a call of the consumer's, with no borrow of the pool, and
