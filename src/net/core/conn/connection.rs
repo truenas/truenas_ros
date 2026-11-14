@@ -60,6 +60,8 @@ impl<U> Connection<U> {
             receipt_deadline_owed: 0,
             #[cfg(feature = "net-server")]
             read_held: false,
+            #[cfg(feature = "net-server")]
+            let_in: false,
             evict_on_resume: false,
             close_on_flush: None,
             peer_closed: None,
@@ -343,6 +345,18 @@ impl<U> Connection<U> {
         self.recv_buf.set_owned();
     }
 
+    /// The bytes the receive storage has on the body pool's count ([`RecvBuf::held_bytes`]).
+    #[cfg(feature = "net-server")]
+    pub(crate) fn recv_held_bytes(&self) -> usize {
+        self.recv_buf.held_bytes()
+    }
+
+    /// Whether a read of `want` more bytes promotes what is buffered first ([`RecvBuf::outgrown_by`]).
+    #[cfg(feature = "net-server")]
+    pub(crate) fn recv_outgrown_by(&self, want: usize) -> bool {
+        self.recv_buf.outgrown_by(want)
+    }
+
     /// Bytes already accumulated in `buf`.
     pub(crate) fn buffered(&self) -> usize {
         self.recv_buf.len()
@@ -351,6 +365,12 @@ impl<U> Connection<U> {
     /// Drop the delivered message from the front of `buf`, keeping any pipelined remainder for the next message. A
     /// placed body never entered `buf` (only its header did), so at most `buf.len()` bytes are drained.
     pub(crate) fn consume(&mut self) {
+        // The message ends here, and with it its mark. A redelivery consumes an empty frame while the pump may have let
+        // in the next message already, so it leaves the mark alone.
+        #[cfg(feature = "net-server")]
+        if self.frame_len() > 0 {
+            self.let_in = false;
+        }
         let drained = self.frame_len().min(self.recv_buf.len());
         self.recv_buf.drain_front(drained);
         self.header_len = 0;

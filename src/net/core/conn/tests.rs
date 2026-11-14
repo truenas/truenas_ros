@@ -972,3 +972,18 @@ fn a_redelivery_is_not_handed_a_write_lease() {
     let lease = lease.expect("a wire delivery still gets its lease");
     assert_eq!((lease.bid, lease.cap), (7, 8), "bounded to the message");
 }
+
+/// The mark that a message was let in at the cap ends as the message is consumed. A redelivery consumes an empty frame
+/// while the next message may be under way already, and leaves the mark alone.
+#[cfg(feature = "net-server")]
+#[test]
+fn a_mark_ends_with_its_message_and_not_at_a_redelivery() {
+    let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 2);
+    c.let_in = true;
+    c.set_frame(0, 0);
+    c.consume();
+    assert!(c.let_in, "a redelivery ended the next message's mark");
+    c.set_frame(4, 8);
+    c.consume();
+    assert!(!c.let_in, "the mark outlived its message");
+}

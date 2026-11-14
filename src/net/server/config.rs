@@ -126,12 +126,15 @@ pub struct ServerConfig {
     pub buf_pool_max_bytes: Option<usize>,
     /// The bytes of body pool storage a ring may hold, as
     /// [`BodyRecycler::held`](crate::net::server::BodyRecycler::held) counts them with the consumer's own figure,
-    /// before it holds back the read of the next placed body. A held-back read keeps its header and waits in one queue
-    /// with the consumer's turns ([`BodyRecycler::queue_turn`](crate::net::server::BodyRecycler::queue_turn)), going on
-    /// in the order they came once the count is under the cap, so the ring passes the cap by one at most and a body
-    /// larger than the cap still goes on. Its [`max_receipt_time`](ServerConfig::max_receipt_time) does not run while
-    /// it waits. Promoted storage counts but is never held back, since part of its message has arrived. `None`, the
-    /// default, sets no cap, and 0 is refused, since it would hold every placed body back for good.
+    /// before it holds back the next message that would take storage of the pool, at the read of its placed body or at
+    /// one that would promote what it has buffered. A message is let in once, and no later read of it waits, since what
+    /// it would wait on is its own bytes. A held-back read keeps what its connection has buffered and waits in one
+    /// queue with the consumer's turns ([`BodyRecycler::queue_turn`](crate::net::server::BodyRecycler::queue_turn)),
+    /// going on in the order they came once the count is under the cap. So what is held back passes the cap by one at
+    /// most, a body larger than the cap still goes on, and the ring passes it further only by what the messages under
+    /// way take as the rest of them arrives, one message at most for each connection. Its
+    /// [`max_receipt_time`](ServerConfig::max_receipt_time) does not run while it waits. `None`, the default, sets no
+    /// cap, and 0 is refused, since it would hold every placed body back for good.
     pub held_cap: Option<usize>,
     /// How a read answers a buffer pool that is genuinely exhausted, at its registered bound with every buffer lent.
     /// `Some(backoff)` (the default, 10 ms) parks the read and retries it a `backoff` later on a kernel `TIMEOUT`, so

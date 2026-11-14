@@ -72,9 +72,9 @@ pub(crate) struct BodyPool {
     /// Consecutive rebalances that observed no serve.
     idle_rounds: u8,
     /// Bytes of storage out of this pool that the reactor holds, by capacity. A placed or promoted body counts from its
-    /// claim until it is taken or given back, and a reply marked recycled from when it is queued on its connection
-    /// until it is sent or dropped. Each give takes back exactly what its claim counted and never reads a capacity
-    /// again, since storage may grow while it is held.
+    /// claim until it is taken or given back, promoted storage with every growth since, and a reply marked recycled
+    /// from when it is queued on its connection until it is sent or dropped. Each give takes back exactly what was
+    /// counted for it, which its ticket or home carries, and never reads a capacity again.
     ring_held: usize,
     /// Bytes the consumer counts as its own ([`BodyRecycler::take_out`]).
     out_held: usize,
@@ -82,12 +82,12 @@ pub(crate) struct BodyPool {
     /// queued or sent home, which count from that hand-off.
     #[cfg(feature = "net-server")]
     shared: Option<Arc<LoopShared>>,
-    /// `ServerConfig::held_cap`, past which the ring holds back the read of the next placed body and the consumer's own
-    /// calls.
+    /// `ServerConfig::held_cap`, past which the ring holds back the next read that would take storage of this pool, a
+    /// placed body's or a promote's, and the consumer's own calls.
     cap: Option<usize>,
-    /// What the ring holds back for its held bytes to fall under the cap, the reads of placed bodies and the consumer's
-    /// turns, in the order they came, so that neither keeps the other back for good. Here and not in the reactor, since
-    /// the consumer's [`BodyRecycler`] reaches the pool alone.
+    /// What the ring holds back for its held bytes to fall under the cap, the reads that would take storage of this
+    /// pool and the consumer's turns, in the order they came, so that neither keeps the other back for good. Here and
+    /// not in the reactor, since the consumer's [`BodyRecycler`] reaches the pool alone.
     #[cfg(feature = "net-server")]
     held_back: std::collections::VecDeque<HeldBack>,
 }
@@ -96,8 +96,9 @@ pub(crate) struct BodyPool {
 #[cfg(feature = "net-server")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeldBack {
-    /// The read of the placed body of the connection in `slot`, while that slot is of `generation`.
-    /// `Connection::read_held` keeps a connection here once, and an entry whose slot has moved on is passed over.
+    /// A read of the connection in `slot` that would take storage of the pool, a placed body's or a promote's, while
+    /// that slot is of `generation`. `Connection::read_held` keeps a connection here once, and an entry whose slot has
+    /// moved on is passed over.
     Read { slot: u32, generation: u64 },
     /// A turn the consumer queued ([`BodyRecycler::queue_turn`]), for which the server runs its held hook once.
     Turn,
@@ -128,8 +129,8 @@ impl BodyPool {
         self.cap.is_some_and(|cap| self.held() >= cap)
     }
 
-    /// Whether a placed body read or a call of the consumer's may go now, the bytes held under the cap with nothing
-    /// held back before it.
+    /// Whether a read that would take storage of this pool, or a call of the consumer's, may go now, the bytes held
+    /// under the cap with nothing held back before it.
     #[cfg(feature = "net-server")]
     pub(crate) fn may_go(&self) -> bool {
         !self.at_cap() && self.held_back.is_empty()
@@ -391,17 +392,17 @@ impl BodyRecycler {
     }
 
     /// Whether a call of the consumer's that holds storage of the pool may go now, the bytes [`held`](Self::held) under
-    /// [`held_cap`](crate::net::server::ServerConfig::held_cap) with nothing held back, neither a placed body read nor
-    /// a turn. A call that may not waits on a turn ([`queue_turn`](Self::queue_turn)), or answers in place of waiting
-    /// with no turn left over. With no cap, every call may go.
+    /// [`held_cap`](crate::net::server::ServerConfig::held_cap) with nothing held back, neither a read of the ring's
+    /// nor a turn. A call that may not waits on a turn ([`queue_turn`](Self::queue_turn)), or answers in place of
+    /// waiting with no turn left over. With no cap, every call may go.
     #[cfg(feature = "net-server")]
     pub fn may_go(&self) -> bool {
         self.pool.borrow().may_go()
     }
 
-    /// Queue a turn behind what the ring holds back, the placed body reads and the turns queued before it, for which
-    /// the server runs its held hook once (`Server::set_held_hook`) as its loop reaches the turn with the bytes held
-    /// under the cap. The hook never runs inside this call.
+    /// Queue a turn behind what the ring holds back, the reads and the turns queued before it, for which the server
+    /// runs its held hook once (`Server::set_held_hook`) as its loop reaches the turn with the bytes held under the
+    /// cap. The hook never runs inside this call.
     #[cfg(feature = "net-server")]
     pub fn queue_turn(&self) {
         self.pool.borrow_mut().hold_back(HeldBack::Turn);
@@ -725,7 +726,7 @@ mod tests {
         let (mut v, t) = pool.borrow_mut().claim_held(MIB);
         assert_eq!(t.bytes, v.capacity(), "the ticket carries the count");
         assert_eq!(pool.borrow().held(), t.bytes, "a claim is held");
-        // Grown while held, as promoted storage may be.
+        // Grown past what its ticket carries, so a give that read the capacity would take off too much.
         v.reserve_exact(4 * MIB);
         pool.borrow_mut().give_held(v, t);
         assert_eq!(pool.borrow().held(), 0, "what went on came off");

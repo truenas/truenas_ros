@@ -395,6 +395,10 @@ impl<U> Reactor<U> {
                 exact,
                 in_message,
             } => {
+                #[cfg(feature = "net-server")]
+                if self.read_waits(slot, generation, false, want)? {
+                    return Ok(Enacted::Done);
+                }
                 self.submit_recv(slot, generation, Op::RecvHeader, want, exact, false, in_message)?;
                 Ok(Enacted::Done)
             }
@@ -416,7 +420,7 @@ impl<U> Reactor<U> {
                     && !(self.table.conn(slot).recv_needs_buffer()
                         && self.recv_bufs.as_ref().is_some_and(|pool| total <= pool.buf_len()));
                 #[cfg(feature = "net-server")]
-                if place && self.hold_back(slot, generation)? {
+                if self.read_waits(slot, generation, place, want)? {
                     return Ok(Enacted::Done);
                 }
                 self.table.conn_mut(slot).set_frame(header_len, body_len);

@@ -161,8 +161,8 @@ pub(crate) struct RecvClaim {
 }
 
 /// What storage the reactor claimed from the ring's body pool owes the pool as it leaves, the held licence the claim's
-/// miss recorded and the bytes the claim put on the pool's count of held storage (`BodyPool::claim_held`). Zero for
-/// storage that came from elsewhere.
+/// miss recorded and the bytes the claim and every growth of the storage since put on the pool's count of held storage
+/// (`BodyPool::claim_held`, `RecvBuf::reserve_at`). Zero for storage that came from elsewhere.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Ticket {
     pub(crate) licence: usize,
@@ -200,7 +200,7 @@ pub(crate) struct RecvBuf {
     filled: usize,
     /// The ticket a promote's claim recorded ([`BodyPool::claim_held`](super::bodypool::BodyPool::claim_held)), carried
     /// until `owned` goes home so a receipt spanning maintenance ticks keeps the licence it is owed, and the count
-    /// loses what the claim put on it.
+    /// loses what the claim and the storage's growth put on it.
     #[cfg(feature = "net-server")]
     owned_ticket: Ticket,
 }
@@ -398,6 +398,12 @@ impl RecvBuf {
         self.claim.take()
     }
 
+    /// Whether a read of `want` more bytes outgrows the pool buffer in hand, so that it promotes what is buffered first
+    /// ([`promote_for`](Self::promote_for)).
+    pub(crate) fn outgrown_by(&self, want: usize) -> bool {
+        self.claim.is_some_and(|c| self.filled.saturating_add(want) > c.cap)
+    }
+
     /// Make room for `want` bytes past `at`, and answer how many were granted.
     ///
     /// A claim cannot grow, so its grant is capped at what remains of it. The reactor never asks a claim for more,
@@ -405,6 +411,11 @@ impl RecvBuf {
     /// buffer never takes one (`submit_recv`). The cap stays because the alternative is a write past the buffer, and
     /// the caller treats a short grant on an exact read as fatal. Owned storage grows, so its grant is always the full
     /// `want`.
+    ///
+    /// Storage promoted off a pool buffer is on the body pool's count by capacity, so the capacity a growth adds goes on
+    /// its ticket, and the reactor puts what the ticket gained on the count ([`held_bytes`](Self::held_bytes)). The
+    /// growth stays amortized, since growing exactly would copy the whole storage at each read of a record that arrives
+    /// in many small fragments.
     pub(crate) fn reserve_at(&mut self, at: usize, want: usize) -> usize {
         if let Some(c) = &self.claim {
             return want.min(c.cap.saturating_sub(at));
@@ -414,9 +425,21 @@ impl RecvBuf {
         }
         let need = at.saturating_add(want);
         if need > self.owned.len() {
+            #[cfg(feature = "net-server")]
+            let before = self.owned.capacity();
             self.owned.resize(need, 0);
+            #[cfg(feature = "net-server")]
+            if self.owned_ticket.bytes > 0 {
+                self.owned_ticket.bytes = self.owned_ticket.bytes.saturating_add(self.owned.capacity() - before);
+            }
         }
         want
+    }
+
+    /// The bytes `owned` has on the body pool's count, 0 for storage that came from elsewhere.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.owned_ticket.bytes
     }
 
     /// Destination for a recv writing at `at`. Null when a buffer has yet to be acquired, since the kernel supplies the
@@ -840,11 +863,18 @@ pub(crate) struct Connection<U> {
     /// Budgets retired but not yet reaped - see [`Connection::splice_deadline_owed`], which this mirrors exactly.
     #[cfg(feature = "net-server")]
     pub receipt_deadline_owed: u32,
-    /// The read of this connection's placed body waits in the body pool's queue of what is held back for the ring's
-    /// held bytes to fall under `ServerConfig::held_cap`. The queue's dedup key, set as the read is held and cleared as
-    /// it is taken off the queue, and nowhere else.
+    /// A read of this connection's that would take storage of the body pool waits in the pool's queue of what is held
+    /// back for the ring's held bytes to fall under `ServerConfig::held_cap`. The queue's dedup key, set as the read is
+    /// held and cleared as it is taken off the queue, and nowhere else.
     #[cfg(feature = "net-server")]
     pub(crate) read_held: bool,
+    /// The message being framed was let in at `ServerConfig::held_cap`, by the promote that first took storage of the
+    /// body pool for it, so no later read of it waits there, since what it would wait on is its own bytes. Set by the
+    /// promote and cleared as the message is consumed. Neither the receive buffer nor the promoted storage can stand
+    /// for it, since promoted storage outlives its message while the next one's first bytes are buffered behind it, and
+    /// a connection that fell back to storage of its own holds some for good.
+    #[cfg(feature = "net-server")]
+    pub(crate) let_in: bool,
     // A push overflowed `max_send_backlog` while the connection was detached (its worker owns the raw stream, so it
     // cannot be torn down mid-detach): evict with `SendBacklog` when the worker resumes it.
     pub evict_on_resume: bool,
