@@ -68,8 +68,33 @@ impl FsCore {
         Ok(())
     }
 
-    /// Wake both pools, the file pool and the lookup lane, for everything queued since the last flush, and return the
-    /// sooner of their deadlines ([`WorkerPool::flush`]).
+    /// Size the write lane, as [`Self::set_lookup_bounds`] sizes the lookup lane.
+    #[cfg(any(test, feature = "net-server"))]
+    pub(crate) fn set_write_bounds(&mut self, bounds: OffloadBounds) {
+        self.write = SharedPool::new(WRITE_WORKER, bounds);
+    }
+
+    /// The write lane's bounds, for a test of where they came from.
+    #[cfg(all(test, not(loom), feature = "net-server"))]
+    pub(crate) fn write_bounds(&self) -> OffloadBounds {
+        self.write.bounds()
+    }
+
+    /// Whether the write lane has a thread to take a write ([`SharedPool::ready`]), asked before the write's payload
+    /// moves into its job.
+    pub(super) fn write_ready(&self) -> bool {
+        self.write.ready()
+    }
+
+    /// Queue `job` on the write lane, once [`Self::write_ready`] has said it may.
+    pub(super) fn submit_write(&mut self, job: Job) {
+        // A lane that had a thread keeps its floor, so the job is never handed back here.
+        let _ = self.write.try_enqueue(job);
+        self.pending_writes += 1;
+    }
+
+    /// Wake every pool for everything queued since the last flush, and return the soonest of their deadlines
+    /// ([`WorkerPool::flush`]).
     ///
     /// The loop calls this every iteration right before it can block, and before its teardown drain, and bounds its
     /// sleep by the return (`Ring::submit_and_wait_for`), which also covers deadlines published by off-loop submitters
@@ -81,19 +106,20 @@ impl FsCore {
     pub(crate) fn flush_offloads(&mut self) -> Option<std::time::Duration> {
         let file = std::mem::take(&mut self.pending_offloads);
         let lookups = std::mem::take(&mut self.pending_lookups);
+        let writes = std::mem::take(&mut self.pending_writes);
         let file = flush_pool(&self.pool, file);
         let lookups = flush_pool(&self.lookup, lookups);
-        file.into_iter().chain(lookups).min()
+        let writes = flush_pool(&self.write, writes);
+        file.into_iter().chain(lookups).chain(writes).min()
     }
 
     /// Remove a **server-owned** extended attribute on the blocking pool, gated on the
     /// [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs) allowlist. Refuses anything unlisted with `EPERM`.
     ///
-    /// The one fs mutation in the module that carries no [`Personality`]. io_uring has no remove opcode
-    /// ([`remove_xattr_blocking`]), so the call runs on a pool thread under the reactor's own credentials, where the
-    /// kernel cannot check it against a request identity. The allowlist keys the promotion on the name alone, as the
-    /// `FSETXATTR` promotion in [`FsCore::submit_fd_meta`] is, so a caller can clear the metadata this reactor wrote
-    /// and nothing else.
+    /// io_uring has no remove opcode ([`remove_xattr_blocking`]), so the call runs on a pool thread under the reactor's
+    /// own credentials, where the kernel cannot check it against a request identity. The allowlist keys the promotion
+    /// on the name alone, as the `FSETXATTR` promotion in [`FsCore::submit_fd_meta`] is, so a caller can clear the
+    /// metadata this reactor wrote and nothing else.
     pub(crate) fn remove_priv_xattr(&mut self, file: Arc<OwnedFd>, name: Cow<'static, CStr>, reply: ReplyTo) {
         if !self.priv_xattrs.permits(&name) {
             let _ = reply.send(FsOutcome::new(Err(Errno::EPERM), Vec::new(), None, None));
@@ -152,5 +178,32 @@ impl FsCore {
             queue: Arc::clone(&self.lease_returns),
             wake: Arc::clone(wake),
         }
+    }
+}
+
+/// What a test makes each write of the write lane do, a call on its thread before it writes and a drop of `CAP_FSETID`
+/// that fails. Empty outside tests, so a write carries nothing.
+#[derive(Clone, Default)]
+pub(crate) struct WriteSeam {
+    #[cfg(test)]
+    pub(crate) before: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    pub(crate) drop_fails: bool,
+}
+
+impl WriteSeam {
+    pub(super) fn before_write(&self) {
+        #[cfg(test)]
+        if let Some(before) = &self.before {
+            before();
+        }
+    }
+
+    pub(super) fn drop_fsetid(&self) -> Result<(), Errno> {
+        #[cfg(test)]
+        if self.drop_fails {
+            return Err(Errno::EPERM);
+        }
+        crate::uring_fs::broker::drop_effective_fsetid()
     }
 }

@@ -530,12 +530,18 @@ A streamed window is written to a file straight out of its recv buffer.
   `TASK_KILLABLE` (FUSE, sunrpc).
 - **`ON_POOL_WORKER` carries the pool's identity, not a bare flag**, or the
   self-join exemption leaks to every pool in the process.
-- **The lookup lane never runs a job on the loop.** Its jobs wait on another
-  machine for as long as that service's timeouts allow, so a lane with no
-  thread answers `EAGAIN` through the completion queue instead
-  (`FsConn::offload_lookup`, `SharedPool::try_enqueue`). The file pool's
-  inline fallback suits jobs that take microseconds and nothing else. Pinned
-  by `a_lane_with_no_thread_answers_eagain_without_running_the_job`.
+- **Neither lane runs a job on the loop.** A lookup waits on another
+  machine for as long as that service's timeouts allow, and a write may
+  wait on a commit of the ZIL, so a lane with no thread answers `EAGAIN`
+  instead (`FsConn::offload_lookup`, `FsConn::offload_write_owned`,
+  `SharedPool::try_enqueue`, `SharedPool::ready`). The file pool's inline
+  fallback suits jobs that take microseconds and nothing else. The write
+  lane's threads drop `CAP_FSETID` before their first write, so a write
+  clears the set-user-ID bits as an unprivileged caller's does. Pinned by
+  `a_lane_with_no_thread_answers_eagain_without_running_the_job`,
+  `a_lane_with_no_thread_refuses_a_write_with_a_marked_eagain`,
+  `a_thread_that_cannot_drop_fsetid_writes_nothing` and
+  `a_lane_write_as_root_clears_the_set_user_id_bit`.
 
 ### Where a poisoned lock fails closed
 

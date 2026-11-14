@@ -431,6 +431,10 @@ where
                 floor: cfg.lookup_offload_floor,
                 ceiling: cfg.lookup_offload_ceiling,
             });
+            fs.set_write_bounds(crate::uring_fs::OffloadBounds {
+                floor: cfg.write_offload_floor,
+                ceiling: cfg.write_offload_ceiling,
+            });
             fs
         });
         let mut core = Reactor::from_parts(engine, cfg.pool_size, cfg.to_core(), pads);

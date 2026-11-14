@@ -1,4 +1,5 @@
 use super::*;
+use offload::WriteSeam;
 
 impl FsConn<'_> {
     /// Run `job` on a blocking worker thread, then deliver its result to `on_done` **on the reactor thread** with a
@@ -168,6 +169,101 @@ impl FsConn<'_> {
             let wake = &self.eng.shared.wake;
             finish_offload(&self.fs.completions, wake, token, Box::new(r));
         }
+    }
+
+    /// Write `buf[range]` to `f` at `off` with `flags`, a plain `pwritev2(2)` on a thread of the ring's write lane, at
+    /// the reactor's credentials less `CAP_FSETID`, so two writes to one file run at once where io-wq runs them in
+    /// turn. It completes as [`pwritev2_owned`](Self::pwritev2_owned) does and refuses what it refuses, and a lane that
+    /// cannot spawn a thread refuses with a marked `EAGAIN` ([`FsDone::was_refused`]), since a write never runs on the
+    /// loop.
+    ///
+    /// The write carries no personality, which is sound on ZFS, the one filesystem the lane serves. The file was opened
+    /// under the caller's, and `zfs_write` checks the writer only in clearing the set-user-ID and set-group-ID bits
+    /// (`zfs_clear_setid_bits_if_necessary`), as its quotas go by the file's owner, group and project. A lane thread
+    /// drops `CAP_FSETID` before its first write, so it clears them as an unprivileged caller would, and a thread that
+    /// cannot drop it answers the errno of `capset` and writes nothing.
+    pub fn offload_write_owned<F>(
+        &mut self,
+        f: File,
+        buf: Vec<u8>,
+        range: Range<usize>,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let refusal = if !owned_write_fits(buf.len(), &range, off) {
+            Some(Errno::EINVAL)
+        } else {
+            (!self.fs.write_ready()).then_some(Errno::EAGAIN)
+        };
+        if let Some(err) = refusal {
+            let w = self.waiter(on_done);
+            self.fs.refuse(self.eng, w, err, true, vec![buf], Some(f.fd));
+            return;
+        }
+        let deliver: OffloadDeliver = Box::new(move |any, conn| {
+            if let Ok(r) = any.downcast::<thread::Result<(Result<usize, Errno>, Vec<u8>)>>() {
+                let (written, buf) = (*r).unwrap_or_else(|_| (Err(Errno::EIO), Vec::new()));
+                on_done(FsDone::owned_written(written, buf), conn);
+            }
+        });
+        let token = self.fs.register_offload(self.owner, deliver);
+        let (sink, wake, seam) = (
+            self.fs.completion_sink(),
+            Arc::clone(&self.eng.shared),
+            self.fs.write_seam.clone(),
+        );
+        self.fs.submit_write(Box::new(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let written = lane_write(&f.fd, &buf[range], off, flags, &seam);
+                (written, buf)
+            }));
+            finish_offload(&sink, &wake.wake, token, Box::new(r));
+        }));
+    }
+
+    /// Write `window` to `f` at `off` with `flags` on the ring's write lane, as
+    /// [`offload_write_owned`](Self::offload_write_owned) writes storage, completing as
+    /// [`pwritev2_window`](Self::pwritev2_window) does. The buffer goes back to the pool once the write has returned,
+    /// and an `off` of `u64::MAX`, which `pwritev2` reads as the file's position, is refused with a marked `EINVAL`.
+    #[cfg(feature = "net-server")]
+    pub fn offload_write_window<F>(&mut self, f: File, window: LeasedWindow, off: u64, flags: RwFlags, on_done: F)
+    where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let refusal = if off == u64::MAX {
+            Some(Errno::EINVAL)
+        } else {
+            (!self.fs.write_ready()).then_some(Errno::EAGAIN)
+        };
+        if let Some(err) = refusal {
+            drop(window);
+            let w = self.waiter(on_done);
+            self.fs.refuse(self.eng, w, err, true, Vec::new(), Some(f.fd));
+            return;
+        }
+        let LeasedWindow { view, hold } = window;
+        let asked = view.len;
+        let deliver: OffloadDeliver = Box::new(move |any, conn| {
+            if let Ok(r) = any.downcast::<thread::Result<Result<usize, Errno>>>() {
+                on_done(FsDone::window_written((*r).unwrap_or(Err(Errno::EIO)), asked), conn);
+            }
+        });
+        // `view` stays valid and unwritten while the share registered here lives, until this completion is taken.
+        let token = self.fs.register_leased_offload(self.owner, deliver, hold);
+        let (sink, wake, seam) = (
+            self.fs.completion_sink(),
+            Arc::clone(&self.eng.shared),
+            self.fs.write_seam.clone(),
+        );
+        self.fs.submit_write(Box::new(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                lane_write(&f.fd, view.as_slice(), off, flags, &seam)
+            }));
+            finish_offload(&sink, &wake.wake, token, Box::new(r));
+        }));
     }
 
     /// Offload a `flistxattr` of `f` to the pool and deliver its attribute names (all namespaces, sorted) on the loop.
@@ -407,4 +503,28 @@ impl FsConn<'_> {
             },
         );
     }
+}
+
+thread_local! {
+    /// Whether this thread of the write lane has dropped `CAP_FSETID` from its effective set.
+    static FSETID_DROPPED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// One write of the write lane, `src` to `fd` at `off`, once this thread has dropped `CAP_FSETID`. A thread that could
+/// not drop it writes nothing and tries again on its next write.
+fn lane_write(fd: &OwnedFd, src: &[u8], off: u64, flags: RwFlags, seam: &WriteSeam) -> Result<usize, Errno> {
+    seam.before_write();
+    if !FSETID_DROPPED.get() {
+        seam.drop_fsetid()?;
+        FSETID_DROPPED.set(true);
+    }
+    let iov = libc::iovec {
+        iov_base: src.as_ptr().cast_mut().cast(),
+        iov_len: src.len(),
+    };
+    // SAFETY: the iovec names `src`, which outlives the call, and the kernel only reads it.
+    let n = retry_on_eintr(|| unsafe {
+        libc::pwritev2(fd.as_raw_fd(), &iov, 1, off as libc::off_t, flags.bits() as libc::c_int)
+    })?;
+    Ok(n as usize)
 }

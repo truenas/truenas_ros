@@ -109,7 +109,7 @@ fn the_embedded_reactor_sets_attributes_in_one_call() {
 // Under `--cfg loom` the crate's `Arc` is loom's, which `File::from_shared` takes and a std `Arc` is not, and the loom
 // lane runs no ring.
 #[cfg(all(feature = "uring-fs", not(loom)))]
-fn one_fs_reply<B>(
+pub(super) fn one_fs_reply<B>(
     cfg: ServerConfig,
     request: &'static [u8],
     body: B,
@@ -153,7 +153,7 @@ where
 
 /// What an owned write answered, and whether it gave back the very buffer it was handed with the bytes it held.
 #[cfg(all(feature = "uring-fs", not(loom)))]
-fn owned_write_verdict(d: truenas_ros::uring_fs::FsDone, storage: *const u8, held: &[u8]) -> String {
+pub(super) fn owned_write_verdict(d: truenas_ros::uring_fs::FsDone, storage: *const u8, held: &[u8]) -> String {
     let marked = d.was_refused();
     let res = match d.result() {
         Ok(n) => format!("ok {n}"),

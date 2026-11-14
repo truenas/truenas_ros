@@ -12,8 +12,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-/// Per-ring sizing for a blocking-offload pool, the file pool or the lookup lane, which is how many worker threads it
-/// keeps warm and how far it grows.
+/// Per-ring sizing for one of a ring's offload pools, which is how many worker threads it keeps warm and how far it
+/// grows.
 ///
 /// Every field is per ring, so a deployment running several multiplies them. Only `floor` is resident; workers above it
 /// exist while a job is blocked on them and retire when idle, so the ceiling is a limit rather than a reservation.
@@ -82,6 +82,10 @@ pub(crate) const FILE_WORKER: &str = "truenas-fs-worker";
 
 /// The name of the lookup lane's threads (`FsConn::offload_lookup`), short enough that `ps` shows it whole.
 pub(crate) const LOOKUP_WORKER: &str = "truenas-lookup";
+
+/// The name of the write lane's threads (`FsConn::offload_write_window` and `offload_write_owned`), short enough that
+/// `ps` shows it whole.
+pub(crate) const WRITE_WORKER: &str = "truenas-write";
 
 /// Growth is rate-limited to at most one new worker per this interval, so a burst of microsecond-fast jobs that
 /// momentarily saturates the pool does not spawn a thread per job; sustained blocking work still grows to the ceiling.
@@ -155,7 +159,8 @@ struct PoolShared {
 /// An elastic pool of worker threads running `Box<dyn FnOnce() + Send>` jobs, the shared machinery behind both the
 /// off-loop `QueryPool` helpers and the on-loop `FsConn::offload` path. It keeps `floor` threads warm and grows to
 /// `ceiling` when every worker is stuck in a job, and burst workers retire after an idle period. Jobs run under the
-/// reactor's ambient credentials, so any per-`who` permission check belongs to the job.
+/// reactor's ambient credentials, the write lane's less `CAP_FSETID`, so any per-`who` permission check belongs to the
+/// job.
 ///
 /// Dropping the pool closes the queue and waits for every worker to exit, bounded by [`SHUTDOWN_DETACH_AFTER`].
 pub(crate) struct WorkerPool {
@@ -516,10 +521,10 @@ fn spawn_worker(shared: &Arc<PoolShared>) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-/// One lazily-spawned [`WorkerPool`], cheap to clone. A reactor holds two, the file pool (`FsConn::offload` and the
-/// off-loop `QueryPool`, one thread budget) and the lookup lane (`FsConn::offload_lookup`), whose jobs may wait seconds
-/// on another machine. If a worker cannot be spawned, [`enqueue`](Self::enqueue) runs the job inline while
-/// [`try_enqueue`](Self::try_enqueue) hands it back.
+/// One lazily-spawned [`WorkerPool`], cheap to clone. A reactor holds three, the file pool (`FsConn::offload` and the
+/// off-loop `QueryPool`, one thread budget), the lookup lane (`FsConn::offload_lookup`), whose jobs may wait seconds on
+/// another machine, and the write lane (`FsConn::offload_write_window` and `offload_write_owned`). If a worker cannot
+/// be spawned, [`enqueue`](Self::enqueue) runs the job inline while [`try_enqueue`](Self::try_enqueue) hands it back.
 pub(crate) struct SharedPool {
     pool: OnceCell<WorkerPool>,
     /// The name of the pool's threads.
@@ -595,6 +600,12 @@ impl SharedPool {
             .with(|pool| pool.shared.inner.lock().unwrap_or_else(|e| e.into_inner()).idle)
     }
 
+    /// The bounds the pool was made with, for a test of where they came from.
+    #[cfg(all(test, not(loom), feature = "net-server"))]
+    pub(crate) fn bounds(&self) -> OffloadBounds {
+        self.bounds
+    }
+
     /// Back off as a failed first spawn does, and never stop, so a test can see what a caller does with a job no thread
     /// takes. A real failure needs a process-wide limit, which a test must not exhaust.
     #[cfg(all(test, not(loom)))]
@@ -610,37 +621,41 @@ impl SharedPool {
         }
     }
 
-    /// [`enqueue`](Self::enqueue), but a job no thread can take is handed back rather than run inline. That is when the
-    /// pool's first spawn fails, and for [`SPAWN_RETRY_BACKOFF`] after it, so the caller can answer for a job that must
-    /// not run on its loop.
+    /// [`enqueue`](Self::enqueue), but a job no thread can take ([`ready`](Self::ready)) is handed back rather than run
+    /// inline, so the caller can answer for a job that must not run on its loop.
     pub(crate) fn try_enqueue(&self, job: Job) -> Result<(), Job> {
-        // `job` is `FnOnce`, so it can only be handed to one arm; take it back out of the cell when the pool was not
-        // there to receive it.
-        let mut job = Some(job);
-        if let Some(()) = self.pool.with(|pool| pool.enqueue(job.take().expect("first use"))) {
-            return Ok(());
+        if !self.ready() {
+            return Err(job);
         }
-        let job = job.expect("untouched when the cell was empty");
+        self.pool.with(|pool| pool.enqueue(job));
+        Ok(())
+    }
+
+    /// Whether the pool has a thread to take a job, spawning it on first use. Not when its first spawn fails, nor for
+    /// [`SPAWN_RETRY_BACKOFF`] after, and always once it has spawned, since its floor never retires. So a caller can
+    /// ask before it moves into a job a payload it would want back.
+    pub(crate) fn ready(&self) -> bool {
+        if self.pool.is_set() {
+            return true;
+        }
         let now = self.epoch.elapsed().as_micros() as u64;
         if now < self.retry_spawn_us.load(Ordering::Relaxed) {
             // Backing off a recent failure, so no spawn is tried per job.
-            return Err(job);
+            return false;
         }
         match WorkerPool::try_elastic(self.name, self.bounds) {
             Ok(pool) => {
                 // A lost race just drops the surplus pool here; its `Drop` joins the workers it started before they can
                 // touch anything.
                 self.pool.set(pool);
-                let mut job = Some(job);
-                self.pool.with(|pool| pool.enqueue(job.take().expect("first use")));
-                Ok(())
+                true
             }
             Err(_) => {
                 self.retry_spawn_us.store(
                     now.saturating_add(SPAWN_RETRY_BACKOFF.as_micros() as u64),
                     Ordering::Relaxed,
                 );
-                Err(job)
+                false
             }
         }
     }

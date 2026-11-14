@@ -82,10 +82,12 @@ clients learns when anyone else changes it.
 
 ### Identity
 
-Every `uring-fs` operation carries a `Personality` - a kernel-registered
-credential snapshot stamped into the SQE, under which the kernel itself
-performs the permission check. There is no ambient-identity variant: the
-daemon's own identity is minted explicitly with `UringFs::register_self`, and
+Every `uring-fs` operation but a write on the write lane, which
+`FsConn::offload_write_owned` explains, carries a `Personality` - a
+kernel-registered credential snapshot stamped into the SQE, under which the
+kernel itself performs the permission check. There is no ambient-identity
+variant. The daemon's own identity is minted explicitly with
+`UringFs::register_self`, and
 acting as an authenticated peer goes through `CredBroker`, a forked process
 that impersonates a user just long enough to snapshot their credentials, so
 the reactor process never changes identity itself. Wrap it in an

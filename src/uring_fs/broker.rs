@@ -858,6 +858,22 @@ fn restore_effective_caps() -> errno::Result<()> {
     Ok(())
 }
 
+/// Drop `CAP_FSETID` from the calling thread's effective set, for a thread of the write lane. `capset` changes the
+/// calling thread alone, and permitted keeps the capability, which nothing on the lane raises again.
+pub(crate) fn drop_effective_fsetid() -> errno::Result<()> {
+    let mut hdr = CapHeader {
+        version: VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: capget fills two CapData words for VERSION_3.
+    Errno::result(unsafe { libc::syscall(libc::SYS_capget, std::ptr::addr_of_mut!(hdr), data.as_mut_ptr()) })?;
+    data[0].effective &= !Caps::FSETID.bits();
+    // SAFETY: capset reads the same two-word layout back.
+    Errno::result(unsafe { libc::syscall(libc::SYS_capset, std::ptr::addr_of_mut!(hdr), data.as_ptr()) })?;
+    Ok(())
+}
+
 /// Drop `CAP_SETUID`/`CAP_SETGID` from every capability set of the calling process. Succeeds trivially where they were
 /// not held.
 fn drop_setid_caps() -> errno::Result<()> {
