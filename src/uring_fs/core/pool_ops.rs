@@ -175,7 +175,7 @@ impl FsConn<'_> {
     /// the reactor's credentials less `CAP_FSETID`, so two writes to one file run at once where io-wq runs them in
     /// turn. It completes as [`pwritev2_owned`](Self::pwritev2_owned) does and refuses what it refuses, and a lane that
     /// cannot spawn a thread refuses with a marked `EAGAIN` ([`FsDone::was_refused`]), since a write never runs on the
-    /// loop.
+    /// loop. A write that ran lets go of `f` before `on_done` runs, as a ring write does.
     ///
     /// The write carries no personality, which is sound on ZFS, the one filesystem the lane serves. The file was opened
     /// under the caller's, and `zfs_write` checks the writer only in clearing the set-user-ID and set-group-ID bits
@@ -216,18 +216,21 @@ impl FsConn<'_> {
             self.fs.write_seam.clone(),
         );
         self.fs.submit_write(Box::new(move || {
+            let seam = &seam;
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                let written = lane_write(&f.fd, &buf[range], off, flags, &seam);
+                let written = lane_write(&f.fd, &buf[range], off, flags, seam);
                 (written, buf)
             }));
             finish_offload(&sink, &wake.wake, token, Box::new(r));
+            seam.after_post();
         }));
     }
 
     /// Write `window` to `f` at `off` with `flags` on the ring's write lane, as
     /// [`offload_write_owned`](Self::offload_write_owned) writes storage, completing as
-    /// [`pwritev2_window`](Self::pwritev2_window) does. The buffer goes back to the pool once the write has returned,
-    /// and an `off` of `u64::MAX`, which `pwritev2` reads as the file's position, is refused with a marked `EINVAL`.
+    /// [`pwritev2_window`](Self::pwritev2_window) does. A write that ran lets go of `f` before `on_done` runs, as a
+    /// ring write does. The buffer goes back to the pool once the write has returned, and an `off` of `u64::MAX`, which
+    /// `pwritev2` reads as the file's position, is refused with a marked `EINVAL`.
     #[cfg(feature = "net-server")]
     pub fn offload_write_window<F>(&mut self, f: File, window: LeasedWindow, off: u64, flags: RwFlags, on_done: F)
     where
@@ -259,10 +262,12 @@ impl FsConn<'_> {
             self.fs.write_seam.clone(),
         );
         self.fs.submit_write(Box::new(move || {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                lane_write(&f.fd, view.as_slice(), off, flags, &seam)
+            let seam = &seam;
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                lane_write(&f.fd, view.as_slice(), off, flags, seam)
             }));
             finish_offload(&sink, &wake.wake, token, Box::new(r));
+            seam.after_post();
         }));
     }
 
