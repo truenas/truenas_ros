@@ -535,7 +535,14 @@ impl<U> Reactor<U> {
             // `arm_body_recv` carved.
             conn.arm_body_recv(reuse)
         } else {
+            #[cfg(feature = "net-server")]
+            let held = conn.recv_held_bytes();
             let granted = conn.arm_recv(want, exact);
+            // What promoted storage grew by went on its ticket, and goes on the count beside it.
+            #[cfg(feature = "net-server")]
+            if let Some(pool) = self.body_pool.as_ref() {
+                pool.borrow_mut().hold(conn.recv_held_bytes() - held);
+            }
             if granted < want && exact {
                 // Unreachable: the promote above leaves either a claim that covers this read or no claim at all.
                 // Reading less than the frame declared would deliver a short message as whole, so a promote that ever

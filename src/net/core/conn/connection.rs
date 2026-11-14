@@ -343,6 +343,12 @@ impl<U> Connection<U> {
         self.recv_buf.set_owned();
     }
 
+    /// The bytes the receive storage has on the body pool's count ([`RecvBuf::held_bytes`]).
+    #[cfg(feature = "net-server")]
+    pub(crate) fn recv_held_bytes(&self) -> usize {
+        self.recv_buf.held_bytes()
+    }
+
     /// Bytes already accumulated in `buf`.
     pub(crate) fn buffered(&self) -> usize {
         self.recv_buf.len()

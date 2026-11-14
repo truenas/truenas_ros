@@ -336,20 +336,23 @@ Do not reopen these without a reason that is new.
 - **The count of held bytes is exact by construction.** The reactor counts
   the pool storage it holds by capacity, a placed or promoted body from its
   claim until it is taken or given back, and a reply marked recycled from
-  its queueing until it is sent or dropped. Each holder carries what it put
-  on the count (`Ticket`, `Home`) and takes exactly that off, never a
-  capacity read again, since promoted storage grows while held. Storage a
-  consumer takes leaves the count, since a `Vec` dropped where the pool
-  cannot see it would stay counted for good, and the consumer counts what
-  it holds with `BodyRecycler::take_out` and `give_back`. A reply given to
-  `Deferred::reply_recycled` counts from that call through `handed` in
-  `LoopShared`, which the handle adds to before it sends the reply and the
-  loop takes off as it queues the reply or sends it home. The loop reads
-  that capacity again, which is still what was added, since nothing can
-  touch the storage while the reply waits in the mailbox. Pinned by
-  `held_bytes_come_off_as_they_went_on`,
-  `held_bytes_follow_a_placed_body_and_a_recycled_reply` and
-  `a_deferred_recycled_reply_counts_from_its_hand_off`.
+  its queueing until it is sent or dropped. Promoted storage grows while
+  held, amortized, and the capacity each growth adds goes on its ticket and
+  on the count together (`RecvBuf::reserve_at`), so the cap sees what a
+  record in fragments holds. Each holder carries what it put on the count
+  (`Ticket`, `Home`) and takes exactly that off, never a capacity read
+  again. Storage a consumer takes leaves the count, since a `Vec` dropped
+  where the pool cannot see it would stay counted for good, and the consumer
+  counts what it holds with `BodyRecycler::take_out` and `give_back`. A
+  reply given to `Deferred::reply_recycled` counts from that call through
+  `handed` in `LoopShared`, which the handle adds to before it sends the
+  reply and the loop takes off as it queues the reply or sends it home. The
+  loop reads that capacity again, which is still what was added, since
+  nothing can touch the storage while the reply waits in the mailbox. Pinned
+  by `held_bytes_come_off_as_they_went_on`,
+  `held_bytes_follow_a_placed_body_and_a_recycled_reply`,
+  `a_deferred_recycled_reply_counts_from_its_hand_off` and
+  `promoted_storage_counts_what_it_grows_by`.
 - **At `held_cap` a placed body read and the consumer's turns wait in one
   queue, in the order they came, and nothing else does.** The check sits
   where the reactor decides to place a body, before it claims storage, so

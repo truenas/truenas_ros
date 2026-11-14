@@ -90,6 +90,116 @@ fn held_bytes_follow_a_placed_body_and_a_recycled_reply() {
     assert_eq!(recycler.held(), 0, "and nothing once the ring is idle");
 }
 
+/// A framer of records in fragments, each behind a mark of four bytes whose top bit says it is the last, as RFC 5531
+/// frames ONC RPC over TCP. It reads only the marks, and only as far as it must, so every fragment but the last is the
+/// header, and the data of the last is the body, placed when it is large enough.
+fn fragments_header(buf: &[u8], _state: &mut ()) -> Framing {
+    if buf.is_empty() {
+        return Framing::Need(4);
+    }
+    let mut at = 0;
+    loop {
+        let data = at + 4;
+        let Some(mark) = buf.get(at..data) else {
+            return Framing::NeedInMessage(data - buf.len());
+        };
+        let mark = u32::from_be_bytes(mark.try_into().expect("a mark is four bytes"));
+        let len = (mark & 0x7fff_ffff) as usize;
+        if mark & 0x8000_0000 != 0 {
+            return Framing::Complete {
+                header_len: data,
+                body_len: len,
+            };
+        }
+        at = data + len;
+        if buf.len() < at + 4 {
+            return Framing::NeedInMessage(at + 4 - buf.len());
+        }
+    }
+}
+
+/// Send a record of `fragments`, each behind its mark.
+fn send_record<W: Write>(s: &mut W, fragments: &[&[u8]]) -> io::Result<()> {
+    for (i, fragment) in fragments.iter().enumerate() {
+        let last = if i + 1 == fragments.len() { 0x8000_0000 } else { 0 };
+        s.write_all(&(fragment.len() as u32 | last).to_be_bytes())?;
+        s.write_all(fragment)?;
+    }
+    Ok(())
+}
+
+/// Storage promoted off a receive buffer counts what it grows by as later fragments of its record arrive, and gives
+/// exactly that back. The handler of a record of two fragments whose last is not placed, and of one of three, sees at
+/// least the record's bytes held, and a request after each finds the count back at 0.
+#[test]
+fn promoted_storage_counts_what_it_grows_by() {
+    use std::cell::OnceCell;
+    use std::rc::Rc;
+    use truenas_ros::net::server::BodyRecycler;
+
+    // Past a receive buffer of the default size, so the record is promoted as it outgrows one.
+    const FIRST: usize = 300 * 1024;
+    // Under the placement threshold, so the last fragment is read into the promoted storage.
+    const LAST: usize = 32 * 1024;
+    let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
+    let h_seam = Rc::clone(&seam);
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: fragments_header,
+        body: move |req: Request<'_, ()>| {
+            let held = h_seam.get().expect("filled before serving").held() as u64;
+            let record = (req.header.len() + req.body.len()) as u64;
+            let mut reply = held.to_be_bytes().to_vec();
+            reply.extend_from_slice(&record.to_be_bytes());
+            Response::Reply(echo_frame(&reply))
+        },
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], ServerConfig::default(), proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let recycler = server.body_recycler().expect("a server keeps a body pool");
+    seam.set(recycler.clone()).expect("set once");
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        (|| -> io::Result<()> {
+            let ask = |s: &mut TcpStream, fragments: &[&[u8]]| -> io::Result<(u64, u64)> {
+                send_record(s, fragments)?;
+                let reply = recv_framed(s)?;
+                let (held, record) = reply.split_at(8);
+                Ok((
+                    u64::from_be_bytes(held.try_into().expect("eight bytes")),
+                    u64::from_be_bytes(record.try_into().expect("eight bytes")),
+                ))
+            };
+            let mut s = connect_tcp(v4)?;
+            let (first, middle, last) = (vec![1u8; FIRST], vec![2u8; 400 * 1024], vec![3u8; LAST]);
+            for record in [&[&first[..], &last[..]][..], &[&first[..], &middle[..], &last[..]][..]] {
+                let (held, bytes) = ask(&mut s, record)?;
+                assert!(
+                    held >= bytes,
+                    "a record of {} fragments counts {held} of its {bytes} bytes",
+                    record.len()
+                );
+                let (held, _) = ask(&mut s, &[b"p"])?;
+                assert_eq!(held, 0, "after a record of {} fragments", record.len());
+            }
+            Ok(())
+        })()
+        .expect("client io");
+        stop.shutdown();
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    assert_eq!(recycler.held(), 0, "and nothing once the ring is idle");
+}
+
 /// A reply given to `Deferred::reply_recycled` counts from that call, before the loop has it, and stays counted once
 /// the loop queues it until it is sent, with no turn where neither side counts it. One that reaches no request leaves
 /// the count as it goes home, and an empty one goes as `Done` and adds nothing.

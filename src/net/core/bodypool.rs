@@ -72,9 +72,9 @@ pub(crate) struct BodyPool {
     /// Consecutive rebalances that observed no serve.
     idle_rounds: u8,
     /// Bytes of storage out of this pool that the reactor holds, by capacity. A placed or promoted body counts from its
-    /// claim until it is taken or given back, and a reply marked recycled from when it is queued on its connection
-    /// until it is sent or dropped. Each give takes back exactly what its claim counted and never reads a capacity
-    /// again, since storage may grow while it is held.
+    /// claim until it is taken or given back, promoted storage with every growth since, and a reply marked recycled
+    /// from when it is queued on its connection until it is sent or dropped. Each give takes back exactly what was
+    /// counted for it, which its ticket or home carries, and never reads a capacity again.
     ring_held: usize,
     /// Bytes the consumer counts as its own ([`BodyRecycler::take_out`]).
     out_held: usize,
@@ -725,7 +725,7 @@ mod tests {
         let (mut v, t) = pool.borrow_mut().claim_held(MIB);
         assert_eq!(t.bytes, v.capacity(), "the ticket carries the count");
         assert_eq!(pool.borrow().held(), t.bytes, "a claim is held");
-        // Grown while held, as promoted storage may be.
+        // Grown past what its ticket carries, so a give that read the capacity would take off too much.
         v.reserve_exact(4 * MIB);
         pool.borrow_mut().give_held(v, t);
         assert_eq!(pool.borrow().held(), 0, "what went on came off");
