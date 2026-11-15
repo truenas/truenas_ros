@@ -411,12 +411,13 @@ where
         let fs = (cfg.fs_ops > 0).then(|| {
             // FS ops submit on raw fds, never `IOSQE_FIXED_FILE`, so this sizes the op table alone and nothing here
             // bounds open files.
-            crate::uring_fs::core::FsCore::new(
+            crate::uring_fs::core::FsCore::with_rooms(
                 fs_op_slots(&cfg),
                 crate::uring_fs::OffloadBounds {
                     floor: cfg.fs_offload_floor,
                     ceiling: cfg.fs_offload_ceiling,
                 },
+                cfg.fs_callback_bytes,
             )
         });
         #[cfg(feature = "uring-fs")]

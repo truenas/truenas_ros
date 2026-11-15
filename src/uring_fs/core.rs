@@ -89,6 +89,10 @@ pub(crate) const LOOKUP_CEILING: usize = 64;
 pub(crate) const WRITE_FLOOR: usize = 4;
 /// Default ceiling of the write lane, sixteen writes in flight on a ring before the rest queue.
 pub(crate) const WRITE_CEILING: usize = 16;
+/// Default size of the room each op slot of a server's ring keeps its callback in, which holds a callback that captures
+/// a few handles and counts. A larger one is boxed, as every callback once was.
+#[cfg(any(test, feature = "net-server"))]
+pub(crate) const FS_CALLBACK_BYTES: usize = 64;
 /// Names per off-loop `readdir` batch in [`FsConn::next_batch`].
 const DIR_BATCH: usize = 256;
 
@@ -141,7 +145,58 @@ pub(crate) const TAG_CANCEL: u8 = 0x9E;
 /// and a fresh [`FsConn`] for chaining. It fires inline at the completion's dispatch, or at the wake drain for a host
 /// refusal ([`FsCore::refuse`]). Only the teardown drain drops it unfired, which drops the captured continuation and so
 /// closes the connection.
+///
+/// This is the boxed form. One that fits a room of the op table is kept there instead ([`Callback`]).
 pub(crate) type EmbeddedCb = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
+
+/// What an embedded op's callback runs with, for the rooms of the op table ([`super::callbacks`]).
+pub(crate) struct FsSig;
+
+impl super::callbacks::Sig for FsSig {
+    type Args<'a, 'b>
+        = (FsDone, &'a mut FsConn<'b>)
+    where
+        'b: 'a;
+    type Boxed = EmbeddedCb;
+
+    fn boxed<C: super::callbacks::Call<FsSig>>(c: C) -> EmbeddedCb {
+        Box::new(move |done: FsDone, conn: &mut FsConn<'_>| c.call((done, conn)))
+    }
+}
+
+impl<F> super::callbacks::Call<FsSig> for F
+where
+    F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+{
+    fn call<'a, 'b>(self, (done, conn): (FsDone, &'a mut FsConn<'b>))
+    where
+        'b: 'a,
+    {
+        self(done, conn)
+    }
+}
+
+/// Where an embedded waiter's callback is. Every move between them is the core's, which holds the rooms.
+pub(crate) enum Callback {
+    /// In the core's staging room, from [`FsConn::waiter`] until the submit it is handed to parks it in its slot's room
+    /// or refuses it.
+    Staged,
+    /// In the room of the slot whose entry holds the waiter.
+    Parked,
+    /// In a box of its own, one larger or more aligned than a room, or one that left its room before it ran.
+    Boxed(EmbeddedCb),
+}
+
+/// Callbacks boxed because they did not fit a room of their op table, across the process.
+static BOXED_CALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many callbacks of [`FsConn`]'s ops this process has boxed because they were larger or more aligned than a room
+/// of their ring's op table, which [`fs_callback_bytes`](crate::net::server::ServerConfig::fs_callback_bytes) sizes.
+/// A consumer's tests read it to check that the size it set holds every callback it submits. A standalone
+/// [`UringFs`](super::UringFs) keeps no rooms, so each callback of an `FsConn` on one counts here.
+pub fn boxed_callbacks() -> u64 {
+    BOXED_CALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Where an op that never reached the ring reports why, and hands back what it was given.
 ///
@@ -188,7 +243,7 @@ pub(crate) enum FsWaiter {
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     Embedded {
         owner: Owner,
-        cb: EmbeddedCb,
+        cb: Callback,
         /// The reason-sink share [`armed::arm`] took, `None` for a plain callback, whose contract is that a drop closes
         /// the connection. The wrapper makes hand-building this variant a build failure (see [`armed`]).
         on_fail: armed::Armed,
@@ -252,11 +307,21 @@ mod armed {
 /// A routed fs-domain CQE, from [`FsCore::on_cqe`], for the host to act on once its borrow of the fs tables has ended.
 pub(crate) enum ReapedFs {
     None,
-    Embedded(EmbeddedCb, FsDone, Owner),
+    Embedded(ReapedCb, FsDone, Owner),
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     Pump(FsDone, (u32, u64)),
     /// File leases of the ring a break reached, for its handler.
     FileLeaseBreaks(Vec<FileLeaseId>),
+}
+
+/// A reaped op's callback, for [`deliver_embedded`] to run.
+pub(crate) enum ReapedCb {
+    Boxed(EmbeddedCb),
+    /// Still in the room of `slot`. The slot is free again, so a parked body read can take it first, and the room holds
+    /// the callback until it moves out to run, so an op with a callback that takes the slot sooner boxes it.
+    Parked {
+        slot: u32,
+    },
 }
 
 /// `fremovexattr(2)` on `f`. Blocking, because io_uring has no remove opcode, and an `IORING_OP_FSETXATTR` with a
@@ -796,6 +861,8 @@ impl WallClock {
 /// [`FsCore::on_cqe`].
 pub(crate) struct FsCore {
     ops: Vec<SlotEntry<FsOpEntry>>,
+    /// A room for the callback of each slot in `ops`, by index, and one to stage in ([`Callback`]).
+    cbs: super::callbacks::Rooms<FsSig>,
     op_free: Vec<u32>,
     /// Reply-path pump reads in flight that select from a provided-buffer ring: what the body pool's `grow` subtracts
     /// from its free count.
@@ -819,11 +886,15 @@ pub(crate) struct FsCore {
     pub(crate) write_seam: offload::WriteSeam,
     /// Where workers push finished jobs; drained on the loop's wake.
     completions: Arc<Mutex<VecDeque<PoolCompletion>>>,
+    /// The storage `completions` is swapped with as it is drained, so neither list grows afresh on a warm ring.
+    drained: VecDeque<PoolCompletion>,
+    /// The storage of the finished jobs one drain delivers ([`deliver_pool_completions`]).
+    deliveries: Vec<PoolDelivery>,
     /// Reactor-side continuations for in-flight offloads, keyed by token.
     offload_reg: HashMap<u64, OffloadEntry>,
     next_offload: u64,
     /// Recv-pool buffer ids whose last share a finished [`FsConn::offload_from`] job dropped, owed to the net server's
-    /// pool ([`FsCore::take_pool_releases`]); the fs core cannot reach the pool itself.
+    /// pool ([`FsCore::release_pool_buffers`]), which the fs core cannot reach itself.
     #[cfg(feature = "net-server")]
     pool_releases: Vec<u16>,
     /// Buffer ids returned by shares dropped off the explicit release paths ([`LeaseHold`]), from any thread; drained
@@ -858,7 +929,14 @@ pub(crate) struct FsCore {
 }
 
 impl FsCore {
+    /// A core of `op_slots` slots whose rooms take callbacks of the default size a server's rings use, for the tests.
+    #[cfg(test)]
     pub(crate) fn new(op_slots: u32, offload: OffloadBounds) -> FsCore {
+        FsCore::with_rooms(op_slots, offload, FS_CALLBACK_BYTES)
+    }
+
+    /// A core of `op_slots` slots, each with a room of `callback_bytes` for its callback, none when 0.
+    pub(crate) fn with_rooms(op_slots: u32, offload: OffloadBounds, callback_bytes: usize) -> FsCore {
         FsCore {
             ops: (0..op_slots)
                 .map(|_| SlotEntry {
@@ -866,6 +944,7 @@ impl FsCore {
                     state: FsOpEntry::new(),
                 })
                 .collect(),
+            cbs: super::callbacks::Rooms::new(op_slots as usize, callback_bytes),
             op_free: (0..op_slots).rev().collect(),
             pump_selecting: 0,
             pool: SharedPool::new(FILE_WORKER, offload),
@@ -888,6 +967,8 @@ impl FsCore {
             pending_writes: 0,
             write_seam: offload::WriteSeam::default(),
             completions: Arc::new(Mutex::new(VecDeque::new())),
+            drained: VecDeque::new(),
+            deliveries: Vec::new(),
             offload_reg: HashMap::new(),
             next_offload: 0,
             #[cfg(feature = "net-server")]

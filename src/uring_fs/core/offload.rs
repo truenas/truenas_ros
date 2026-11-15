@@ -133,17 +133,18 @@ impl FsCore {
         }));
     }
 
-    /// Take every finished offload paired with its owner + continuation. The caller fires each with a fresh
-    /// owner-scoped [`FsConn`] once its borrow of the fs tables has ended (mirrors [`FsCore::on_cqe`]'s hand-back).
-    /// Called from the loop's `TAG_WAKE` handler.
+    /// Push every finished offload, paired with its owner and continuation, onto `out`. The caller fires each with a
+    /// fresh owner-scoped [`FsConn`] once its borrow of the fs tables has ended (mirrors [`FsCore::on_cqe`]'s
+    /// hand-back). Called from the loop's `TAG_WAKE` handler. The queue is swapped with a list kept for it, under the
+    /// lock, so the workers' pushes and this drain keep the storage of both and a warm ring allocates neither.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
-    pub(crate) fn take_pool_completions(&mut self) -> Vec<PoolDelivery> {
-        let drained: Vec<PoolCompletion> = {
+    pub(crate) fn take_pool_completions(&mut self, out: &mut Vec<PoolDelivery>) {
+        {
             let mut q = self.completions.lock().unwrap_or_else(|e| e.into_inner());
-            q.drain(..).collect()
-        };
-        let mut out = Vec::with_capacity(drained.len());
-        for (token, any) in drained {
+            std::mem::swap(&mut *q, &mut self.drained);
+        }
+        let mut drained = std::mem::take(&mut self.drained);
+        for (token, any) in drained.drain(..) {
             if let Some(e) = self.offload_reg.remove(&token) {
                 // The job is over, so its share of the recv claim ends here, on the reactor. The buffer surfaces only
                 // from the last share, as in `on_cqe`.
@@ -158,20 +159,41 @@ impl FsCore {
                 out.push((e.owner, e.deliver, any));
             }
         }
+        self.drained = drained;
+    }
+
+    /// The finished offloads [`take_pool_completions`](Self::take_pool_completions) would push, in one list, for the
+    /// tests.
+    #[cfg(all(test, any(loom, feature = "net-server")))]
+    pub(crate) fn pool_completions_for_test(&mut self) -> Vec<PoolDelivery> {
+        let mut out = Vec::new();
+        self.take_pool_completions(&mut out);
         out
     }
 
-    /// The recv-pool buffers finished offload jobs, and shares dropped elsewhere, have released since the last call,
-    /// for the net server to hand back to its pool. Empty on a host with no pool.
+    /// Hand `release` each recv-pool buffer finished offload jobs, and shares dropped elsewhere, have released since
+    /// the last call, for the net server to give back to its pool. Nothing on a host with no pool. The lists keep their
+    /// storage, so a warm ring allocates nothing here.
     #[cfg(feature = "net-server")]
+    pub(crate) fn release_pool_buffers(&mut self, mut release: impl FnMut(u16)) {
+        self.pool_releases.drain(..).for_each(&mut release);
+        self.lease_returns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .for_each(release);
+    }
+
+    /// The buffers [`release_pool_buffers`](Self::release_pool_buffers) would hand back, in one list, for the tests.
+    #[cfg(all(test, feature = "net-server"))]
     pub(crate) fn take_pool_releases(&mut self) -> Vec<u16> {
-        let mut out = std::mem::take(&mut self.pool_releases);
-        out.extend(self.lease_returns.lock().unwrap_or_else(|e| e.into_inner()).drain(..));
+        let mut out = Vec::new();
+        self.release_pool_buffers(|bid| out.push(bid));
         out
     }
 
-    /// The return road for a share minted against this core: the queue [`take_pool_releases`](Self::take_pool_releases)
-    /// drains, and the loop's wake.
+    /// The return road for a share minted against this core, the queue
+    /// [`release_pool_buffers`](Self::release_pool_buffers) drains and the loop's wake.
     #[cfg(feature = "net-server")]
     pub(super) fn lease_returns(&self, wake: &Arc<crate::uring::wake::LoopShared>) -> LeaseReturns {
         LeaseReturns {

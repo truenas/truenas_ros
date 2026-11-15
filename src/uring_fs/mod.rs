@@ -146,13 +146,16 @@ mod single_flight;
 // the fs-domain modules that submit to it.
 pub(crate) mod offload_pool;
 pub use offload_pool::OffloadBounds;
+// The rooms an op table keeps its callbacks in, kept apart from `core` so Miri, which cannot run a ring, checks
+// their unsafe code.
+mod callbacks;
 // `pub(crate)` so a `net` server can drive an `FsCore` on its own ring.
 pub(crate) mod core;
 // Read leases a ring holds on files, and the breaks of them that reach it.
 pub mod file_lease;
 // Exported without `net-server`, since a consumer driving a standalone [`UringFs`] needs the `FsConn` facade to run
 // several operations back to back as much as an embedded server does.
-pub use core::{ConnToken, DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, StepPath, Timer};
+pub use core::{ConnToken, DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, StepPath, Timer, boxed_callbacks};
 // The one on-loop type that is the server's alone: a window of a pooled receive buffer, which only the net server has.
 #[cfg(feature = "net-server")]
 pub use core::LeasedWindow;

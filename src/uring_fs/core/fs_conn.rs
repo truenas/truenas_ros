@@ -49,18 +49,33 @@ impl<'a> FsConn<'a> {
         self.fail_sink = sink;
     }
 
-    /// Box `on_done` as this connection's owner-stamped embedded waiter, taking a share of the staged reason sink on
-    /// the way. **The one shape every submit method here hands the core**, and the only way to build the share
+    /// Make `on_done` this connection's owner-stamped embedded waiter, taking a share of the staged reason sink on the
+    /// way. **The one shape every submit method here hands the core**, and the only way to build the share
     /// ([`armed`]).
+    ///
+    /// The callback goes into the core's staging room, for the submit to park in the room of the slot it gives the op
+    /// ([`FsCore::park`]), or into a box when it is larger or more aligned than a room, which [`boxed_callbacks`]
+    /// counts. Every caller hands the waiter to the core at once, so the staging room is empty here, and a callback
+    /// that finds it taken all the same is boxed and not counted.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(super) fn waiter<F>(&mut self, on_done: F) -> FsWaiter
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
         let on_fail = armed::arm(self);
+        let fits = self.fs.cbs.fits::<F>();
+        let cb = match self.fs.cbs.stage(on_done) {
+            Ok(()) => Callback::Staged,
+            Err(on_done) => {
+                if !fits {
+                    BOXED_CALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Callback::Boxed(Box::new(on_done))
+            }
+        };
         FsWaiter::Embedded {
             owner: self.owner,
-            cb: Box::new(on_done),
+            cb,
             on_fail,
         }
     }

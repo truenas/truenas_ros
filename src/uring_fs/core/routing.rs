@@ -90,11 +90,11 @@ impl FsCore {
 
     // ---- completion routing --------------------------------------------
 
-    /// Route one fs-domain CQE. `tag` is the unpacked op tag; a generation mismatch makes the completion inert (op
-    /// entries free only at their own terminal CQE). An **off-loop** (channel) op is delivered here and returns
-    /// [`ReapedFs::None`]; an **embedded** (on-loop) op hands back its callback and outcome for the host to fire once
-    /// its borrow of the fs tables has ended; a **pump** read hands back its outcome and owner for the host to route
-    /// itself.
+    /// Route one fs-domain CQE. `tag` is the unpacked op tag, and a generation mismatch makes the completion inert, as
+    /// op entries free only at their own terminal CQE. An **off-loop** (channel) op is delivered here and returns
+    /// [`ReapedFs::None`]. An **embedded** (on-loop) op hands back its callback, or the slot whose room holds it, and
+    /// its outcome, for the host to fire once its borrow of the fs tables has ended. A **pump** read hands back its
+    /// outcome and owner for the host to route itself.
     pub(crate) fn on_cqe(&mut self, eng: &mut Engine, tag: u8, op_slot: u32, gen32: u32, res: i32) -> ReapedFs {
         // A poll of the file leases' signalfd that could not be staged is staged again on the ring's next completion.
         self.file_leases.arm(eng);
@@ -245,7 +245,15 @@ impl FsCore {
                 ReapedFs::None
             }
             Some(FsWaiter::Embedded { owner, cb, .. }) => ReapedFs::Embedded(
-                cb,
+                match cb {
+                    Callback::Boxed(cb) => ReapedCb::Boxed(cb),
+                    Callback::Parked => ReapedCb::Parked { slot: op_slot },
+                    // Only a submit that never parked its waiter's callback leaves it staged.
+                    Callback::Staged => match self.cbs.unstage() {
+                        Some(cb) => ReapedCb::Boxed(cb),
+                        None => return ReapedFs::None,
+                    },
+                },
                 FsDone {
                     result,
                     refused,
@@ -305,6 +313,17 @@ impl FsCore {
             stat,
             ..
         } = done;
+        // The loop is dying, so a callback still in its slot's room is dropped there, unfired, as `deliver` drops a
+        // boxed one.
+        if matches!(
+            waiter,
+            Some(FsWaiter::Embedded {
+                cb: Callback::Parked,
+                ..
+            })
+        ) {
+            self.cbs.discard(op_slot as usize);
+        }
         // A short leased write answers `EIO` here too, as the live reap does.
         #[cfg(feature = "net-server")]
         let res = {
@@ -331,9 +350,54 @@ impl FsCore {
 
     /// Leak the op table without dropping it, used only when a teardown drain failed with ops possibly still in flight.
     /// The kernel may still write into a buffer an op entry owns until its CQE reaps, so freeing it would be a
-    /// use-after-free. Pairs with `ConnTable::leak` and `Engine::leak_wake_buf`.
+    /// use-after-free. Pairs with `ConnTable::leak` and `Engine::leak_wake_buf`. The callbacks in the slots' rooms leak
+    /// with their entries, as boxed ones do.
     pub(crate) fn leak(&mut self) {
         std::mem::forget(std::mem::take(&mut self.ops));
+        std::mem::forget(std::mem::replace(
+            &mut self.cbs,
+            crate::uring_fs::callbacks::Rooms::new(0, 0),
+        ));
+    }
+
+    /// Move the staged callback of `waiter` into the room of `op_slot`, the slot it is about to wait in. A room that
+    /// still holds the callback of the slot's last op, reaped and not yet run, takes no other, and the staged callback
+    /// is boxed instead.
+    pub(super) fn park(&mut self, op_slot: u32, waiter: FsWaiter) -> FsWaiter {
+        match waiter {
+            FsWaiter::Embedded {
+                owner,
+                cb: Callback::Staged,
+                on_fail,
+            } => {
+                let cb = if self.cbs.park(op_slot as usize) {
+                    Callback::Parked
+                } else {
+                    self.cbs.unstage().map_or(Callback::Staged, Callback::Boxed)
+                };
+                FsWaiter::Embedded { owner, cb, on_fail }
+            }
+            other => other,
+        }
+    }
+
+    /// Move the callback of `waiter` out of the room of `op_slot` into a box, for a waiter that leaves its slot before
+    /// its callback runs.
+    fn unpark(&mut self, op_slot: u32, waiter: FsWaiter) -> FsWaiter {
+        match waiter {
+            FsWaiter::Embedded {
+                owner,
+                cb: Callback::Parked,
+                on_fail,
+            } => {
+                let cb = self
+                    .cbs
+                    .unpark(op_slot as usize)
+                    .map_or(Callback::Parked, Callback::Boxed);
+                FsWaiter::Embedded { owner, cb, on_fail }
+            }
+            other => other,
+        }
     }
 
     // ---- internals -----------------------------------------------------
@@ -353,7 +417,8 @@ impl FsCore {
     }
 
     /// Take a completed op entry out: returns its waiter and payloads and frees the slot (generation bumped) - the
-    /// freed-before-fire rule.
+    /// freed-before-fire rule. A callback in the slot's room stays there until [`deliver_embedded`] moves it out to
+    /// run, and the room takes no other callback before then.
     fn take_op(&mut self, tag: u8, op_slot: u32, gen32: u32) -> Option<Completed> {
         let entry = self.ops.get(op_slot as usize)?;
         if entry.generation as u32 != gen32 {
@@ -478,6 +543,16 @@ impl FsCore {
                 if marked && let Some(sink) = &on_fail {
                     (sink.fill)(err, Vec::new());
                 }
+                // The refusal waits in the queue while later ops take slots and the staging room, so a callback kept in
+                // a room is boxed. `fail_op` boxes a parked one before its slot goes back.
+                let cb = match cb {
+                    Callback::Boxed(cb) => cb,
+                    Callback::Staged => match self.cbs.unstage() {
+                        Some(cb) => cb,
+                        None => return,
+                    },
+                    Callback::Parked => return,
+                };
                 if self.refusals.is_empty() {
                     eng.shared.wake.poke();
                 }
@@ -525,9 +600,15 @@ impl FsCore {
     /// Fail a just-reserved op entry before its SQE reached the kernel, freeing it and answering through
     /// [`FsCore::refuse`] with the buffers handed back. An entry with no waiter, an `Allow` guard, frees silently.
     pub(super) fn fail_op(&mut self, eng: &mut Engine, op_slot: u32, err: Errno) {
+        // The refusal waits in the queue while the next op takes this slot and parks its callback in the slot's room,
+        // so a callback kept there is boxed first.
+        let waiter = self.ops[op_slot as usize]
+            .state
+            .waiter
+            .take()
+            .map(|w| self.unpark(op_slot, w));
         let entry = &mut self.ops[op_slot as usize];
         let e = &mut entry.state;
-        let waiter = e.waiter.take();
         let bufs = with_value(std::mem::take(&mut e.bufs), e.value.take());
         // Taken out before `clear`, as the buffers are, since the caller surrendered its `File` to this submission and
         // a marked errno advises a retry that needs it.

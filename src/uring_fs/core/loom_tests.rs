@@ -47,7 +47,7 @@ fn loom_offload_wakeup_loses_nothing() {
             "a completion was left on the queue"
         );
         assert!(
-            fs.take_pool_completions().is_empty(),
+            fs.pool_completions_for_test().is_empty(),
             "an unregistered token produced a delivery"
         );
     });
@@ -73,13 +73,13 @@ fn loom_offload_delivers_each_completion_once() {
         let mut delivered = 0usize;
         while delivered == 0 {
             wake.drain();
-            delivered += fs.take_pool_completions().len();
+            delivered += fs.pool_completions_for_test().len();
         }
         worker.join().expect("worker");
 
         assert_eq!(delivered, 1, "the completion was delivered {delivered} times");
         assert!(
-            fs.take_pool_completions().is_empty(),
+            fs.pool_completions_for_test().is_empty(),
             "the continuation fired twice for one completion"
         );
     });
@@ -126,7 +126,7 @@ fn loom_leased_offload_releases_after_the_job_read() {
         let mut released = Vec::new();
         while released.is_empty() {
             wake.drain();
-            let _ = fs.take_pool_completions();
+            let _ = fs.pool_completions_for_test();
             released = fs.take_pool_releases();
         }
         assert_eq!(released, [7], "the job's share frees its buffer");
