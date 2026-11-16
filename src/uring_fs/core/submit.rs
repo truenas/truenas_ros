@@ -573,16 +573,79 @@ impl FsCore {
             return;
         };
         let waiter = self.park(op_slot, waiter);
+        let e = &mut self.ops[op_slot as usize].state;
+        e.waiter = Some(waiter);
+        e.file = Some(file);
+        self.stage_fsync(eng, op_slot, TAG_FSYNC, pers, datasync, offset, length);
+    }
 
-        let raw_fd = file.as_raw_fd();
+    /// Stage an `FSYNC` of the whole file that waits its turn under the bound the host set ([`FsCore::set_fsync_bound`]),
+    /// or with no bound, one of [`FsCore::submit_fsync`]. It takes its slot as it is asked and parks its callback and
+    /// file there, and goes behind any that wait, for [`FsCore::start_waiting_fsyncs`] to stage once the bound has
+    /// room.
+    ///
+    /// **A swept owner's is refused with the sweep's unmarked `ECANCELED`**, as one that waits is ended when its owner
+    /// is swept ([`FsCore::cancel_owned_by`]), so no fsync of a closed connection that is not yet in the kernel reaches
+    /// it, whether it was asked before the close or after.
+    pub(crate) fn submit_fsync_bounded(&mut self, eng: &mut Engine, pers: u16, file: Arc<OwnedFd>, waiter: FsWaiter) {
+        if self.fsync_bound.is_none() {
+            self.submit_fsync(eng, pers, file, false, 0, 0, waiter);
+            return;
+        }
+        if let FsWaiter::Embedded { owner, .. } = &waiter
+            && self.owner_is_gone(*owner)
+        {
+            self.refuse(eng, waiter, Errno::ECANCELED, false, Vec::new(), Some(file));
+            return;
+        }
+        let Some(op_slot) = self.pop_op() else {
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), Some(file));
+            return;
+        };
+        let waiter = self.park(op_slot, waiter);
+        let e = &mut self.ops[op_slot as usize].state;
+        e.state = FsOpState::Waiting;
+        e.waiter = Some(waiter);
+        e.file = Some(file);
+        self.fsyncs_waiting.push_back((op_slot, pers));
+        self.start_waiting_fsyncs(eng);
+    }
+
+    /// Stage the bounded fsyncs that wait, oldest first, while the bound has room. It runs as one is asked and as one
+    /// in flight is reaped, before that one's callback runs, so the place it gives back goes to the one that waited
+    /// longest, and a callback that asks another puts it behind those waiting. One that fails to stage is refused, and
+    /// the next goes on.
+    pub(super) fn start_waiting_fsyncs(&mut self, eng: &mut Engine) {
+        let bound = self.fsync_bound.unwrap_or(u32::MAX);
+        while self.fsyncs_in_flight < bound
+            && let Some((op_slot, pers)) = self.fsyncs_waiting.pop_front()
+        {
+            if self.stage_fsync(eng, op_slot, TAG_FSYNC_BOUNDED, pers, false, 0, 0) {
+                self.fsyncs_in_flight += 1;
+            }
+        }
+    }
+
+    /// Stage the `FSYNC` of the op in `op_slot` under `tag`, its waiter and file already in the slot, answering whether
+    /// it staged. One that did not is refused through [`FsCore::fail_op`].
+    #[allow(clippy::too_many_arguments)] // the fields of the SQE, unpacked
+    fn stage_fsync(
+        &mut self,
+        eng: &mut Engine,
+        op_slot: u32,
+        tag: u8,
+        pers: u16,
+        datasync: bool,
+        offset: u64,
+        length: u32,
+    ) -> bool {
         let entry = &mut self.ops[op_slot as usize];
         let gen32 = entry.generation as u32;
         let e = &mut entry.state;
-        e.state = FsOpState::InFlight { tag: TAG_FSYNC };
-        e.waiter = Some(waiter);
-        e.file = Some(file);
+        let raw_fd = e.file.as_ref().map_or(-1, |f| f.as_raw_fd());
+        e.state = FsOpState::InFlight { tag };
 
-        let ud = pack_raw(TAG_FSYNC, op_slot, gen32);
+        let ud = pack_raw(tag, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = IORING_OP_FSYNC;
             sqe.fd = raw_fd;
@@ -597,7 +660,9 @@ impl FsCore {
         });
         if let Err(err) = staged {
             self.fail_op(eng, op_slot, err);
+            return false;
         }
+        true
     }
 
     /// Stage a standalone relative timer, one `IORING_OP_TIMEOUT` that completes after `after`. Expiry is the op's
@@ -607,8 +672,9 @@ impl FsCore {
     /// Answers the armed timer's slot and full-width generation, for [`FsConn::cancel_timeout`]'s [`Timer`], or `None`
     /// when the arm was refused and the waiter has been answered.
     ///
-    /// **A swept owner may not park time on the table.** Other post-sweep submissions are allowed, but a timer is a
-    /// wait, not progress, and a re-arming tick whose connection died would strand a slot per arm. The refusal is the
+    /// **A swept owner may not park time on the table.** Other post-sweep submissions are allowed, a bounded fsync's
+    /// aside ([`FsCore::submit_fsync_bounded`]), but a timer is a wait, not progress, and a re-arming tick whose
+    /// connection died would strand a slot per arm. The refusal is the
     /// sweep's own unmarked `ECANCELED`, so a continuation winds down the same way in both orderings, and it arrives
     /// through the callback, since [`FsCore::refuse`] fills a sink only for a marked refusal.
     pub(crate) fn submit_timeout(

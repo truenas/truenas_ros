@@ -557,6 +557,34 @@ A streamed window is written to a file straight out of its recv buffer.
   `a_callback_refused_after_it_took_its_slot_waits_in_a_box` and
   `http_a_freed_op_slot_reaches_the_parked_body_first`.
 
+### Bounded fsyncs
+
+- **A ring keeps at most `max_fsyncs_in_flight` of the fsyncs asked through
+  `FsConn::fsync_bounded` in flight, and the rest wait on the ring in the
+  order they were asked.** Every fsync of a ZFS dataset waits for the one
+  writer of its intent log (`zil_commit_writer`), each on an io-wq worker,
+  so past a few they contend for its lock rather than sync sooner. One that
+  waits holds its slot, callback and file with nothing staged
+  (`FsOpState::Waiting`). The place one in flight gives back goes to the one
+  that waited longest as it is reaped, before its callback runs, and a new
+  one always goes behind those waiting, so a callback that asks another
+  cannot pass them. The count falls at the fsync's own completion alone,
+  never at the cancel that reaches it, and `FsConn::fsync` never counts.
+  Pinned by `a_bounded_fsync_past_the_bound_waits_for_the_one_in_flight`,
+  `bounded_fsyncs_go_on_in_the_order_they_came_across_owners`,
+  `a_callbacks_bounded_fsync_goes_in_behind_those_waiting`,
+  `a_bounded_fsync_in_flight_that_is_cancelled_or_fails_lets_the_next_go`
+  and `a_bounded_fsync_that_fails_to_stage_at_its_turn_is_refused`.
+- **No fsync of a closed connection that is not yet in the kernel reaches
+  it.** The sweep ends one that waits with its unmarked `ECANCELED`
+  (`end_swept_fsyncs`), and one asked after the sweep is refused the same
+  way, as a timer is. The teardown drops those still waiting unrun with
+  their files, as the drain drops an op in flight (`drop_waiting_fsyncs` in
+  `drain_stop_window`), since its reap reaches none of them. Pinned by
+  `a_bounded_fsync_waiting_for_a_closed_connection_ends_cancelled`,
+  `a_bounded_fsync_asked_after_its_connection_is_swept_is_refused` and
+  `a_teardown_drops_the_bounded_fsyncs_still_waiting_unrun`.
+
 ### Where a poisoned lock fails closed
 
 - **`SingleFlight::get_or_try_init` fails closed on a poisoned map because

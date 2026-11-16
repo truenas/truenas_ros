@@ -91,7 +91,8 @@ impl<'a> FsConn<'a> {
     /// A continuation may run after its owner is gone, and failing ops are the signal a task winds down on. An offload
     /// is never cancelled and a timer armed after the sweep expires normally, so a task built from either would run for
     /// a dead connection, holding a graceful drain open, unless it reads this. Submitting is still allowed, since a
-    /// handler finishing work it already accepted is not undone by the peer hanging up.
+    /// handler finishing work it already accepted is not undone by the peer hanging up, but for
+    /// [`fsync_bounded`](Self::fsync_bounded) under a bound, which answers the sweep's `ECANCELED`.
     ///
     /// Always `false` where the reactor has no owners (a standalone [`UringFs`](super::super::UringFs)).
     pub fn owner_is_gone(&self) -> bool {
@@ -652,6 +653,22 @@ impl<'a> FsConn<'a> {
     {
         let w = self.waiter(on_done);
         self.fs.submit_fsync(self.eng, who.0, f.fd, false, 0, 0, w);
+    }
+
+    /// Flush `f`'s data and metadata (`fsync`) as `who`, waiting its turn under the bound of the host, a server's
+    /// `ServerConfig::max_fsyncs_in_flight`. Past the bound it waits on the ring, behind any asked before it, and goes
+    /// on as one in flight ends, however that one ends. With no bound set it is [`fsync`](Self::fsync), which never
+    /// counts against one.
+    ///
+    /// Under a bound, one asked for a connection the server has torn down, or waiting when it is torn down, never
+    /// reaches the kernel and answers the unmarked `ECANCELED` of the teardown. A full op table refuses it as it refuses
+    /// any op, with the marked `EBUSY` ([`FsDone::was_refused`]).
+    pub fn fsync_bounded<F>(&mut self, who: Personality, f: File, on_done: F)
+    where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let w = self.waiter(on_done);
+        self.fs.submit_fsync_bounded(self.eng, who.0, f.fd, w);
     }
 
     /// Flush `f`'s data and essential metadata (`fdatasync`) as `who`.

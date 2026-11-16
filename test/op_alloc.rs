@@ -102,7 +102,7 @@ fn recv_framed(s: &mut TcpStream) -> io::Result<Vec<u8>> {
 
 /// The ops counted, in the order a pass reports them, with how many allocations each may make at its submit. A statx
 /// makes the box of its result, and a write on the write lane the boxes of its job and continuation.
-const OPS: [(&str, usize); 13] = [
+const OPS: [(&str, usize); 15] = [
     ("a reopen through /proc", 0),
     ("an open of a name", 0),
     ("an open of ..", 0),
@@ -116,6 +116,8 @@ const OPS: [(&str, usize); 13] = [
     ("a write of a window of the request", 0),
     ("an owned write on the write lane", 2),
     ("a write of a window on the write lane", 2),
+    ("a bounded fsync", 0),
+    ("a bounded fsync that waits behind it", 0),
 ];
 
 /// How many allocations the turns that deliver a pass may make, the `Arc` of the new descriptor of each of its opens.
@@ -181,9 +183,9 @@ const XATTR: &CStr = c"user.alloc";
 
 /// A reopen, an open of a name, an open of `..`, a statx of a name, an `fstatx`, a read of an xattr through `/proc`, an
 /// `fsetxattr`, a read into spare room with a buffer the handler keeps, an owned write from storage of the ring's body
-/// pool, a leased write of the request from its receive buffer and a write of a window of it allocate nothing on a warm
-/// ring but each statx the box of its result. An owned write and a write of a window on the write lane allocate the
-/// boxes of their job and continuation. The turns that deliver them and hand the request's buffer back allocate the
+/// pool, a leased write of the request from its receive buffer, a write of a window of it, a bounded fsync and one that
+/// waits behind it allocate nothing on a warm ring but each statx the box of its result. An owned write and a write of
+/// a window on the write lane allocate the boxes of their job and continuation. The turns that deliver them and hand the request's buffer back allocate the
 /// `Arc` of each new descriptor and nothing else. An xattr op, the read and the write give their buffer back through
 /// `FsDone::into_value` with no outer `Vec`, and the write's storage goes back to the pool and is the storage the next
 /// pass claims.
@@ -307,7 +309,14 @@ fn a_warm_rings_ops_allocate_only_what_they_answer() {
         let n = counted(|| fs.offload_write_owned(f.clone(), storage, 0..4096, 16384, empty, cb));
         pass.counts.borrow_mut().push(n);
         let cb = done(&pass);
-        let n = counted(|| fs.offload_write_window(f, on_lane, 20480, empty, cb));
+        let n = counted(|| fs.offload_write_window(f.clone(), on_lane, 20480, empty, cb));
+        pass.counts.borrow_mut().push(n);
+        // The server lets one bounded fsync be in flight, so the second waits for the first.
+        let cb = done(&pass);
+        let n = counted(|| fs.fsync_bounded(who, f.clone(), cb));
+        pass.counts.borrow_mut().push(n);
+        let cb = done(&pass);
+        let n = counted(|| fs.fsync_bounded(who, f, cb));
         pass.counts.borrow_mut().push(n);
         pass.delivered_from.set(ALLOCS.with(Cell::get));
         Response::Defer(permit)
@@ -320,6 +329,7 @@ fn a_warm_rings_ops_allocate_only_what_they_answer() {
     let cfg = ServerConfig {
         pool_size: 4,
         fs_ops: 16,
+        max_fsyncs_in_flight: Some(1),
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
