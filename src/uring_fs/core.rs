@@ -136,6 +136,9 @@ pub(crate) const TAG_FILE_LEASE: u8 = 0x96;
 /// `WRITE` of a range of one buffer ([`FsConn::pwritev2_owned`]). The buffer rides in the slot's `value`, as a read
 /// into spare room's does, and comes back whole whatever the kernel answers.
 pub(crate) const TAG_WRITE_OWNED: u8 = 0x97;
+/// `FSYNC` asked through [`FsConn::fsync_bounded`], which counts against the bound the host set
+/// ([`FsCore::set_fsync_bound`]) from its staging to its own completion.
+pub(crate) const TAG_FSYNC_BOUNDED: u8 = 0x98;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
@@ -606,7 +609,12 @@ impl std::fmt::Debug for LeasedWindow {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FsOpState {
     Free,
-    InFlight { tag: u8 },
+    InFlight {
+        tag: u8,
+    },
+    /// A bounded fsync past the bound, holding its slot, callback and file with nothing staged, until one in flight
+    /// ends and its turn comes (`FsCore::fsyncs_waiting`).
+    Waiting,
 }
 
 impl FsOpEntry {
@@ -915,6 +923,11 @@ pub(crate) struct FsCore {
     /// Wall-clock holds per owner ([`WallClock`]) and the per-owner cap the host set ([`FsCore::set_timer_cap`]).
     armed_timers: HashMap<(u32, u64), WallClock>,
     timer_cap: Option<u32>,
+    /// How many bounded fsyncs may be in flight at once ([`FsCore::set_fsync_bound`]), or `None` for no bound, how many
+    /// are, and the slot and personality of each past the bound, in the order they were asked.
+    fsync_bound: Option<u32>,
+    fsyncs_in_flight: u32,
+    fsyncs_waiting: VecDeque<(u32, u16)>,
     /// Which of this core's reads and writes carry `IOSQE_ASYNC`, as the host set it ([`FsCore::set_force_async`]).
     /// Only `READ` and `WRITE` are read here, as the socket classes belong to the net reactor.
     force_async: ForceAsync,
@@ -985,6 +998,9 @@ impl FsCore {
             closed_owners: HashMap::new(),
             armed_timers: HashMap::new(),
             timer_cap: None,
+            fsync_bound: None,
+            fsyncs_in_flight: 0,
+            fsyncs_waiting: VecDeque::new(),
             force_async: ForceAsync::empty(),
             refusals: VecDeque::new(),
             file_leases: FileLeases::default(),
@@ -1003,6 +1019,20 @@ impl FsCore {
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn set_timer_cap(&mut self, per_owner: u32) {
         self.timer_cap = Some(per_owner);
+    }
+
+    /// Bound the fsyncs asked through [`FsConn::fsync_bounded`] in flight at once, `None` for no bound, which leaves
+    /// each as [`FsConn::fsync`] is. Unset for the standalone host. Setup-time only, on [`FsCore::set_timer_cap`]'s
+    /// rule.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn set_fsync_bound(&mut self, bound: Option<u32>) {
+        self.fsync_bound = bound;
+    }
+
+    /// The bound on bounded fsyncs, for a test of where it came from.
+    #[cfg(all(test, not(loom), feature = "net-server"))]
+    pub(crate) fn fsync_bound(&self) -> Option<u32> {
+        self.fsync_bound
     }
 
     /// Stamp `IOSQE_ASYNC` on this core's `READV`/`WRITEV` submissions (see the field). Setup-time only, on

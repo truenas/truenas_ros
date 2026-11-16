@@ -67,6 +67,7 @@ fn snapshot(c: &FsCore) -> (Vec<u32>, Vec<(u64, u8)>) {
             let code = match e.state.state {
                 FsOpState::Free => 0u8,
                 FsOpState::InFlight { tag } => tag,
+                FsOpState::Waiting => 1,
             };
             (e.generation, code)
         })
