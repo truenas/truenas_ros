@@ -279,6 +279,68 @@ where
                 }
                 continue;
             }
+            // A push in parts takes the same checks. Each part queues as a segment of its own, back to back, so the
+            // PDU stays whole on the wire. A dropped push drops its parts, which hands lent bytes back.
+            if let Injected::PushParts {
+                slot,
+                generation,
+                mut parts,
+                finish,
+            } = msg
+            {
+                if self.core.draining {
+                    continue; // shutting down
+                }
+                // The producer's own step runs now, in the push's turn, so the push keeps its place in the order.
+                if let Some(finish) = finish {
+                    let Some((_, serving)) = self.core.table.push_conn_mut(slot, generation) else {
+                        continue; // connection gone (or slot recycled)
+                    };
+                    if !finish(&mut parts) {
+                        drop(parts);
+                        if serving {
+                            self.core
+                                .close_conn(slot, generation as u32, CloseReason::WorkerClosed)?;
+                        } else if let Some((conn, _)) = self.core.table.push_conn_mut(slot, generation) {
+                            // Can't tear down under the worker; evict at resume instead.
+                            conn.evict_on_resume = true;
+                        }
+                        continue;
+                    }
+                }
+                if parts.iter().all(|p| p.as_slice().is_empty()) {
+                    continue;
+                }
+                let total: usize = parts.iter().map(|p| p.as_slice().len()).sum();
+                let (overflow, serving) = {
+                    let Some((conn, serving)) = self.core.table.push_conn_mut(slot, generation) else {
+                        continue; // connection gone (or slot recycled)
+                    };
+                    if conn.close_on_flush.is_some() {
+                        continue;
+                    }
+                    if conn.queued_bytes() + total > self.core.cfg.max_send_backlog {
+                        if !serving {
+                            conn.evict_on_resume = true;
+                        }
+                        (true, serving)
+                    } else {
+                        for part in parts {
+                            if !part.as_slice().is_empty() {
+                                conn.enqueue_push_buf(part.into());
+                            }
+                        }
+                        (false, serving)
+                    }
+                };
+                if overflow && serving {
+                    self.core
+                        .close_conn(slot, generation as u32, CloseReason::SendBacklog)?;
+                } else if !overflow && serving {
+                    self.core.kick_send(slot, generation as u32)?;
+                }
+                continue;
+            }
             // A cross-thread close (`PushHandle::close`) reaches any live state, like a push. A serving connection
             // flushes and closes, and one parked under a detach worker is only marked, the close landing at resume.
             // Processed while draining too, since it can only speed the drain.
@@ -346,6 +408,7 @@ where
                 | Injected::Close(t)
                 | Injected::Redeliver(t) => *t,
                 Injected::Push { .. }
+                | Injected::PushParts { .. }
                 | Injected::PushClose { .. }
                 | Injected::DetachResume { .. }
                 | Injected::DetachClose { .. }
@@ -430,6 +493,7 @@ where
                     self.pump(token.slot, token.generation as u32)?;
                 }
                 Injected::Push { .. }
+                | Injected::PushParts { .. }
                 | Injected::PushClose { .. }
                 | Injected::DetachResume { .. }
                 | Injected::DetachClose { .. }

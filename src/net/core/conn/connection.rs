@@ -576,6 +576,12 @@ impl<U> Connection<U> {
         self.enqueue(bytes, SendKind::Push);
     }
 
+    /// Queue one part of a pushed PDU, such as lent bytes, behind everything already queued.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn enqueue_push_buf(&mut self, bytes: SendBuf) {
+        self.enqueue(bytes, SendKind::Push);
+    }
+
     pub(super) fn enqueue(&mut self, bytes: impl Into<SendBuf>, kind: SendKind) {
         #[cfg_attr(not(feature = "net-server"), allow(unused_mut))]
         let mut bytes = bytes.into();

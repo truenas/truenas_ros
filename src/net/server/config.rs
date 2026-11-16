@@ -339,9 +339,10 @@ impl ServerConfig {
     /// Construction-time validation of the knobs and the listener list -- [`Server::with_config`] fails with a
     /// validation error on the first violated bound, before any socket or ring is created.
     pub(super) fn validate(&self, addrs: &[Listen]) -> crate::Result<()> {
-        if addrs.is_empty() || addrs.len() > MAX_LISTENERS {
+        // No listener is valid: such a server serves only the sockets it adopts (`Server::adopt`).
+        if addrs.len() > MAX_LISTENERS {
             return Err(Error::Validation(format!(
-                "listener count must be in 1..={MAX_LISTENERS}"
+                "listener count must be in 0..={MAX_LISTENERS}"
             )));
         }
         if let Some(bad) = addrs

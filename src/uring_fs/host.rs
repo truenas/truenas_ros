@@ -196,6 +196,12 @@ impl UringFs {
         Ok(Personality(id))
     }
 
+    /// A `Clone + Send + Sync` handle that registers a calling thread's credentials on this reactor's ring, from any
+    /// thread, while [`UringFs::run`] holds the reactor (see [`SelfRegistrar`](crate::uring_fs::SelfRegistrar)).
+    pub fn self_registrar(&self) -> crate::uring_fs::SelfRegistrar {
+        self.eng.ring.self_registrar()
+    }
+
     /// Declare which extended attributes are written under this reactor's ambient credentials rather than the
     /// requesting [`Personality`] - see [`PrivilegedXattrs`] for the rules and the reasoning.
     ///
@@ -854,6 +860,123 @@ mod tests {
 
                 h.close(f).unwrap();
                 stop_c.shutdown();
+            });
+            afs.run().unwrap();
+        });
+    }
+
+    /// A small reactor for the registrar tests, or `None` where io_uring is unavailable.
+    fn small_fs() -> Option<UringFs> {
+        let cfg = FsConfig {
+            entries: 128,
+            ops: 128,
+            ..FsConfig::default()
+        };
+        match UringFs::new(cfg) {
+            Ok(a) => Some(a),
+            Err(crate::Error::Errno(e)) if skip_unavailable(e) => None,
+            Err(e) => panic!("UringFs::new: {e}"),
+        }
+    }
+
+    /// A [`SelfRegistrar`](crate::uring_fs::SelfRegistrar) registers and unregisters from a thread that does not own
+    /// the ring, and fails `EBADF` once the ring is gone instead of reaching a descriptor that may name another file.
+    #[test]
+    fn a_registrar_works_from_another_thread_until_the_ring_drops() {
+        let Some(afs) = small_fs() else { return };
+        let reg = afs.self_registrar();
+        let owner = afs.register_self().unwrap();
+
+        let reg_c = reg.clone();
+        let other = std::thread::spawn(move || {
+            let who = reg_c.register_self().unwrap();
+            reg_c.unregister(who).unwrap();
+            // The id is gone, so a second unregister names nothing.
+            assert!(matches!(reg_c.unregister(who), Err(crate::Error::Errno(Errno::EINVAL))));
+            who
+        })
+        .join()
+        .unwrap();
+        assert_ne!(other.id(), 0);
+        assert_ne!(other, owner, "one ring gives each registration its own id");
+
+        // The gate, not the kernel: a call on the old number could reach a ring that took it since.
+        assert!(!reg.ring_gone());
+        drop(afs);
+        assert!(reg.ring_gone(), "the ring closes its gate before its descriptor");
+        assert!(matches!(reg.register_self(), Err(crate::Error::Errno(Errno::EBADF))));
+        assert!(matches!(reg.unregister(owner), Err(crate::Error::Errno(Errno::EBADF))));
+    }
+
+    /// The registrar snapshots the credentials of the **calling thread**. A thread that made itself an unprivileged
+    /// user with the raw syscalls, which change that thread alone, registers that user. The kernel then refuses a
+    /// root-only file to an op under that id, and opens it for an op under the owner's id, although the thread is
+    /// root again by then. Root only.
+    #[test]
+    fn a_registrar_snapshots_the_calling_threads_identity() {
+        // SAFETY: geteuid reads no memory.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_ROOT").is_none(),
+                "TRUENAS_ROS_REQUIRE_ROOT is set but this process is not root"
+            );
+            return;
+        }
+        const NOBODY: libc::c_long = 65534;
+        const KEEP: libc::c_long = -1;
+
+        let dir = crate::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret"), b"data").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Any user may search the directory, and only root may read the file.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(dir.path().join("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let Some(mut afs) = small_fs() else { return };
+        let root = afs.register_self().unwrap();
+        let reg = afs.self_registrar();
+        let h = afs.handle();
+        let stop = afs.shutdown_handle();
+        let dir_path = dir.path().to_path_buf();
+        std::thread::scope(|s| {
+            let stop_c = stop.clone();
+            s.spawn(move || {
+                // Shut the loop down on every way out, a failed assert included.
+                struct Stop(ShutdownHandle);
+                impl Drop for Stop {
+                    fn drop(&mut self) {
+                        self.0.shutdown();
+                    }
+                }
+                let _stop = Stop(stop_c);
+
+                let anchor = Anchor::open(dir_path.as_path()).unwrap();
+                // SAFETY: the raw syscalls take plain integers and a NULL list of zero groups, and change the
+                // credentials of this thread alone. The real and saved ids stay root, so the thread can go back.
+                let user = unsafe {
+                    assert_eq!(
+                        libc::syscall(libc::SYS_setgroups, 0 as libc::size_t, std::ptr::null::<u32>()),
+                        0
+                    );
+                    assert_eq!(libc::syscall(libc::SYS_setresgid, KEEP, NOBODY, KEEP), 0);
+                    assert_eq!(libc::syscall(libc::SYS_setresuid, KEEP, NOBODY, KEEP), 0);
+                    let user = reg.register_self();
+                    assert_eq!(libc::syscall(libc::SYS_setresuid, KEEP, 0 as libc::c_long, KEEP), 0);
+                    assert_eq!(libc::syscall(libc::SYS_setresgid, KEEP, 0 as libc::c_long, KEEP), 0);
+                    user.unwrap()
+                };
+
+                let how = OpenHow::new().flags(OFlag::O_RDONLY);
+                assert!(
+                    matches!(
+                        h.open(user, &anchor, "secret", how),
+                        Err(crate::Error::Errno(Errno::EACCES))
+                    ),
+                    "the user's id must not open a root-only file"
+                );
+                let f = h.open(root, &anchor, "secret", how).unwrap();
+                h.close(f).unwrap();
             });
             afs.run().unwrap();
         });

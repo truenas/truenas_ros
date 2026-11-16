@@ -542,7 +542,7 @@ pub(crate) fn open_parts<P: ?Sized + TnPath>(
 
 // Lives in the engine (`uring::personality`): registration is engine-level (`register_personality` takes a bare ring
 // fd) and the net client stamps it on outbound connects, so the type cannot be fs-owned.
-pub use crate::uring::personality::Personality;
+pub use crate::uring::personality::{Personality, SelfRegistrar};
 
 tn_bitflags! {
     /// Per-operation flags for the `preadv2`/`pwritev2` forms ([`FsHandle::preadv2`], [`FsHandle::pwritev2`] and their

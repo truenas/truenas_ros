@@ -3,7 +3,9 @@
 //! across the consumer's handshake.
 
 use super::Server;
+use super::handles::PushHandle;
 use crate::errno::{self, Errno};
+use crate::error::Error;
 use crate::net::core::conn::{Connection, Op, pack};
 use crate::net::core::handles::{AcceptDeferral, HandshakeOutcome, stat};
 use crate::net::core::probe::fill_getsockopt_cmd;
@@ -14,7 +16,7 @@ use crate::net::server::protocol::{Incoming, Request, Response};
 use crate::sync::Arc;
 use crate::uring::sys::*;
 use std::mem::size_of;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::Ordering;
 
 // The admission path runs the accept handler and, once a connection is installed, enters the pump - so this block
@@ -86,6 +88,60 @@ where
             Ok(slot) => self.accept_connection(slot, lidx, false),
             Err(_) => Ok(()),
         }
+    }
+
+    /// Serve `sock`, a connected stream socket that was accepted or received somewhere else, with `state` as its
+    /// per-connection state. The accept handler does not run, since the caller has already admitted the connection.
+    /// The returned [`PushHandle`] sends on the connection before its first request arrives. The close hook reports
+    /// the connection's end, and the stats count it as accepted.
+    ///
+    /// This is for a process that takes connections over, like smbd, whose channels reach it by fd passing. Build a
+    /// server with no listeners on the thread that will run it, adopt, then call [`Server::serve_forever`].
+    ///
+    /// The ring takes its own reference to the socket, and `sock` closes on return. The socket keeps the options its
+    /// owner set, since the listener options of [`ServerConfig`](super::ServerConfig) reach only accepted sockets. It
+    /// turns non-blocking like an accepted one, for every descriptor of the open file.
+    ///
+    /// A server with listeners or in a spread refuses with [`Error::Validation`], since the kernel picks the slots of
+    /// its accepts and hand-offs and could pick the one this call takes. So does a server that is shutting down.
+    /// `ENFILE` means every slot holds a connection. `ENOTSOCK`, `EPROTOTYPE` and `ENOTCONN` refuse a descriptor that
+    /// is not a connected stream socket.
+    pub fn adopt(&mut self, sock: OwnedFd, state: U) -> crate::Result<PushHandle> {
+        if !self.listeners.is_empty() || self.core.spread.is_some() {
+            return Err(Error::Validation(
+                "adopt needs a server with no listeners, outside a spread".into(),
+            ));
+        }
+        if self.core.draining || self.core.stopping() {
+            return Err(Error::Validation("the server is shutting down".into()));
+        }
+        let fd = sock.as_raw_fd();
+        let peer = sock::adopted_peer(fd)?;
+        // SAFETY: F_GETFL and F_SETFL read and set the status flags of an open descriptor and touch no memory.
+        let flags = Errno::result(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
+        // SAFETY: as above.
+        Errno::result(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) })?;
+        let slot = self.core.table.first_empty().ok_or(Errno::ENFILE)?;
+        self.core.engine.ring.install_file(slot, fd)?;
+        drop(sock);
+        let generation = self.core.table.generation(slot);
+        if let Err(e) = self.install_conn(slot, peer, state, false) {
+            // Nothing was submitted for the slot yet, so clearing it here is the whole teardown.
+            let _ = self.core.engine.ring.install_file(slot, -1);
+            if self.core.table.free(slot) {
+                self.core
+                    .stats
+                    .active
+                    .store(u64::from(self.core.table.active()), Ordering::Relaxed);
+            }
+            return Err(e.into());
+        }
+        Ok(PushHandle::for_slot(
+            slot,
+            generation,
+            self.mailbox.inject_tx.clone(),
+            Arc::clone(&self.core.engine.shared),
+        ))
     }
 
     fn accept_connection(&mut self, slot: u32, lidx: u32, may_move: bool) -> errno::Result<()> {

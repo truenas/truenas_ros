@@ -7,6 +7,7 @@ use super::Server;
 use crate::net::core::handles::{StatsInner, Token};
 #[cfg(doc)]
 use crate::net::core::protocol::CloseReason;
+use crate::net::core::protocol::{Lent, SendBuf};
 #[cfg(doc)]
 use crate::net::server::protocol::Response;
 use crate::sync::Arc;
@@ -382,8 +383,40 @@ impl std::fmt::Debug for Deferred {
     }
 }
 
+/// The step that finishes the parts of a push on the loop thread ([`PushHandle::push_parts_finished`]). False closes
+/// the connection.
+pub type PushFinish = Box<dyn FnOnce(&mut Vec<PushPart>) -> bool + Send>;
+
+/// One part of a PDU queued with [`PushHandle::push_parts`]: bytes the push owns, or bytes the consumer lends.
+#[derive(Debug)]
+pub enum PushPart {
+    /// Bytes the push owns.
+    Owned(Vec<u8>),
+    /// Bytes the consumer lends until the [`Lent`]'s callback runs.
+    Lent(Lent),
+}
+
+impl PushPart {
+    /// The bytes of the part.
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            PushPart::Owned(bytes) => bytes,
+            PushPart::Lent(lent) => lent.as_slice(),
+        }
+    }
+}
+
+impl From<PushPart> for SendBuf {
+    fn from(part: PushPart) -> SendBuf {
+        match part {
+            PushPart::Owned(bytes) => bytes.into(),
+            PushPart::Lent(lent) => lent.into(),
+        }
+    }
+}
+
 /// A `Clone + Send + Sync` handle for pushing unsolicited PDUs to one connection, obtained from
-/// [`Responder::push_handle`].
+/// [`Responder::push_handle`] or [`Server::adopt`].
 ///
 /// A push is a complete, caller-framed PDU queued behind pending replies and sent one at a time, so it never
 /// interleaves with a reply. A push to a closed or recycled connection is dropped, one that would overflow
@@ -398,6 +431,16 @@ pub struct PushHandle {
 }
 
 impl PushHandle {
+    /// The handle of the connection in `slot` at `generation`, for a socket the server adopted.
+    pub(super) fn for_slot(slot: u32, generation: u64, tx: mpsc::Sender<Injected>, shared: Arc<LoopShared>) -> Self {
+        PushHandle {
+            slot,
+            generation,
+            tx,
+            shared,
+        }
+    }
+
     /// Queue `bytes` as an unsolicited PDU on this connection and wake the server loop. Empty `bytes` is a no-op.
     ///
     /// Pushes cross to the loop on an unbounded channel. `ServerConfig::max_send_backlog` bounds what is queued on a
@@ -412,6 +455,41 @@ impl PushHandle {
             slot: self.slot,
             generation: self.generation,
             bytes,
+        });
+        self.shared.wake.poke();
+    }
+
+    /// Queue `parts`, in order, as one unsolicited PDU on this connection and wake the server loop. A [`Lent`] part
+    /// goes out from its consumer's memory without a copy, and its `done` callback tells when the server is finished
+    /// with that memory. The parts of one call stay together on the wire. Empty parts are skipped, and a call with no
+    /// bytes at all is a no-op. A push that the server drops - its connection gone, the server draining, a send backlog
+    /// overflow - drops its parts, which runs their callbacks. The channel is unbounded, as for
+    /// [`push`](Self::push).
+    pub fn push_parts(&self, parts: Vec<PushPart>) {
+        if parts.iter().all(|p| p.as_slice().is_empty()) {
+            return;
+        }
+        let _ = self.tx.send(Injected::PushParts {
+            slot: self.slot,
+            generation: self.generation,
+            parts,
+            finish: None,
+        });
+        self.shared.wake.poke();
+    }
+
+    /// As [`push_parts`](Self::push_parts), with `finish`, which the loop runs on its thread when the push's turn comes,
+    /// before it checks the send backlog and queues the parts. So the push keeps its place among the pushes and
+    /// deferred replies of the connection, and the work of `finish` stays off the caller's thread, such as signing or
+    /// encrypting a PDU there. `finish` may change or replace the parts. Returning false closes the connection, with
+    /// [`CloseReason::WorkerClosed`], and drops the parts. A push that the server drops before its turn drops `finish`
+    /// unrun.
+    pub fn push_parts_finished(&self, parts: Vec<PushPart>, finish: PushFinish) {
+        let _ = self.tx.send(Injected::PushParts {
+            slot: self.slot,
+            generation: self.generation,
+            parts,
+            finish: Some(finish),
         });
         self.shared.wake.poke();
     }
@@ -587,6 +665,14 @@ pub(super) enum Injected {
     Redeliver(Token),
     /// An unsolicited push ([`PushHandle::push`]) - not tied to any request.
     Push { slot: u32, generation: u64, bytes: Vec<u8> },
+    /// An unsolicited push in parts, some of them lent ([`PushHandle::push_parts`]), with the step that finishes
+    /// them on the loop thread ([`PushHandle::push_parts_finished`]).
+    PushParts {
+        slot: u32,
+        generation: u64,
+        parts: Vec<PushPart>,
+        finish: Option<PushFinish>,
+    },
     /// Close the connection once everything already queued on it has flushed ([`PushHandle::close`]) - not tied to any
     /// request.
     PushClose { slot: u32, generation: u64 },
