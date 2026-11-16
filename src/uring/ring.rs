@@ -8,8 +8,10 @@
 //! pointers into the mmap. Under `--cfg loom` the same accessors run against owned `loom` atomics and `UnsafeCell`
 //! arrays, so `loom_tests` explores the user and kernel interleavings and flags any unsynchronized SQE or CQE access.
 
+use super::personality::{RingGate, SelfRegistrar};
 use super::sys::*;
 use crate::errno::{self, Errno};
+use crate::sync::Arc;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::ptr;
@@ -545,8 +547,10 @@ impl Ring {
 
         let rings = SqCqRings::new(&p, maps.sq_ring, maps.cq_ring, maps.sqes);
 
+        let gate = RingGate::new(fd.as_raw_fd());
         Ok(Ring {
             fd,
+            gate,
             sq_ring: maps.sq_ring,
             sq_ring_len: maps.sq_ring_len,
             cq_ring: maps.cq_ring,
@@ -565,6 +569,11 @@ impl Ring {
         self.fd.as_raw_fd()
     }
 
+    /// A handle that registers a calling thread's credentials on this ring from any thread, until the ring drops.
+    pub(crate) fn self_registrar(&self) -> SelfRegistrar {
+        SelfRegistrar::new(Arc::clone(&self.gate))
+    }
+
     /// Bound the io-wq workers for bounded work of this ring's tasks to `bounded`, 0 leaving it as it is, and give back
     /// the bounds held before ([`register_iowq_max_workers`]).
     #[cfg(feature = "net-server")]
@@ -578,9 +587,10 @@ impl Ring {
         register_file_alloc_range(self.raw_fd(), 0, count)
     }
 
-    /// Install a connected socket `fd` into the pool at `slot` (client-side; the server's pool fills via
-    /// multishot-accept auto-allocation). The kernel takes its own reference, so `fd` may be closed after this returns.
-    #[cfg(any(feature = "net-client", feature = "uring-fs"))]
+    /// Install a connected socket `fd` into the pool at `slot`: a client's connection, or a socket a server adopts. A
+    /// server's accepts fill the pool by multishot-accept auto-allocation instead. The kernel takes its own reference,
+    /// so `fd` may be closed after this returns.
+    #[cfg(any(feature = "net-client", feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn install_file(&self, slot: u32, fd: RawFd) -> errno::Result<()> {
         register_file_update(self.raw_fd(), slot, fd)
     }
@@ -790,6 +800,8 @@ impl Ring {
 /// Its raw pointers into the mmap'd rings make it `!Send` and `!Sync`, which keeps each ring on its own thread.
 pub(crate) struct Ring {
     fd: OwnedFd,
+    /// What a [`SelfRegistrar`] reaches `fd` through. `Drop` closes it first, so no handle outlives the descriptor.
+    gate: Arc<RingGate>,
 
     // mmap regions (for munmap on drop).
     sq_ring: *mut u8,
@@ -810,6 +822,8 @@ pub(crate) struct Ring {
 
 impl Drop for Ring {
     fn drop(&mut self) {
+        // Before `fd` closes: a registration in flight on another thread finishes first, and none starts after.
+        self.gate.close();
         // SAFETY: each pointer and length came from the maps `from_setup` took over, and `cq_ring_len` is 0 when the CQ
         // aliases the SQ region, so nothing is unmapped twice. The owner drains every in-flight op first.
         unsafe {

@@ -158,6 +158,40 @@ pub(crate) fn peer_from_fd(fd: RawFd) -> Option<ClientAddr> {
     parse_inet(&storage).map(ClientAddr::Inet)
 }
 
+/// The peer of a socket that a server adopts: its inet address, or an unnamed unix peer. The family comes from the
+/// socket itself, not from a listener, so a unix peer is really local. `ENOTSOCK` for a descriptor that is not a
+/// socket, `EPROTOTYPE` for one that is not a stream, and `ENOTCONN` for one that is not connected.
+///
+/// A unix peer carries no credentials. `ServerConfig::unix_peercred` fetches those on a listener's accepts, and a
+/// server that adopts has no listener, so the option cannot reach here.
+#[cfg(feature = "net-server")]
+pub(crate) fn adopted_peer(fd: RawFd) -> crate::errno::Result<ClientAddr> {
+    let mut kind: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: SO_TYPE writes one c_int into `kind`, and `len` gives its size.
+    Errno::result(unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut libc::c_int).cast::<c_void>(),
+            &mut len,
+        )
+    })?;
+    if kind != libc::SOCK_STREAM {
+        return Err(Errno::EPROTOTYPE);
+    }
+    // SAFETY: sockaddr_storage is plain data; zeroed is a valid initial value.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: getpeername writes at most `len` bytes into `storage` and updates `len`.
+    Errno::result(unsafe { libc::getpeername(fd, std::ptr::addr_of_mut!(storage).cast(), &mut len) })?;
+    if i32::from(storage.ss_family) == libc::AF_UNIX {
+        return Ok(ClientAddr::Unix { cred: None });
+    }
+    parse_inet(&storage).map(ClientAddr::Inet).ok_or(Errno::EAFNOSUPPORT)
+}
+
 /// `setsockopt` an integer-valued option.
 pub(crate) fn set_opt(fd: &OwnedFd, level: libc::c_int, opt: libc::c_int, val: libc::c_int) -> crate::Result<()> {
     // SAFETY: optval points to a valid c_int of the given length.

@@ -369,6 +369,9 @@ mod splice;
 #[path = "net_server/push.rs"]
 mod push;
 
+#[path = "net_server/adopt.rs"]
+mod adopt;
+
 #[path = "net_server/config.rs"]
 mod config;
 

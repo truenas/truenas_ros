@@ -125,6 +125,15 @@ impl<U> ConnTable<U> {
         self.slots.iter().any(|e| matches!(e.state, SlotState::Empty))
     }
 
+    /// The first `Empty` slot, for a socket a server adopts. Only a server with no listener adopts. Its slots hold only
+    /// connections, and a connection's slot turns `Empty` once its `CLOSE` reaps, since the teardown counts as one
+    /// of its ops. So the kernel's slot is free too.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn first_empty(&self) -> Option<u32> {
+        let slot = self.slots.iter().position(|e| matches!(e.state, SlotState::Empty))?;
+        u32::try_from(slot).ok()
+    }
+
     /// Whether `slot` holds nothing: free, or freed and awaiting reuse.
     #[cfg(feature = "net-server")]
     pub(crate) fn is_empty(&self, slot: u32) -> bool {

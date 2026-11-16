@@ -141,8 +141,11 @@ enum SendKind {
     /// A non-final segment of a vectored reply (e.g. the head): already part of a reply the final segment will retire,
     /// so it tallies nothing.
     ReplyPart,
-    /// An out-of-band pushed PDU.
+    /// The last (or only) segment of an out-of-band pushed PDU: tallies one push.
     Push,
+    /// A non-final segment of a pushed PDU sent in parts: already part of a push the final segment will tally, so it
+    /// tallies nothing.
+    PushPart,
 }
 
 /// A connection's hold on a pool buffer: which buffer, and where it lives.
@@ -875,9 +878,10 @@ pub(crate) struct Connection<U> {
     /// a connection that fell back to storage of its own holds some for good.
     #[cfg(feature = "net-server")]
     pub(crate) let_in: bool,
-    // A push overflowed `max_send_backlog` while the connection was detached (its worker owns the raw stream, so it
-    // cannot be torn down mid-detach): evict with `SendBacklog` when the worker resumes it.
-    pub evict_on_resume: bool,
+    // A push could not be queued while the connection was detached (its worker owns the raw stream, so it cannot be
+    // torn down mid-detach): evict with this reason when the worker resumes it. `SendBacklog` for an overflow, and
+    // `WorkerClosed` for a push whose step refused the PDU, as the serving side of each reports.
+    pub evict_on_resume: Option<CloseReason>,
     // A flush-close is pending. The connection's final PDU, if any, is queued, and it closes with this reason once the
     // send queue drains (`Response::ReplyClose`, `Deferred::reply_close`, `PushHandle::close`). While set the recv side
     // is retired, and later injected outcomes and pushes for this connection are dropped. On a detached connection it

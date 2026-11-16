@@ -20,6 +20,10 @@
 //! a completion and `EINTR` is retried, so a consumer stops it from its own signal thread with
 //! [`ShutdownHandle::shutdown`].
 //!
+//! A server with no listeners serves only the sockets it is handed. [`Server::adopt`] takes a connected stream socket
+//! that was accepted or received elsewhere, such as a channel passed between processes, and serves it like an
+//! accepted one. Adopt on the server's own thread, before [`Server::serve_forever`].
+//!
 //! A multishot accept writes every peer address into one shared buffer, so peer identity is fetched per connection
 //! (`SO_PEERNAME`, or `SO_PEERCRED` with `ServerConfig::unix_peercred`), and a failed fetch sheds the connection rather
 //! than deliver it with a wrong identity. A pool slot is taken at accept, before any authentication, and a connection
@@ -90,14 +94,15 @@ mod wake;
 pub use crate::net::core::bodypool::BodyRecycler;
 pub use crate::net::core::handles::AcceptDeferral;
 pub use crate::net::core::protocol::{
-    Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth, SendBuf, ServerAddr, length_prefix_header,
+    Body, ClientAddr, CloseReason, Endian, Framing, Lent, PeerCred, PrefixWidth, SendBuf, ServerAddr,
+    length_prefix_header,
 };
 pub use crate::uring::force_async::ForceAsync;
 pub use crate::uring::ring::RingFd;
 pub use config::{Listen, ServerConfig};
 pub use handles::{
-    ControlHandle, DeferPermit, Deferred, DetachPermit, Detached, PushHandle, Responder, ServerStats, ShutdownHandle,
-    StatsHandle,
+    ControlHandle, DeferPermit, Deferred, DetachPermit, Detached, PushFinish, PushHandle, PushPart, Responder,
+    ServerStats, ShutdownHandle, StatsHandle,
 };
 pub use protocol::{DetachContext, Incoming, Protocol, Request, Response, length_prefixed};
 pub use spread::{Spread, physical_cores};
@@ -845,6 +850,17 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     pub fn register_self(&self) -> crate::Result<crate::uring_fs::Personality> {
         let id = crate::uring::sys::register_personality(self.core.engine.ring.raw_fd())?;
         crate::uring_fs::Personality::from_raw(id).ok_or_else(|| crate::Error::from(errno::Errno::EINVAL))
+    }
+
+    /// A `Clone + Send + Sync` handle that registers a calling thread's credentials on this server's ring, from any
+    /// thread, while [`Server::serve_forever`] runs (see [`SelfRegistrar`](crate::uring_fs::SelfRegistrar)).
+    ///
+    /// [`Server::register_self`] needs `&self`, which the running loop holds. A process whose threads change their
+    /// own credentials takes this handle before serving. A thread that holds an identity then registers it, and the
+    /// requests of that identity run their fs ops under the id it gets. Requires the `uring-fs` feature.
+    #[cfg(feature = "uring-fs")]
+    pub fn self_registrar(&self) -> crate::uring_fs::SelfRegistrar {
+        self.core.engine.ring.self_registrar()
     }
 
     /// Declare which extended attributes this server's embedded fs reactor writes under its **own ambient credentials**

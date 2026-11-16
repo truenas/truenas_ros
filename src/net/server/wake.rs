@@ -262,7 +262,7 @@ where
                     if conn.queued_bytes() + bytes.len() > self.core.cfg.max_send_backlog {
                         if !serving {
                             // Can't tear down under the worker; evict with `SendBacklog` at resume instead.
-                            conn.evict_on_resume = true;
+                            conn.evict_on_resume = Some(CloseReason::SendBacklog);
                         }
                         (true, serving)
                     } else {
@@ -272,6 +272,76 @@ where
                 };
                 if overflow && serving {
                     // Slow consumer, evict rather than queue without bound.
+                    self.core
+                        .close_conn(slot, generation as u32, CloseReason::SendBacklog)?;
+                } else if !overflow && serving {
+                    self.core.kick_send(slot, generation as u32)?;
+                }
+                continue;
+            }
+            // A push in parts takes the same checks. Each part queues as a segment of its own, back to back, so the
+            // PDU stays whole on the wire. A dropped push drops its parts, which hands lent bytes back.
+            if let Injected::PushParts {
+                slot,
+                generation,
+                mut parts,
+                finish,
+            } = msg
+            {
+                if self.core.draining {
+                    continue; // shutting down
+                }
+                // The producer's own step runs now, in the push's turn, so the push keeps its place in the order.
+                if let Some(finish) = finish {
+                    let serving = {
+                        let Some((conn, serving)) = self.core.table.push_conn_mut(slot, generation) else {
+                            continue; // connection gone (or slot recycled)
+                        };
+                        if conn.teardown_owns_slot() {
+                            // The farewell is final, as for a push: drop this one with its step unrun.
+                            continue;
+                        }
+                        serving
+                    };
+                    if !finish(&mut parts) {
+                        drop(parts);
+                        if serving {
+                            self.core
+                                .close_conn(slot, generation as u32, CloseReason::WorkerClosed)?;
+                        } else if let Some((conn, _)) = self.core.table.push_conn_mut(slot, generation) {
+                            // Can't tear down under the worker; evict at resume instead.
+                            conn.evict_on_resume = Some(CloseReason::WorkerClosed);
+                        }
+                        continue;
+                    }
+                }
+                if parts.iter().all(|p| p.as_slice().is_empty()) {
+                    continue;
+                }
+                let total: usize = parts.iter().map(|p| p.as_slice().len()).sum();
+                let (overflow, serving) = {
+                    let Some((conn, serving)) = self.core.table.push_conn_mut(slot, generation) else {
+                        continue; // connection gone (or slot recycled)
+                    };
+                    if conn.close_on_flush.is_some() {
+                        continue;
+                    }
+                    if conn.queued_bytes() + total > self.core.cfg.max_send_backlog {
+                        if !serving {
+                            conn.evict_on_resume = Some(CloseReason::SendBacklog);
+                        }
+                        (true, serving)
+                    } else {
+                        let last = parts.iter().rposition(|p| !p.as_slice().is_empty());
+                        for (i, part) in parts.into_iter().enumerate() {
+                            if !part.as_slice().is_empty() {
+                                conn.enqueue_push_buf(part.into(), Some(i) == last);
+                            }
+                        }
+                        (false, serving)
+                    }
+                };
+                if overflow && serving {
                     self.core
                         .close_conn(slot, generation as u32, CloseReason::SendBacklog)?;
                 } else if !overflow && serving {
@@ -313,9 +383,8 @@ where
                             conn.has_pending_send(),
                         )
                     };
-                    if evict {
-                        self.core
-                            .close_conn(slot, generation as u32, CloseReason::SendBacklog)?;
+                    if let Some(reason) = evict {
+                        self.core.close_conn(slot, generation as u32, reason)?;
                         continue;
                     }
                     if flush {
@@ -346,6 +415,7 @@ where
                 | Injected::Close(t)
                 | Injected::Redeliver(t) => *t,
                 Injected::Push { .. }
+                | Injected::PushParts { .. }
                 | Injected::PushClose { .. }
                 | Injected::DetachResume { .. }
                 | Injected::DetachClose { .. }
@@ -430,6 +500,7 @@ where
                     self.pump(token.slot, token.generation as u32)?;
                 }
                 Injected::Push { .. }
+                | Injected::PushParts { .. }
                 | Injected::PushClose { .. }
                 | Injected::DetachResume { .. }
                 | Injected::DetachClose { .. }

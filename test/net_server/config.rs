@@ -19,8 +19,7 @@ fn server_config_bounds_are_rejected_at_construction() {
             Ok(_) => panic!("expected {needle:?} to be rejected"),
         };
 
-    // The listener list itself.
-    expect(Vec::new(), ServerConfig::default(), "listener count");
+    // The listener list itself. An empty one is valid, for a server that only adopts (test/net_server/adopt.rs).
     expect(
         (0..257).map(|_| Listen::from(tcp())).collect(),
         ServerConfig::default(),
