@@ -87,8 +87,7 @@ fn a_drained_open_owns_its_fd() {
 /// Control first. With a slot free the same submission parks the fd and it stays open, so the weak-ref instrument is
 /// shown reading alive before it is trusted to read closed.
 ///
-/// This drives the submit-time refusals. `fail_op`'s arm carries the same return and no test, since `push_sqe` flushes
-/// and retries on a full SQ, so a staging failure needs a kernel-side refusal this suite cannot provoke.
+/// This drives the submit-time refusals.
 #[test]
 fn a_refused_fd_op_hands_the_callers_file_back() {
     let Some(mut eng) = engine_or_skip() else {

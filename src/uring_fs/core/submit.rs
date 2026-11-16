@@ -41,6 +41,7 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), None);
             return;
         };
+        let waiter = self.park(op_slot, waiter);
 
         // The owner an `Allow` pair's wall-clock charge is metered to, read before the waiter parks on the entry.
         let timer_owner = match &waiter {
@@ -141,6 +142,7 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EBUSY, true, bufs, Some(file));
             return;
         };
+        let waiter = self.park(op_slot, waiter);
 
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
@@ -214,6 +216,7 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EBUSY, true, bufs, file);
             return;
         };
+        let waiter = self.park(op_slot, waiter);
 
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
@@ -273,6 +276,7 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EBUSY, true, bufs, file);
             return;
         };
+        let waiter = self.park(op_slot, waiter);
 
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
@@ -382,12 +386,14 @@ impl FsCore {
         });
         match staged {
             Ok(()) => {
-                entry.state.waiter = Some(waiter);
+                let waiter = self.park(op_slot, waiter);
+                self.ops[op_slot as usize].state.waiter = Some(waiter);
                 Ok(())
             }
             Err(_) => {
                 // Never in flight, so the clear drops every share the slot took, which returns each buffer as its last
-                // share goes.
+                // share goes. The waiter never reached the slot, so its callback is still staged for the caller's
+                // refusal to box.
                 entry.state.clear();
                 entry.generation += 1;
                 self.op_free.push(op_slot);
@@ -566,6 +572,7 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), Some(file));
             return;
         };
+        let waiter = self.park(op_slot, waiter);
 
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
@@ -618,6 +625,7 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), None);
             return None;
         };
+        let waiter = self.park(op_slot, waiter);
 
         // Saturating, as every Duration-to-timespec conversion in the crate is. `timespec64_valid` only refuses a bad
         // `tv_nsec` (`__io_timeout_prep`, `io_uring/timeout.c`), so a clamped `i64::MAX` is effectively forever.
@@ -806,6 +814,7 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), Some(file));
             return;
         };
+        let waiter = self.park(op_slot, waiter);
         let (how, guarded) = access.how();
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
@@ -909,6 +918,7 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EBUSY, true, vec![value], Some(file));
             return;
         };
+        let waiter = self.park(op_slot, waiter);
 
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
@@ -1022,6 +1032,7 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), None);
             return;
         };
+        let waiter = self.park(op_slot, waiter);
 
         let entry = &mut self.ops[op_slot as usize];
         let gen32 = entry.generation as u32;
@@ -1107,6 +1118,7 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), Some(file));
             return;
         };
+        let waiter = self.park(op_slot, waiter);
 
         let entry = &mut self.ops[op_slot as usize];
         let gen32 = entry.generation as u32;

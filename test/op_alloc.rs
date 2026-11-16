@@ -1,9 +1,11 @@
-//! Does an op a handler sends on a warm ring allocate more than its callback?
+//! Does an op a handler sends on a warm ring allocate anything it need not?
 //!
-//! Its own test binary, since it counts through a global allocator. It counts on the ring's thread alone, around each
-//! submit, so nothing else the process does reaches the count, and what the completion makes (the `Arc` of a new
-//! descriptor) is the op's answer, not its cost. The one allocation left is the box of the callback itself, and a
-//! statx's box for its result.
+//! Its own test binary, since it counts through a global allocator. It counts on the ring's thread alone, so nothing
+//! else the process does reaches the count, around each submit, and then across the turns that deliver the pass's ops
+//! and hand their buffers back, drains included. A callback is kept in its slot's room, so an op on the ring allocates
+//! nothing but a statx's box for its result, and a write on the write lane the boxes of its job and continuation, as
+//! the box of its result is made on the lane's thread. What a completion makes, the `Arc` of an open's new descriptor,
+//! is the op's answer, not its cost.
 //!
 //! The ops run twice on one connection, the first pass to warm the ring, and the second pass is counted.
 // Under `--cfg loom` the crate's `Arc` is loom's, which a std `Arc` is not, and the loom lane runs no ring.
@@ -24,7 +26,7 @@ use truenas_ros::net::server::{
     ServerConfig, ShutdownHandle, length_prefix_header,
 };
 use truenas_ros::sync_fs::{AtFlags, OFlag, OpenHow, StatxMask};
-use truenas_ros::uring_fs::{Anchor, File, FsDone, Leaf, Personality, ReopenAccess, RwFlags};
+use truenas_ros::uring_fs::{Anchor, File, FsConn, FsDone, Leaf, LeasedWindow, Personality, ReopenAccess, RwFlags};
 use truenas_ros::{Errno, Error};
 
 #[path = "support/xattr.rs"]
@@ -98,21 +100,26 @@ fn recv_framed(s: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// The ops counted, in the order a pass reports them, with the allocations each may make: its callback's box, and a
-/// statx's box for its result besides.
-const OPS: [(&str, usize); 11] = [
-    ("a reopen through /proc", 1),
-    ("an open of a name", 1),
-    ("an open of ..", 1),
-    ("a statx of a name", 2),
-    ("an fstatx", 2),
-    ("a read of an xattr through /proc", 1),
-    ("an fsetxattr", 1),
-    ("a read into spare room", 1),
-    ("an owned write", 1),
-    ("a leased write of the request", 1),
-    ("a write of a window of the request", 1),
+/// The ops counted, in the order a pass reports them, with how many allocations each may make at its submit. A statx
+/// makes the box of its result, and a write on the write lane the boxes of its job and continuation.
+const OPS: [(&str, usize); 13] = [
+    ("a reopen through /proc", 0),
+    ("an open of a name", 0),
+    ("an open of ..", 0),
+    ("a statx of a name", 1),
+    ("an fstatx", 1),
+    ("a read of an xattr through /proc", 0),
+    ("an fsetxattr", 0),
+    ("a read into spare room", 0),
+    ("an owned write", 0),
+    ("a leased write of the request", 0),
+    ("a write of a window of the request", 0),
+    ("an owned write on the write lane", 2),
+    ("a write of a window on the write lane", 2),
 ];
+
+/// How many allocations the turns that deliver a pass may make, the `Arc` of the new descriptor of each of its opens.
+const DELIVERY: usize = 3;
 
 /// What one pass gathers until its last op answers.
 struct Pass {
@@ -124,21 +131,44 @@ struct Pass {
     cycled: Cell<bool>,
     left: Cell<usize>,
     deferred: RefCell<Option<Deferred>>,
+    /// A share of the request's buffer the pass keeps until its last op answers, so the buffer goes home then, through
+    /// the queue of shares dropped off the reactor's own paths and the drain of the next turn.
+    kept: RefCell<Option<LeasedWindow>>,
+    /// The ring thread's count of allocations as the handler returned.
+    delivered_from: Cell<usize>,
+    /// Who submits the op that ends the pass, and on what file.
+    last: RefCell<Option<(Personality, File)>>,
 }
 
 impl Pass {
-    /// One op answered. The last one replies with the counts, then a byte for each op that gave its buffer back.
-    fn answered(&self) {
+    /// One op answered. The last one lets the kept share go and submits an `fsync`, whose answer comes in a later turn
+    /// than the drain that hands the buffer back, and ends the pass.
+    fn answered(self: &Rc<Self>, c: &mut FsConn<'_>) {
         self.left.set(self.left.get() - 1);
         if self.left.get() > 0 {
             return;
         }
+        drop(self.kept.borrow_mut().take());
+        let (who, file) = self
+            .last
+            .borrow_mut()
+            .take()
+            .expect("the pass's last op is submitted once");
+        let pass = Rc::clone(self);
+        c.fsync(who, file, move |_: FsDone, _: &mut FsConn<'_>| pass.reply());
+    }
+
+    /// Reply with the counts, then a byte for each op that gave its buffer back, then the count of the turns that
+    /// delivered the pass, taken before the reply allocates anything.
+    fn reply(&self) {
+        let delivered = ALLOCS.with(Cell::get) - self.delivered_from.get();
         let mut reply = Vec::new();
         for n in self.counts.borrow().iter() {
             reply.extend_from_slice(&(*n as u32).to_be_bytes());
         }
         reply.extend(self.same_value.borrow().iter().map(|&s| u8::from(s)));
         reply.push(u8::from(self.cycled.get()));
+        reply.extend_from_slice(&(delivered as u32).to_be_bytes());
         let mut framed = (reply.len() as u32).to_be_bytes().to_vec();
         framed.extend_from_slice(&reply);
         if let Some(deferred) = self.deferred.borrow_mut().take() {
@@ -152,11 +182,13 @@ const XATTR: &CStr = c"user.alloc";
 /// A reopen, an open of a name, an open of `..`, a statx of a name, an `fstatx`, a read of an xattr through `/proc`, an
 /// `fsetxattr`, a read into spare room with a buffer the handler keeps, an owned write from storage of the ring's body
 /// pool, a leased write of the request from its receive buffer and a write of a window of it allocate nothing on a warm
-/// ring but the box of their callback, and each statx the box of its result. An xattr op, the read and the write give
-/// their buffer back through `FsDone::into_value` with no outer `Vec`, and the write's storage goes back to the pool
-/// and is the storage the next pass claims.
+/// ring but each statx the box of its result. An owned write and a write of a window on the write lane allocate the
+/// boxes of their job and continuation. The turns that deliver them and hand the request's buffer back allocate the
+/// `Arc` of each new descriptor and nothing else. An xattr op, the read and the write give their buffer back through
+/// `FsDone::into_value` with no outer `Vec`, and the write's storage goes back to the pool and is the storage the next
+/// pass claims.
 #[test]
-fn a_warm_rings_ops_allocate_only_their_callback() {
+fn a_warm_rings_ops_allocate_only_what_they_answer() {
     let dir = truenas_ros::tempdir().unwrap();
     std::fs::write(dir.path().join("f"), b"bytes").unwrap();
     std::fs::create_dir(dir.path().join("d")).unwrap();
@@ -187,28 +219,31 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
             return Response::Close;
         };
         let who = *pc.get().expect("personality set before serving");
+        let file = File::from_shared(Arc::clone(&held));
         let pass = Rc::new(Pass {
             counts: RefCell::new(Vec::with_capacity(OPS.len())),
             same_value: RefCell::new(Vec::with_capacity(4)),
             cycled: Cell::new(false),
             left: Cell::new(OPS.len()),
             deferred: RefCell::new(Some(deferred)),
+            kept: RefCell::new(None),
+            delivered_from: Cell::new(0),
+            last: RefCell::new(Some((who, file.clone()))),
         });
-        let file = File::from_shared(Arc::clone(&held));
         let read = OpenHow::new().flags(OFlag::O_RDONLY);
         let leaf = Leaf::new("f").expect("a valid leaf");
 
         let done = |pass: &Rc<Pass>| {
             let pass = Rc::clone(pass);
-            move |_: FsDone, _: &mut truenas_ros::uring_fs::FsConn<'_>| pass.answered()
+            move |_: FsDone, c: &mut FsConn<'_>| pass.answered(c)
         };
         let gave_back = |pass: &Rc<Pass>, storage: *const u8| {
             let pass = Rc::clone(pass);
-            move |d: FsDone, _: &mut truenas_ros::uring_fs::FsConn<'_>| {
+            move |d: FsDone, c: &mut FsConn<'_>| {
                 let back = d.into_value();
                 let same = back.as_ptr() == storage;
                 pass.same_value.borrow_mut().push(same);
-                pass.answered();
+                pass.answered(c);
             }
         };
 
@@ -246,11 +281,11 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
         owned.resize(4096, b'w');
         pass.cycled.set(owned.as_ptr() == claimed.replace(owned.as_ptr()));
         let (storage, pass_back) = (owned.as_ptr(), Rc::clone(&pass));
-        let cb = move |d: FsDone, _: &mut truenas_ros::uring_fs::FsConn<'_>| {
+        let cb = move |d: FsDone, c: &mut FsConn<'_>| {
             let back = d.into_value();
             pass_back.same_value.borrow_mut().push(back.as_ptr() == storage);
             recycler.recycle(back);
-            pass_back.answered();
+            pass_back.answered(c);
         };
         let f = file.clone();
         let n = counted(|| fs.pwritev2_owned(who, file, owned, 0..4096, 4096, empty, cb));
@@ -259,12 +294,22 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
         // nothing to make.
         let request = &req.body[..];
         let held = fs.lease_window(request).expect("a pooled request");
+        let on_lane = fs.lease_window(request).expect("a pooled request");
+        *pass.kept.borrow_mut() = fs.lease_window(request);
         let cb = done(&pass);
         let n = counted(|| fs.pwritev2_from(who, f.clone(), request, 8192, empty, cb));
         pass.counts.borrow_mut().push(n);
         let cb = done(&pass);
-        let n = counted(|| fs.pwritev2_window(who, f, held, 12288, empty, cb));
+        let n = counted(|| fs.pwritev2_window(who, f.clone(), held, 12288, empty, cb));
         pass.counts.borrow_mut().push(n);
+        let storage = vec![b'l'; 4096];
+        let cb = done(&pass);
+        let n = counted(|| fs.offload_write_owned(f.clone(), storage, 0..4096, 16384, empty, cb));
+        pass.counts.borrow_mut().push(n);
+        let cb = done(&pass);
+        let n = counted(|| fs.offload_write_window(f, on_lane, 20480, empty, cb));
+        pass.counts.borrow_mut().push(n);
+        pass.delivered_from.set(ALLOCS.with(Cell::get));
         Response::Defer(permit)
     };
     let protocol = Protocol {
@@ -303,7 +348,7 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
     });
     server.serve_forever().expect("serve_forever");
     let reply = client.join().unwrap().expect("client io");
-    assert_eq!(reply.len(), OPS.len() * 4 + 5, "{reply:?}");
+    assert_eq!(reply.len(), OPS.len() * 4 + 9, "{reply:?}");
     for (i, (what, most)) in OPS.iter().enumerate() {
         let at = i * 4;
         let n = u32::from_be_bytes(reply[at..at + 4].try_into().unwrap());
@@ -315,5 +360,10 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
         reply[OPS.len() * 4 + 4],
         1,
         "the pass wrote from the storage the warm pass gave back"
+    );
+    let delivered = u32::from_be_bytes(reply[OPS.len() * 4 + 5..].try_into().unwrap());
+    assert_eq!(
+        delivered as usize, DELIVERY,
+        "the turns that delivered the pass allocated {delivered} times"
     );
 }

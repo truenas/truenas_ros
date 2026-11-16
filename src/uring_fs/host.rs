@@ -171,7 +171,8 @@ impl UringFs {
         }
         let (inject_tx, inject_rx) = mpsc::channel();
         Ok(UringFs {
-            fs: FsCore::new(cfg.ops, cfg.offload),
+            // Its handles' ops answer through channels, so the table keeps no rooms for callbacks.
+            fs: FsCore::with_rooms(cfg.ops, cfg.offload, 0),
             inject_tx,
             inject_rx,
             eng,

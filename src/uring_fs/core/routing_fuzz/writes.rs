@@ -284,7 +284,7 @@ fn a_hold_of_another_core_goes_home() {
     let (sink, hold) = (fs.completion_sink(), std::sync::Arc::new(LeaseHold::new(8, theirs)));
     let token = fs.register_leased_offload(None, Box::new(|_any, _conn| {}), hold);
     finish_offload(&sink, &wake, token, Box::new(()));
-    assert_eq!(fs.take_pool_completions().len(), 1, "the job is taken");
+    assert_eq!(fs.pool_completions_for_test().len(), 1, "the job is taken");
     assert!(fs.take_pool_releases().is_empty(), "no id of theirs here");
     assert_eq!(other.take_pool_releases(), [8], "the job's goes home");
 }
@@ -322,7 +322,7 @@ fn the_last_shared_lease_releases_the_buffer() {
             // No facade here, so no sink to arm from; every shipping submission goes through `FsConn::waiter`.
             FsWaiter::Embedded {
                 owner: Some((0, 0)),
-                cb: Box::new(|_d, _fs| {}),
+                cb: Callback::Boxed(Box::new(|_d, _fs| {})),
                 on_fail: armed::unarmed(),
             },
         );
@@ -365,7 +365,7 @@ fn the_last_shared_lease_releases_the_buffer() {
 fn embedded_noop() -> FsWaiter {
     FsWaiter::Embedded {
         owner: Some((0, 0)),
-        cb: Box::new(|_d, _fs| {}),
+        cb: Callback::Boxed(Box::new(|_d, _fs| {})),
         on_fail: armed::unarmed(),
     }
 }
@@ -427,6 +427,9 @@ fn refused_leased_writes_answer_and_return_every_buffer_once() {
         if let ReapedFs::Embedded(cb, mut done, owner) = reaped {
             done.take_recv_lease().into_iter().for_each(&mut *surface);
             done.take_recv_lease_more().into_iter().for_each(&mut *surface);
+            let ReapedCb::Boxed(cb) = cb else {
+                panic!("a waiter built by hand is boxed");
+            };
             cb(done, &mut FsConn::new(core, eng, owner));
         }
     };
@@ -458,7 +461,7 @@ fn refused_leased_writes_answer_and_return_every_buffer_once() {
                 let answered = Rc::clone(&answered);
                 let waiter = FsWaiter::Embedded {
                     owner,
-                    cb: Box::new(move |_d, _fs| answered.borrow_mut().push(id)),
+                    cb: Callback::Boxed(Box::new(move |_d, _fs| answered.borrow_mut().push(id))),
                     on_fail: armed::unarmed(),
                 };
                 let full = !core.has_free_op();

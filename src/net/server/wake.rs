@@ -64,13 +64,15 @@ where
             // A job that digested a leased recv buffer released its share as its completion was taken above, and a
             // share dropped anywhere else, on any thread, queued its id and poked this wake. Both come back to the pool
             // here, the one place that can reach it.
-            let released = fs.take_pool_releases();
-            if !released.is_empty() {
-                if let Some(pool) = self.core.recv_bufs.as_mut() {
-                    for bid in released {
-                        pool.release(bid);
-                    }
+            let mut released = false;
+            let pool = &mut self.core.recv_bufs;
+            fs.release_pool_buffers(|bid| {
+                released = true;
+                if let Some(pool) = pool.as_mut() {
+                    pool.release(bid);
                 }
+            });
+            if released {
                 self.core.sync_recv_buf_stats();
             }
         }

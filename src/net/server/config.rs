@@ -25,6 +25,10 @@ use crate::uring_fs::offload_pool::MAX_OFFLOAD_THREADS;
 const MIN_FS_BODY_CHUNK: usize = 4096;
 #[cfg(feature = "uring-fs")]
 const MAX_FS_BODY_CHUNK: usize = 16 * 1024 * 1024;
+/// Bound for `fs_callback_bytes`, a room far past any callback's captures, which keeps the rooms of a full table inside
+/// what one allocation may hold.
+#[cfg(feature = "uring-fs")]
+const MAX_FS_CALLBACK_BYTES: usize = 4096;
 /// Bounds for `recv_buffer_bytes`: one chunked read at least, and at most what one arrival should pin.
 const MIN_RECV_BUFFER: usize = 4096;
 const MAX_RECV_BUFFER: usize = 16 * 1024 * 1024;
@@ -49,10 +53,18 @@ pub struct ServerConfig {
     ///
     /// It bounds operations, not open files, since files are plain fds closed as their last `Arc` drops. A linked chain
     /// counts each of its SQEs, so size it for the deepest chain a handler submits times the connections that can be
-    /// mid-chain. A slot is 616 bytes of heap, so this is the cheap axis to raise. The server adds `pool_size` slots of
-    /// its own for the reply path's body reads. Requires the `uring-fs` feature.
+    /// mid-chain. A slot is 616 bytes of heap and a room of [`fs_callback_bytes`](ServerConfig::fs_callback_bytes), so
+    /// this is the cheap axis to raise. The server adds `pool_size` slots of its own for the reply path's body reads.
+    /// Requires the `uring-fs` feature.
     #[cfg(feature = "uring-fs")]
     pub fs_ops: u32,
+    /// Bytes each op slot of the embedded fs reactor keeps for the callback of the op it hosts, so an op whose callback
+    /// fits allocates nothing for it. A callback larger, or aligned to more than 16 bytes, is boxed, and
+    /// [`boxed_callbacks`](crate::uring_fs::boxed_callbacks) counts it, so a consumer sizes this from its largest
+    /// callback and reads the count in its tests. Rounded up to a multiple of 16 and allocated once with the op table.
+    /// Default 64, validated to at most 4096.
+    #[cfg(feature = "uring-fs")]
+    pub fs_callback_bytes: usize,
     /// Warm floor of offload worker threads for the embedded fs reactor's blocking work (`readdir`, byte copies), which
     /// has no io_uring opcode. Per ring, and resident once first used, so it is a standing cost times the servers a
     /// deployment runs. Default `uring_fs::core::OFFLOAD_FLOOR`.
@@ -274,6 +286,8 @@ impl Default for ServerConfig {
             #[cfg(feature = "uring-fs")]
             fs_ops: 0,
             #[cfg(feature = "uring-fs")]
+            fs_callback_bytes: crate::uring_fs::core::FS_CALLBACK_BYTES,
+            #[cfg(feature = "uring-fs")]
             fs_offload_floor: crate::uring_fs::core::OFFLOAD_FLOOR,
             #[cfg(feature = "uring-fs")]
             fs_offload_ceiling: crate::uring_fs::core::OFFLOAD_CEILING,
@@ -359,6 +373,12 @@ impl ServerConfig {
         if self.fs_ops > 0 && u64::from(self.fs_ops).saturating_add(u64::from(self.pool_size)) > u64::from(MAX_POOL) {
             return Err(Error::Validation(format!(
                 "fs_ops + pool_size must not exceed {MAX_POOL}"
+            )));
+        }
+        #[cfg(feature = "uring-fs")]
+        if self.fs_callback_bytes > MAX_FS_CALLBACK_BYTES {
+            return Err(Error::Validation(format!(
+                "fs_callback_bytes must not exceed {MAX_FS_CALLBACK_BYTES}"
             )));
         }
         // The floor spawns eagerly on the reactor thread at first use, so an absurd value is a thread storm rather than
@@ -619,6 +639,29 @@ mod tests {
                     e.contains(knob),
                     "{knob} ({floor}, {ceiling}) accepted or wrong error: {e}"
                 );
+            }
+        }
+    }
+
+    /// A room for a callback is at most 4096 bytes, so the rooms of a full table fit one allocation, and none at all is
+    /// a room of no bytes, which boxes every callback with captures.
+    #[cfg(feature = "uring-fs")]
+    #[test]
+    fn validate_bounds_the_callback_rooms() {
+        let a = addrs();
+        for (bytes, ok) in [
+            (0, true),
+            (MAX_FS_CALLBACK_BYTES, true),
+            (MAX_FS_CALLBACK_BYTES + 1, false),
+        ] {
+            let cfg = ServerConfig {
+                fs_callback_bytes: bytes,
+                ..ServerConfig::default()
+            };
+            let verdict = cfg.validate(&a);
+            assert_eq!(verdict.is_ok(), ok, "{bytes}");
+            if let Err(e) = verdict {
+                assert!(e.to_string().contains("fs_callback_bytes"), "{e}");
             }
         }
     }

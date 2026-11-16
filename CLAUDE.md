@@ -543,6 +543,20 @@ A streamed window is written to a file straight out of its recv buffer.
   `a_thread_that_cannot_drop_fsetid_writes_nothing` and
   `a_lane_write_as_root_clears_the_set_user_id_bit`.
 
+### Callbacks in the op table
+
+- **A reaped op's callback keeps its slot's room, not its slot, until it runs.**
+  A callback that fits `fs_callback_bytes` waits in the room of its op's slot.
+  The slot goes back at reap, so a parked body read takes it first, and a room
+  that holds a callback takes no other, so an op with a callback that takes the
+  slot sooner boxes it. `deliver_embedded` empties the room as the callback
+  moves out, before it runs, so the op it submits next parks in that room, and a
+  refusal that waits in the queue boxes the callback first. Pinned by
+  `a_reaped_callback_keeps_its_room_until_it_runs`,
+  `a_callbacks_next_op_takes_the_slot_it_came_from`,
+  `a_callback_refused_after_it_took_its_slot_waits_in_a_box` and
+  `http_a_freed_op_slot_reaches_the_parked_body_first`.
+
 ### Where a poisoned lock fails closed
 
 - **`SingleFlight::get_or_try_init` fails closed on a poisoned map because

@@ -27,6 +27,25 @@ pub(crate) fn counted(cqe: &IoUringCqe) -> bool {
     cqe.flags & IORING_CQE_F_MORE == 0 && cqe.user_data as u8 != crate::uring::user_data::TAG_POSTED
 }
 
+/// What a test makes the next [`Engine::stage`] answer, since a full SQ is flushed and retried, so only the kernel
+/// refuses a stage. Empty outside tests, so a stage carries nothing.
+#[derive(Default)]
+pub(crate) struct StageSeam {
+    /// Refuse the next stage with `EBUSY`, as `push_sqe` answers a full SQ whose flush moved nothing.
+    #[cfg(test)]
+    pub(crate) refuse_next: bool,
+}
+
+impl StageSeam {
+    fn refusal(&mut self) -> errno::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.refuse_next) {
+            return Err(errno::Errno::EBUSY);
+        }
+        Ok(())
+    }
+}
+
 /// The role-agnostic io_uring engine a domain stack embeds. Field order is load-bearing: the embedding struct declares
 /// its buffer-owning tables before the engine, and `ring` is this struct's last field - so every kernel-visible buffer
 /// drops before the ring is unmapped and its pool descriptors close (the kernel must never touch a freed buffer).
@@ -40,6 +59,8 @@ pub(crate) struct Engine {
     pub(crate) inflight: u64,
     /// Whether the kernel supports `IORING_OP_FIXED_FD_INSTALL`, probed at construction and needed to furnish real fds.
     pub(crate) fixed_fd_install: bool,
+    /// What a test makes the next [`Engine::stage`] answer.
+    pub(crate) stage_seam: StageSeam,
     /// Declared last so it drops after everything above; see the struct doc.
     pub(crate) ring: Ring,
 }
@@ -82,12 +103,14 @@ impl Engine {
             wake_buf: Box::new(0),
             inflight: 0,
             fixed_fd_install,
+            stage_seam: StageSeam::default(),
             ring,
         })
     }
 
     /// Stage one SQE (setting its `user_data`) and count it as in-flight.
     pub(crate) fn stage<Fill: FnOnce(&mut IoUringSqe)>(&mut self, user_data: u64, fill: Fill) -> errno::Result<()> {
+        self.stage_seam.refusal()?;
         self.ring.push_sqe(move |sqe| {
             fill(sqe);
             sqe.user_data = user_data;

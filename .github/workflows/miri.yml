@@ -160,11 +160,13 @@ env:
   # tests, which need no ring and so execute here, and one guard-gated
   # engine test, counted rather than claimed; 123 adds the two pool
   # tests of the lookup lane, its thread name and a job handed back,
-  # which need no ring either.) If that friction is unwanted,
+  # which need no ring either; 130 adds the seven tests of the rooms an
+  # op table keeps its callbacks in, which need no ring and execute
+  # here.) If that friction is unwanted,
   # `-lt` pinned at the TRUE count still catches deletion, which is
   # the failure mode; what it must not be again is a floor far below
   # what runs.
-  MIRI_TESTS: "123"
+  MIRI_TESTS: "130"
 
   # The `http` band, run as its own step under its own feature set.
   # Exact for the same reason, and bumped by the same rule: 32 at the

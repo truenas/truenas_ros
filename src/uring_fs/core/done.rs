@@ -180,12 +180,16 @@ pub(super) fn deliver(
 pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
     // Tasks woken by these deliveries run in this dispatch, so an on-loop wake inside it needs no poke. A recv buffer a
     // finished `offload_from` job released is not handed back here, since the pool is the net server's
-    // (`FsCore::take_pool_releases`).
+    // (`FsCore::release_pool_buffers`).
     super::task::in_pass(fs, eng, |fs, eng| {
-        for (owner, deliver, any) in fs.take_pool_completions() {
+        // Taken out while each delivery borrows the core, and put back with its storage for the next drain.
+        let mut deliveries = std::mem::take(&mut fs.deliveries);
+        fs.take_pool_completions(&mut deliveries);
+        for (owner, deliver, any) in deliveries.drain(..) {
             let mut conn = FsConn::new(fs, eng, owner);
             deliver(any, &mut conn);
         }
+        fs.deliveries = deliveries;
         // Host refusals deliver on the same pass, with the same fresh facade. Bounded to what was queued when the pass
         // began, so a callback refused again delivers next pass and a retry loop cannot starve the ring in one drain.
         for _ in 0..fs.refusals_queued() {
@@ -221,9 +225,19 @@ pub(crate) fn deliver_embedded(fs: &mut FsCore, eng: &mut Engine, reaped: Reaped
     // A completion that resolves an op future wakes its task from inside the callback below; the drain that follows
     // polls it, so the wake needs no poke to reach the loop. See `task::in_pass`.
     super::task::in_pass(fs, eng, move |fs, eng| match reaped {
-        ReapedFs::Embedded(cb, done, owner) => {
+        ReapedFs::Embedded(ReapedCb::Boxed(cb), done, owner) => {
             let mut conn = FsConn::new(fs, eng, owner);
             cb(done, &mut conn);
+        }
+        ReapedFs::Embedded(ReapedCb::Parked { slot }, done, owner) => {
+            // The room is empty from here, so the next op the callback submits may park its own callback there.
+            let Some(taken) = fs.cbs.take(slot as usize) else {
+                return;
+            };
+            let mut conn = FsConn::new(fs, eng, owner);
+            // SAFETY: the rooms are `fs`'s, which outlives the call, and nothing has parked in the slot's room since
+            // `take` emptied it.
+            unsafe { taken.run((done, &mut conn)) };
         }
         ReapedFs::Pump(..) => {
             unreachable!("pump reads are routed by the net server")
