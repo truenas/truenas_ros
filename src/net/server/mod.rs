@@ -21,7 +21,7 @@
 //! [`ShutdownHandle::shutdown`].
 //!
 //! A server with no listeners serves only the sockets it is handed. [`Server::adopt`] takes a connected stream socket
-//! that was accepted or received elsewhere, such as an smbd channel passed between processes, and serves it like an
+//! that was accepted or received elsewhere, such as a channel passed between processes, and serves it like an
 //! accepted one. Adopt on the server's own thread, before [`Server::serve_forever`].
 //!
 //! A multishot accept writes every peer address into one shared buffer, so peer identity is fetched per connection

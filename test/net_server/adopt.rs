@@ -13,7 +13,22 @@ fn bare_server() -> Option<
         impl FnMut(Request<'_, ()>) -> Response,
     >,
 > {
-    match Server::with_config(Vec::<ServerAddr>::new(), ServerConfig::default(), noop_protocol()) {
+    bare_server_with(ServerConfig::default())
+}
+
+/// As [`bare_server`], with `cfg`.
+#[allow(clippy::type_complexity)]
+fn bare_server_with(
+    cfg: ServerConfig,
+) -> Option<
+    Server<
+        (),
+        impl FnMut(Incoming<'_>) -> Option<()>,
+        impl FnMut(&[u8], &mut ()) -> Framing,
+        impl FnMut(Request<'_, ()>) -> Response,
+    >,
+> {
+    match Server::with_config(Vec::<ServerAddr>::new(), cfg, noop_protocol()) {
         Ok(s) => Some(s),
         Err(e) if should_skip(&e) => None,
         Err(e) => panic!("with_config: {e}"),
@@ -296,4 +311,236 @@ fn push_parts_finished_that_fails_closes_the_connection() {
         matches!(reason, Ok(CloseReason::WorkerClosed)),
         "close reason {reason:?}"
     );
+}
+
+/// A push whose step would run behind a final farewell is dropped with its step unrun, as a plain push behind one is
+/// dropped. The farewell keeps the connection and its reason: the step must not close it out from under the flush.
+#[test]
+fn a_finished_push_behind_a_farewell_keeps_its_step_unrun() {
+    finished_push_behind_a_farewell(true);
+}
+
+/// As above, with a step that would refuse its PDU and so close the connection before the farewell goes out.
+#[test]
+fn a_refusing_step_behind_a_farewell_keeps_the_farewell() {
+    finished_push_behind_a_farewell(false);
+}
+
+/// A farewell, then a push whose step returns `takes`.
+fn finished_push_behind_a_farewell(takes: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+
+    let Some(mut server) = bare_server() else {
+        return;
+    };
+    let closes = close_reason_channel(&mut server);
+    let (mut client, sock) = accepted_elsewhere();
+    let push = server.adopt(sock, ()).expect("adopt");
+
+    let ran = Arc::new(AtomicBool::new(false));
+    // Queued in this order, so the loop takes the farewell before the finished push.
+    push.push(b"farewell".to_vec());
+    push.close();
+    let flag = Arc::clone(&ran);
+    push.push_parts_finished(
+        vec![PushPart::Owned(b"never".to_vec())],
+        Box::new(move |_| {
+            flag.store(true, AOrd::SeqCst);
+            takes
+        }),
+    );
+
+    let stop = server.shutdown_handle();
+    let worker = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut got = Vec::new();
+        let r = client.read_to_end(&mut got);
+        let reason = closes.recv_timeout(Duration::from_secs(5));
+        stop.shutdown();
+        (r, got, reason)
+    });
+    server.serve_forever().expect("serve_forever");
+    let (r, got, reason) = worker.join().expect("thread join");
+    r.expect("client read");
+
+    assert_eq!(got, b"farewell", "the farewell flushes whole");
+    assert!(
+        matches!(reason, Ok(CloseReason::PushClosed)),
+        "close reason {reason:?}, not the farewell's"
+    );
+    assert!(
+        !ran.load(AOrd::SeqCst),
+        "the step of a push behind a final farewell ran on the loop"
+    );
+}
+
+/// One PDU pushed in parts tallies one push, as one reply in segments tallies one reply.
+#[test]
+fn a_push_in_parts_tallies_one_push() {
+    let Some(mut server) = bare_server() else {
+        return;
+    };
+    let stats = server.stats_handle();
+    let (mut client, sock) = accepted_elsewhere();
+    let push = server.adopt(sock, ()).expect("adopt");
+    push.push_parts(vec![
+        PushPart::Owned(b"aaaa".to_vec()),
+        PushPart::Owned(b"bbbb".to_vec()),
+        PushPart::Owned(b"ccccc".to_vec()),
+    ]);
+    push.close();
+
+    let stop = server.shutdown_handle();
+    let worker = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut got = Vec::new();
+        let r = client.read_to_end(&mut got);
+        stop.shutdown();
+        (r, got)
+    });
+    server.serve_forever().expect("serve_forever");
+    let (r, got) = worker.join().expect("thread join");
+    r.expect("client read");
+    assert_eq!(got, b"aaaabbbbccccc", "the parts arrive as one PDU");
+    assert_eq!(stats.snapshot().pushes, 1, "three parts are one pushed PDU");
+}
+
+/// A push for a connection that has gone hands its lent bytes back.
+#[test]
+fn push_parts_for_a_gone_connection_hand_the_bytes_back() {
+    let Some(mut server) = bare_server() else {
+        return;
+    };
+    let closes = close_reason_channel(&mut server);
+    let (client, sock) = accepted_elsewhere();
+    let push = server.adopt(sock, ()).expect("adopt");
+    let payload = vec![7u8; 4096];
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let part = lend(&payload, done_tx);
+    let stop = server.shutdown_handle();
+    let worker = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        // The server sees the client go and frees the slot before the push comes.
+        drop(client);
+        let reason = closes.recv_timeout(Duration::from_secs(5));
+        push.push_parts(vec![part]);
+        let done = done_rx.recv_timeout(Duration::from_secs(5));
+        stop.shutdown();
+        (reason, done)
+    });
+    server.serve_forever().expect("serve_forever");
+    let (reason, done) = worker.join().expect("thread join");
+    assert!(reason.is_ok(), "the server saw the client go: {reason:?}");
+    assert!(done.is_ok(), "a push for a gone connection runs done");
+    drop(payload);
+}
+
+/// A push that comes while the server drains hands its lent bytes back.
+#[test]
+fn push_parts_while_draining_hand_the_bytes_back() {
+    let Some(mut server) = bare_server() else {
+        return;
+    };
+    let closes = close_reason_channel(&mut server);
+    // The client of `a` reads none of a push larger than its socket buffers, so `a` keeps the drain and the loop
+    // going. `b` is idle, so it closes when the drain begins.
+    let (client_a, sock_a) = accepted_elsewhere();
+    let (client_b, sock_b) = accepted_elsewhere();
+    let push_a = server.adopt(sock_a, ()).expect("adopt a");
+    let _push_b = server.adopt(sock_b, ()).expect("adopt b");
+    push_a.push(vec![0u8; 7 * 1024 * 1024]);
+    let payload = vec![7u8; 4096];
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let part = lend(&payload, done_tx);
+    let stop = server.shutdown_handle();
+    let worker = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        stop.shutdown_graceful(Duration::from_secs(10));
+        // The close of `b` shows that the loop drains.
+        let reason = closes.recv_timeout(Duration::from_secs(5));
+        push_a.push_parts(vec![part]);
+        let done = done_rx.recv_timeout(Duration::from_secs(5));
+        drop(client_a);
+        drop(client_b);
+        stop.shutdown();
+        (reason, done)
+    });
+    server.serve_forever().expect("serve_forever");
+    let (reason, done) = worker.join().expect("thread join");
+    assert!(
+        matches!(reason, Ok(CloseReason::ShuttingDown)),
+        "close reason {reason:?}"
+    );
+    assert!(done.is_ok(), "a push behind a drain runs done");
+    drop(payload);
+}
+
+/// A push past the send backlog closes the connection, sends nothing of the push and hands its lent bytes back.
+#[test]
+fn push_parts_past_the_backlog_hand_the_bytes_back() {
+    let cfg = ServerConfig {
+        max_send_backlog: 1024,
+        ..ServerConfig::default()
+    };
+    let Some(mut server) = bare_server_with(cfg) else {
+        return;
+    };
+    let closes = close_reason_channel(&mut server);
+    let (mut client, sock) = accepted_elsewhere();
+    let push = server.adopt(sock, ()).expect("adopt");
+    let payload = vec![7u8; 4096];
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    push.push_parts(vec![lend(&payload, done_tx)]);
+    let stop = server.shutdown_handle();
+    let worker = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let done = done_rx.recv_timeout(Duration::from_secs(5));
+        let reason = closes.recv_timeout(Duration::from_secs(5));
+        let mut got = Vec::new();
+        let r = client.read_to_end(&mut got);
+        stop.shutdown();
+        (done, reason, r, got)
+    });
+    server.serve_forever().expect("serve_forever");
+    let (done, reason, r, got) = worker.join().expect("thread join");
+    assert!(done.is_ok(), "a push past the backlog runs done");
+    assert!(
+        matches!(reason, Ok(CloseReason::SendBacklog)),
+        "close reason {reason:?}"
+    );
+    r.expect("client read");
+    assert!(got.is_empty(), "nothing of the refused push goes out");
+    drop(payload);
+}
+
+/// An empty part of a push is dropped, so a lent one hands its bytes back. The other parts go out as one PDU.
+#[test]
+fn push_parts_drop_an_empty_part_and_hand_its_bytes_back() {
+    let Some(mut server) = bare_server() else {
+        return;
+    };
+    let (mut client, sock) = accepted_elsewhere();
+    let push = server.adopt(sock, ()).expect("adopt");
+    let empty: [u8; 0] = [];
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    push.push_parts(vec![
+        PushPart::Owned(b"head".to_vec()),
+        lend(&empty, done_tx),
+        PushPart::Owned(b"tail".to_vec()),
+    ]);
+    push.close();
+    let stop = server.shutdown_handle();
+    let worker = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let done = done_rx.recv_timeout(Duration::from_secs(5));
+        let mut got = Vec::new();
+        let r = client.read_to_end(&mut got);
+        stop.shutdown();
+        (done, r, got)
+    });
+    server.serve_forever().expect("serve_forever");
+    let (done, r, got) = worker.join().expect("thread join");
+    r.expect("client read");
+    assert!(done.is_ok(), "an empty lent part runs done");
+    assert_eq!(got, b"headtail", "the other parts go out as one PDU");
 }

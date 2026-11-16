@@ -113,8 +113,18 @@ impl SelfRegistrar {
     }
 
     /// Unregister `who`, which this ring issued. Operations already submitted under it keep their credential
-    /// reference, and a later one that names it fails `EINVAL` at submission. An id this ring does not hold fails
-    /// `EINVAL` (`io_unregister_personality`, `io_uring/register.c`).
+    /// reference. An id this ring does not hold fails `EINVAL` (`io_unregister_personality`,
+    /// `io_uring/register.c`).
+    ///
+    /// **A freed id comes back.** The kernel allocates these cyclically over 1..=65535
+    /// (`xa_alloc_cyclic` with `XA_FLAGS_ALLOC1`, `io_register_personality`), so after one full cycle of this ring
+    /// an id is handed out again. A [`Personality`] kept past its `unregister` therefore stops failing `EINVAL` and
+    /// starts naming whatever registration holds that id now: an op stamped with it runs under **that** identity,
+    /// and an `unregister` of it tears **that** registration down. Measured on this kernel, a register and
+    /// unregister cycle returns id 1 after 65532 further registrations, in about 0.11 s of syscalls. A consumer that
+    /// registers per identity must drop its [`Personality`] when it unregisters, and must not keep one in a map or
+    /// in an op it has not yet submitted. The broker mints into the same per-ring id space
+    /// (`uring_fs::broker`), so the two minters share one cycle.
     pub fn unregister(&self, who: Personality) -> crate::Result<()> {
         self.gate.with_fd(|fd| unregister_personality(fd, who.0))
     }

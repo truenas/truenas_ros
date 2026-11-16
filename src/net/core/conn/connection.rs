@@ -62,7 +62,7 @@ impl<U> Connection<U> {
             read_held: false,
             #[cfg(feature = "net-server")]
             let_in: false,
-            evict_on_resume: false,
+            evict_on_resume: None,
             close_on_flush: None,
             peer_closed: None,
             #[cfg(feature = "net-client")]
@@ -576,10 +576,11 @@ impl<U> Connection<U> {
         self.enqueue(bytes, SendKind::Push);
     }
 
-    /// Queue one part of a pushed PDU, such as lent bytes, behind everything already queued.
+    /// Queue one part of a pushed PDU, such as lent bytes, behind everything already queued. Only the PDU's last part
+    /// tallies the push, as only a reply's last segment tallies the reply.
     #[cfg(feature = "net-server")]
-    pub(crate) fn enqueue_push_buf(&mut self, bytes: SendBuf) {
-        self.enqueue(bytes, SendKind::Push);
+    pub(crate) fn enqueue_push_buf(&mut self, bytes: SendBuf, last: bool) {
+        self.enqueue(bytes, if last { SendKind::Push } else { SendKind::PushPart });
     }
 
     pub(super) fn enqueue(&mut self, bytes: impl Into<SendBuf>, kind: SendKind) {
@@ -894,8 +895,8 @@ impl<U> Connection<U> {
             match item.kind {
                 SendKind::ReplyLast => progress.replies += 1,
                 SendKind::Push => progress.pushes += 1,
-                // Tallied by the reply's final ReplyLast segment.
-                SendKind::ReplyPart => {}
+                // Tallied by the final segment of the reply or the push.
+                SendKind::ReplyPart | SendKind::PushPart => {}
             }
             // A flushed tail chunk frees this connection's share of the ring, and its buffer goes back to the pool -
             // which only the reactor can do, so the id rides out on the progress. Not conditioned on a tail being

@@ -95,7 +95,7 @@ where
     /// The returned [`PushHandle`] sends on the connection before its first request arrives. The close hook reports
     /// the connection's end, and the stats count it as accepted.
     ///
-    /// This is for a process that takes connections over, like smbd, whose channels reach it by fd passing. Build a
+    /// This is for a process that takes connections over, whose channels reach it by fd passing. Build a
     /// server with no listeners on the thread that will run it, adopt, then call [`Server::serve_forever`].
     ///
     /// The ring takes its own reference to the socket, and `sock` closes on return. The socket keeps the options its

@@ -161,6 +161,9 @@ pub(crate) fn peer_from_fd(fd: RawFd) -> Option<ClientAddr> {
 /// The peer of a socket that a server adopts: its inet address, or an unnamed unix peer. The family comes from the
 /// socket itself, not from a listener, so a unix peer is really local. `ENOTSOCK` for a descriptor that is not a
 /// socket, `EPROTOTYPE` for one that is not a stream, and `ENOTCONN` for one that is not connected.
+///
+/// A unix peer carries no credentials. `ServerConfig::unix_peercred` fetches those on a listener's accepts, and a
+/// server that adopts has no listener, so the option cannot reach here.
 #[cfg(feature = "net-server")]
 pub(crate) fn adopted_peer(fd: RawFd) -> crate::errno::Result<ClientAddr> {
     let mut kind: libc::c_int = 0;

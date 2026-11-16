@@ -30,6 +30,11 @@ pub enum ClientAddr {
     Unix {
         /// The peer's credentials (`SO_PEERCRED`), fetched between accept and the accept handler when
         /// `ServerConfig::unix_peercred` is enabled -- the basis for local authentication. `None` when disabled.
+        ///
+        /// Also `None` for a socket a server adopts, whatever that option says. The option fetches credentials on a
+        /// listener's accepts, and a server that adopts has no listener, so nothing on that path fetches them. A
+        /// consumer cannot read `None` here as "the peer has no credentials": an adopting server admitted the
+        /// connection itself, and vouches for it.
         cred: Option<PeerCred>,
     },
 }
@@ -412,8 +417,13 @@ impl std::fmt::Debug for Body<'_> {
 /// Bytes that a connection sends from memory its consumer keeps, without a copy. The consumer keeps the memory valid
 /// and unchanged until the `done` callback runs. The callback runs once, on the thread that drops the `Lent`: the ring
 /// thread after the last of the bytes is sent, the ring thread when the connection closes first, or the pushing thread
-/// when the push cannot reach the ring at all. A send completion means the kernel has copied the bytes, so the memory is
-/// free for reuse when `done` runs.
+/// when the push cannot reach the ring at all. A send completion means the kernel has copied the bytes, so the
+/// memory is free for reuse when `done` runs.
+///
+/// It does not run at all on one path. A teardown whose ring drain failed leaks the connection table rather than
+/// free it, since an op may still be reading those buffers, so a `Lent` queued there is forgotten with its callback
+/// unrun. A consumer that waits for `done` before freeing waits for ever there, which is the safe direction: the
+/// bytes stay valid, as the leak intends.
 pub struct Lent {
     ptr: *const u8,
     len: usize,
@@ -442,7 +452,8 @@ impl Lent {
         if self.len == 0 {
             return &[];
         }
-        // SAFETY: the constructor's contract - `len` initialized bytes, valid until `done` runs, which only `drop` runs.
+        // SAFETY: the constructor's contract - `len` initialized bytes, valid until `done` runs, which only
+        // `drop` runs.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }

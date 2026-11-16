@@ -702,14 +702,18 @@ mod tests {
     /// The ALLOC1 contract this design leans on: ids start at 1 (0 stays the "ambient creds" SQE sentinel), allocate
     /// cyclically, and an unregistered id is not immediately reused.
     #[test]
-    fn personality_ids_start_at_one_and_do_not_reuse() {
+    fn personality_ids_start_at_one_and_are_allocated_cyclically() {
         let Some(ring) = ring_or_skip(4) else { return };
         let fd = ring.raw_fd();
         assert_eq!(register_personality(fd), Ok(1));
         assert_eq!(register_personality(fd), Ok(2));
         assert_eq!(register_personality(fd), Ok(3));
         unregister_personality(fd, 1).expect("unregister");
-        assert_eq!(register_personality(fd), Ok(4), "cyclic, no reuse");
+        assert_eq!(
+            register_personality(fd),
+            Ok(4),
+            "cyclic: the next id, not the freed one"
+        );
     }
 
     /// A `SINGLE_ISSUER` ring refuses registration from any task but its creator with `-EEXIST`, so our rings never set
