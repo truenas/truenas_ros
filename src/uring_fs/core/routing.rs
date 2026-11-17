@@ -21,7 +21,7 @@ impl FsCore {
 
     /// Cancel every in-flight op owned by any of `owners`, the connection-teardown sweep. An op in flight parks its fd
     /// and buffers until its CQE, so it is cancelled rather than dropped, and its entry lives until the `ECANCELED` CQE
-    /// reaps it. A bounded fsync that waits its turn is left to go on in its turn ([`FsCore::submit_fsync_bounded`]).
+    /// reaps it.
     ///
     /// **This runs once per close, and it is not a liveness gate.** A continuation of a cancelled op runs after the
     /// sweep with the same owner, and what it submits then is not swept again, on purpose, since a handler finishing an
@@ -45,8 +45,8 @@ impl FsCore {
             let swept = self.closed_owners.entry(slot).or_insert(generation);
             *swept = (*swept).max(generation);
         }
-        // Bounded by the in-flight count. A slot is in `op_free` iff free, so the difference is how many entries in
-        // flight or waiting the scan can meet, and it stops once it has seen them all.
+        // Bounded by the in-flight count. A slot is in `op_free` iff free, so the difference is how many in-flight
+        // entries the scan can meet, and it stops once it has seen them all.
         let mut in_flight = self.ops.len() - self.op_free.len();
         // Checked only in the direction that hurts. A count too low, from a slot pushed to `op_free` twice, breaks the
         // walk early and leaves live ops uncancelled. `>=`, since a slot popped for an op whose state is not set yet
@@ -70,13 +70,8 @@ impl FsCore {
             if in_flight == 0 {
                 break;
             }
-            let tag = match entry.state.state {
-                FsOpState::InFlight { tag } => tag,
-                FsOpState::Waiting => {
-                    in_flight -= 1;
-                    continue;
-                }
-                FsOpState::Free => continue,
+            let FsOpState::InFlight { tag } = entry.state.state else {
+                continue;
             };
             in_flight -= 1;
             let owner = match &entry.state.waiter {
@@ -156,10 +151,6 @@ impl FsCore {
         let Some(mut completed) = self.take_op(tag, op_slot, gen32) else {
             return ReapedFs::None;
         };
-        // Before this op's callback runs, so the place it gave back goes to the bounded fsync that waited longest.
-        if tag == TAG_FSYNC_BOUNDED {
-            self.start_waiting_fsyncs(eng);
-        }
         #[cfg(feature = "net-server")]
         let leased = completed.recv_lease.is_some();
         // The buffer goes back to the pool only when its LAST share drops: sibling writes in the same delivery may
@@ -300,30 +291,6 @@ impl FsCore {
         }
     }
 
-    /// Drop every bounded fsync that still waits, at teardown, as [`FsCore::on_drain_cqe`] drops an op in flight. None
-    /// is staged, its file closes, and its callback drops unrun, which resolves an awaited frame with the unmarked
-    /// `ECANCELED` as its `Fire` drops.
-    pub(crate) fn drop_waiting_fsyncs(&mut self) {
-        while let Some((op_slot, _)) = self.fsyncs_waiting.pop_front() {
-            let entry = &mut self.ops[op_slot as usize];
-            let waiter = entry.state.waiter.take();
-            let file = entry.state.file.take();
-            entry.state.clear();
-            entry.generation += 1;
-            if matches!(
-                waiter,
-                Some(FsWaiter::Embedded {
-                    cb: Callback::Parked,
-                    ..
-                })
-            ) {
-                self.cbs.discard(op_slot as usize);
-            }
-            self.op_free.push(op_slot);
-            deliver(waiter, Err(Errno::ECANCELED), Vec::new(), file, None);
-        }
-    }
-
     /// Teardown-drain routing, which replies and frees but never stages, since the drain is cancelling everything.
     pub(crate) fn on_drain_cqe(&mut self, cqe: &IoUringCqe) {
         let (tag, op_slot, gen32) = unpack_raw(cqe.user_data);
@@ -460,10 +427,6 @@ impl FsCore {
         match entry.state.state {
             FsOpState::InFlight { tag: t } if t == tag => {}
             _ => return None,
-        }
-        // Past the generation check, so a cancel's completion or a stale one gives back no place.
-        if tag == TAG_FSYNC_BOUNDED {
-            self.fsyncs_in_flight = self.fsyncs_in_flight.saturating_sub(1);
         }
         // An `Allow` open whose guard slot is still in flight parks its pair's charge rather than sending it home (see
         // `park` below). Checked against the guard entry itself, since `guard` stays set on an open whose guard fired

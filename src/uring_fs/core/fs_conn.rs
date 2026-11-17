@@ -654,23 +654,6 @@ impl<'a> FsConn<'a> {
         self.fs.submit_fsync(self.eng, who.0, f.fd, false, 0, 0, w);
     }
 
-    /// Flush `f`'s data and metadata (`fsync`) as `who`, waiting its turn under the bound of the host, a server's
-    /// `ServerConfig::max_fsyncs_in_flight`. Past the bound it waits on the ring, behind any asked before it, and goes
-    /// on as one in flight ends, however that one ends. With no bound set it is [`fsync`](Self::fsync), which never
-    /// counts against one.
-    ///
-    /// One whose connection closes while it waits, or that is asked after the close, still waits its turn and goes on,
-    /// as `fsync` does after the close, since a session can outlive its connection and keep the reply the callback
-    /// gives. One still waiting when the server stops is dropped unrun, as an op in flight is then. A full op table
-    /// refuses it as it refuses any op, with the marked `EBUSY` ([`FsDone::was_refused`]).
-    pub fn fsync_bounded<F>(&mut self, who: Personality, f: File, on_done: F)
-    where
-        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
-    {
-        let w = self.waiter(on_done);
-        self.fs.submit_fsync_bounded(self.eng, who.0, f.fd, w);
-    }
-
     /// Flush `f`'s data and essential metadata (`fdatasync`) as `who`.
     pub fn fdatasync<F>(&mut self, who: Personality, f: File, on_done: F)
     where
