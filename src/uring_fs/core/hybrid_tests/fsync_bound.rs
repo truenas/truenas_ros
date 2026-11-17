@@ -140,10 +140,10 @@ fn a_callbacks_bounded_fsync_goes_in_behind_those_waiting() {
     assert_eq!(marks(&seen), [1, 2, 3, 4]);
 }
 
-/// One that waits for a connection that closes ends with the sweep's unmarked `ECANCELED` without reaching the kernel,
-/// and the others go on in their order.
+/// One that waits when its connection closes stays in its place and goes on in its turn, as the kernel answers it, since
+/// a session can keep the reply it gives for the client's retry on another connection.
 #[test]
-fn a_bounded_fsync_waiting_for_a_closed_connection_ends_cancelled() {
+fn a_bounded_fsync_waiting_for_a_closed_connection_goes_on() {
     let (mut eng, mut fs, me) = bound_of_one(8);
     let dir = a_dir();
     let seen = Seen::default();
@@ -151,32 +151,29 @@ fn a_bounded_fsync_waiting_for_a_closed_connection_ends_cancelled() {
         FsConn::new(&mut fs, &mut eng, owner).fsync_bounded(me, a_file(&dir), recording(mark, &seen));
     }
     fs.cancel_owned_by(&mut eng, vec![(1, 0)]);
-    assert_eq!(
-        fs.refusals_queued(),
-        1,
-        "the closed connection's fsync ended in the core"
-    );
-    assert_eq!(fs.fsyncs_waiting.len(), 1, "and the other still waits");
-    assert_eq!(staged(&fs), 1, "with the first still the one staged");
+    assert_eq!(fs.refusals_queued(), 0, "the sweep ended nothing");
+    assert_eq!(fs.fsyncs_waiting.len(), 2, "both still wait");
     run_until(&mut eng, &mut fs, &seen, 3);
     assert_eq!(
         *seen.borrow(),
-        [(2, Err(Errno::ECANCELED), false), (1, Ok(0), false), (3, Ok(0), false)]
+        [(1, Ok(0), false), (2, Ok(0), false), (3, Ok(0), false)]
     );
 }
 
-/// One asked once its connection is swept is refused at once with the sweep's unmarked `ECANCELED`, and never staged.
+/// One a callback asks once its connection is swept waits behind the one in flight and goes on, as an `fsync` asked
+/// then does.
 #[test]
-fn a_bounded_fsync_asked_after_its_connection_is_swept_is_refused() {
+fn a_bounded_fsync_asked_after_its_connection_is_swept_goes_on() {
     let (mut eng, mut fs, me) = bound_of_one(4);
     let dir = a_dir();
     let seen = Seen::default();
+    FsConn::new(&mut fs, &mut eng, OWNER0).fsync_bounded(me, a_file(&dir), recording(1, &seen));
     fs.cancel_owned_by(&mut eng, vec![(1, 0)]);
-    FsConn::new(&mut fs, &mut eng, OWNER1).fsync_bounded(me, a_file(&dir), recording(1, &seen));
-    assert_eq!(staged(&fs), 0, "nothing staged");
-    assert!(fs.fsyncs_waiting.is_empty(), "and nothing waits");
-    run_until(&mut eng, &mut fs, &seen, 1);
-    assert_eq!(*seen.borrow(), [(1, Err(Errno::ECANCELED), false)]);
+    FsConn::new(&mut fs, &mut eng, OWNER1).fsync_bounded(me, a_file(&dir), recording(2, &seen));
+    assert_eq!(fs.refusals_queued(), 0, "nothing refused");
+    assert_eq!(fs.fsyncs_waiting.len(), 1, "it waits");
+    run_until(&mut eng, &mut fs, &seen, 2);
+    assert_eq!(*seen.borrow(), [(1, Ok(0), false), (2, Ok(0), false)]);
 }
 
 /// One in flight whose connection closes lets the next go on, however the cancel meets it, and so does one that fails.

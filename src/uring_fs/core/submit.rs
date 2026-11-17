@@ -584,18 +584,12 @@ impl FsCore {
     /// file there, and goes behind any that wait, for [`FsCore::start_waiting_fsyncs`] to stage once the bound has
     /// room.
     ///
-    /// **A swept owner's is refused with the sweep's unmarked `ECANCELED`**, as one that waits is ended when its owner
-    /// is swept ([`FsCore::cancel_owned_by`]), so no fsync of a closed connection that is not yet in the kernel reaches
-    /// it, whether it was asked before the close or after.
+    /// **A swept owner's waits and goes on as any other**, whether it was asked before the close or after, as an
+    /// `fsync` asked after the sweep goes on. A session can outlive its connection and keep the reply the callback gives
+    /// for the client's retry on another, where an `ECANCELED` would be a failure the client meets.
     pub(crate) fn submit_fsync_bounded(&mut self, eng: &mut Engine, pers: u16, file: Arc<OwnedFd>, waiter: FsWaiter) {
         if self.fsync_bound.is_none() {
             self.submit_fsync(eng, pers, file, false, 0, 0, waiter);
-            return;
-        }
-        if let FsWaiter::Embedded { owner, .. } = &waiter
-            && self.owner_is_gone(*owner)
-        {
-            self.refuse(eng, waiter, Errno::ECANCELED, false, Vec::new(), Some(file));
             return;
         }
         let Some(op_slot) = self.pop_op() else {
@@ -672,9 +666,8 @@ impl FsCore {
     /// Answers the armed timer's slot and full-width generation, for [`FsConn::cancel_timeout`]'s [`Timer`], or `None`
     /// when the arm was refused and the waiter has been answered.
     ///
-    /// **A swept owner may not park time on the table.** Other post-sweep submissions are allowed, a bounded fsync's
-    /// aside ([`FsCore::submit_fsync_bounded`]), but a timer is a wait, not progress, and a re-arming tick whose
-    /// connection died would strand a slot per arm. The refusal is the
+    /// **A swept owner may not park time on the table.** Other post-sweep submissions are allowed, but a timer is a
+    /// wait, not progress, and a re-arming tick whose connection died would strand a slot per arm. The refusal is the
     /// sweep's own unmarked `ECANCELED`, so a continuation winds down the same way in both orderings, and it arrives
     /// through the callback, since [`FsCore::refuse`] fills a sink only for a marked refusal.
     pub(crate) fn submit_timeout(

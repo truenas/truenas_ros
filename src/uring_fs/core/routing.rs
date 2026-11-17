@@ -21,8 +21,7 @@ impl FsCore {
 
     /// Cancel every in-flight op owned by any of `owners`, the connection-teardown sweep. An op in flight parks its fd
     /// and buffers until its CQE, so it is cancelled rather than dropped, and its entry lives until the `ECANCELED` CQE
-    /// reaps it. A bounded fsync that waits its turn has nothing in the kernel, so it ends here with the same unmarked
-    /// `ECANCELED`.
+    /// reaps it. A bounded fsync that waits its turn is left to go on in its turn ([`FsCore::submit_fsync_bounded`]).
     ///
     /// **This runs once per close, and it is not a liveness gate.** A continuation of a cancelled op runs after the
     /// sweep with the same owner, and what it submits then is not swept again, on purpose, since a handler finishing an
@@ -46,7 +45,6 @@ impl FsCore {
             let swept = self.closed_owners.entry(slot).or_insert(generation);
             *swept = (*swept).max(generation);
         }
-        self.end_swept_fsyncs(eng);
         // Bounded by the in-flight count. A slot is in `op_free` iff free, so the difference is how many entries in
         // flight or waiting the scan can meet, and it stops once it has seen them all.
         let mut in_flight = self.ops.len() - self.op_free.len();
@@ -299,26 +297,6 @@ impl FsCore {
                 owner,
             ),
             None => ReapedFs::None,
-        }
-    }
-
-    /// End each bounded fsync that waits for an owner the sweep has passed ([`FsCore::owner_is_gone`]) with the sweep's
-    /// unmarked `ECANCELED`, as the kernel answers an op the sweep cancels, keeping the rest in their order. None of
-    /// them reached the kernel.
-    fn end_swept_fsyncs(&mut self, eng: &mut Engine) {
-        for _ in 0..self.fsyncs_waiting.len() {
-            let Some((op_slot, pers)) = self.fsyncs_waiting.pop_front() else {
-                break;
-            };
-            let owner = match &self.ops[op_slot as usize].state.waiter {
-                Some(FsWaiter::Embedded { owner, .. }) => *owner,
-                _ => None,
-            };
-            if self.owner_is_gone(owner) {
-                self.end_op(eng, op_slot, Errno::ECANCELED, false);
-            } else {
-                self.fsyncs_waiting.push_back((op_slot, pers));
-            }
         }
     }
 
@@ -659,11 +637,6 @@ impl FsCore {
     /// Fail a just-reserved op entry before its SQE reached the kernel, freeing it and answering through
     /// [`FsCore::refuse`] with the buffers handed back. An entry with no waiter, an `Allow` guard, frees silently.
     pub(super) fn fail_op(&mut self, eng: &mut Engine, op_slot: u32, err: Errno) {
-        self.end_op(eng, op_slot, err, true);
-    }
-
-    /// End an op entry that never reached the kernel with `err`, marked as a refusal or, for a swept owner's, not.
-    fn end_op(&mut self, eng: &mut Engine, op_slot: u32, err: Errno, marked: bool) {
         // The refusal waits in the queue while the next op takes this slot and parks its callback in the slot's room,
         // so a callback kept there is boxed first.
         let waiter = self.ops[op_slot as usize]
@@ -681,7 +654,7 @@ impl FsCore {
         entry.generation += 1;
         self.op_free.push(op_slot);
         match waiter {
-            Some(w) => self.refuse(eng, w, err, marked, bufs, file),
+            Some(w) => self.refuse(eng, w, err, true, bufs, file),
             None => drop((bufs, file)),
         }
     }
