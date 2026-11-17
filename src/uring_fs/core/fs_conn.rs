@@ -89,10 +89,9 @@ impl<'a> FsConn<'a> {
     /// Whether the connection this facade acts for has already been torn down.
     ///
     /// A continuation may run after its owner is gone, and failing ops are the signal a task winds down on. An offload
-    /// is never cancelled and a timer armed after the sweep expires normally, so a task built from either would run for
-    /// a dead connection, holding a graceful drain open, unless it reads this. Submitting is still allowed, since a
-    /// handler finishing work it already accepted is not undone by the peer hanging up, but for
-    /// [`fsync_bounded`](Self::fsync_bounded) under a bound, which answers the sweep's `ECANCELED`.
+    /// is never cancelled, so a task built from offloads would run for a dead connection, holding a graceful drain
+    /// open, unless it reads this. Submitting is still allowed, since a handler finishing work it already accepted is
+    /// not undone by the peer hanging up.
     ///
     /// Always `false` where the reactor has no owners (a standalone [`UringFs`](super::super::UringFs)).
     pub fn owner_is_gone(&self) -> bool {
@@ -660,9 +659,10 @@ impl<'a> FsConn<'a> {
     /// on as one in flight ends, however that one ends. With no bound set it is [`fsync`](Self::fsync), which never
     /// counts against one.
     ///
-    /// Under a bound, one asked for a connection the server has torn down, or waiting when it is torn down, never
-    /// reaches the kernel and answers the unmarked `ECANCELED` of the teardown. A full op table refuses it as it refuses
-    /// any op, with the marked `EBUSY` ([`FsDone::was_refused`]).
+    /// One whose connection closes while it waits, or that is asked after the close, still waits its turn and goes on,
+    /// as `fsync` does after the close, since a session can outlive its connection and keep the reply the callback
+    /// gives. One still waiting when the server stops is dropped unrun, as an op in flight is then. A full op table
+    /// refuses it as it refuses any op, with the marked `EBUSY` ([`FsDone::was_refused`]).
     pub fn fsync_bounded<F>(&mut self, who: Personality, f: File, on_done: F)
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
@@ -682,7 +682,8 @@ impl<'a> FsConn<'a> {
 
     /// Fire `on_done` after `after`, one relative, one-shot `IORING_OP_TIMEOUT` on this ring, delivered as `Ok(0)` when
     /// it expires. No fd or personality rides it, so this is the retry-tick and deadline primitive, re-armed rather
-    /// than sleeping an offload worker. An owner gone before expiry drops the callback, like any continuation's.
+    /// than sleeping an offload worker. The close of its connection before expiry cancels it, and `on_done` runs with
+    /// the unmarked `ECANCELED` of that cancel.
     ///
     /// **A timer holds its op slot for its whole wall-clock duration**, where a read holds one only until its I/O
     /// completes, so retract a deadline reached early with the returned [`Timer`].

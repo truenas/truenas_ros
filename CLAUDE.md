@@ -575,14 +575,18 @@ A streamed window is written to a file straight out of its recv buffer.
   `a_callbacks_bounded_fsync_goes_in_behind_those_waiting`,
   `a_bounded_fsync_in_flight_that_is_cancelled_or_fails_lets_the_next_go`
   and `a_bounded_fsync_that_fails_to_stage_at_its_turn_is_refused`.
-- **No fsync of a closed connection that is not yet in the kernel reaches
-  it.** The sweep ends one that waits with its unmarked `ECANCELED`
-  (`end_swept_fsyncs`), and one asked after the sweep is refused the same
-  way, as a timer is. The teardown drops those still waiting unrun with
-  their files, as the drain drops an op in flight (`drop_waiting_fsyncs` in
-  `drain_stop_window`), since its reap reaches none of them. Pinned by
-  `a_bounded_fsync_waiting_for_a_closed_connection_ends_cancelled`,
-  `a_bounded_fsync_asked_after_its_connection_is_swept_is_refused` and
+- **A closed connection's bounded fsyncs go on.** One that waits when its
+  connection closes, or that a callback asks after the sweep, waits its
+  turn and goes on, as `FsConn::fsync` does after the sweep. A session can
+  outlive its connection and keep the reply of a call that ends after the
+  close for the client's retry on another, so an `ECANCELED` there is a
+  failure the client meets. The sweep still cancels one in flight, as it
+  cancels every op of the connection. The teardown drops those still
+  waiting unrun with their files, as the drain drops an op in flight
+  (`drop_waiting_fsyncs` in `drain_stop_window`), since its reap reaches
+  none of them. Pinned by
+  `a_bounded_fsync_waiting_for_a_closed_connection_goes_on`,
+  `a_bounded_fsync_asked_after_its_connection_is_swept_goes_on` and
   `a_teardown_drops_the_bounded_fsyncs_still_waiting_unrun`.
 
 ### Where a poisoned lock fails closed
