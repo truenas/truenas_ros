@@ -430,7 +430,6 @@ where
             // One timer per request in flight is the consumer discipline, so the cap follows the knob that bounds
             // requests in flight.
             fs.set_timer_cap(u32::try_from(cfg.max_in_flight_requests).unwrap_or(u32::MAX));
-            fs.set_fsync_bound(cfg.max_fsyncs_in_flight);
             // The file half of `ServerConfig::force_async`. The core reads only `READ` and `WRITE` from it; passing the
             // whole set keeps one knob rather than two halves that can drift.
             fs.set_force_async(cfg.force_async);

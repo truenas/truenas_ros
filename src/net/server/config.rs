@@ -277,17 +277,6 @@ pub struct ServerConfig {
     /// thread drives the same bound. 0 and a count past `i32::MAX`, which the kernel refuses, are refused at
     /// validation.
     pub iowq_bounded_workers: Option<u32>,
-    /// The most fsyncs asked through [`FsConn::fsync_bounded`](crate::uring_fs::FsConn::fsync_bounded) this server's
-    /// ring keeps in flight at once, or `None`, the default, for no bound. One past it waits on the ring, behind any
-    /// asked before it, and goes on as one in flight ends.
-    ///
-    /// An `FSYNC` always runs on an io-wq worker (`io_fsync_prep`, `io_uring/sync.c`), and every fsync of a ZFS
-    /// dataset waits for the one writer of its intent log (`zl_issuer_lock` in `zil_commit_writer`,
-    /// `module/zfs/zil.c`), so many in flight at once contend for that lock rather than sync sooner. The bound is the
-    /// ring's, over every file it syncs, and [`FsConn::fsync`](crate::uring_fs::FsConn::fsync) never counts against
-    /// it. 0, which would let none go, is refused at validation.
-    #[cfg(feature = "uring-fs")]
-    pub max_fsyncs_in_flight: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -342,8 +331,6 @@ impl Default for ServerConfig {
             body_placement_threshold: Some(64 * 1024),
             force_async: ForceAsync::empty(),
             iowq_bounded_workers: None,
-            #[cfg(feature = "uring-fs")]
-            max_fsyncs_in_flight: None,
         }
     }
 }
@@ -378,12 +365,6 @@ impl ServerConfig {
             return Err(Error::Validation(format!(
                 "iowq_bounded_workers must be in 1..={}",
                 i32::MAX
-            )));
-        }
-        #[cfg(feature = "uring-fs")]
-        if self.max_fsyncs_in_flight == Some(0) {
-            return Err(Error::Validation(String::from(
-                "max_fsyncs_in_flight must be at least 1",
             )));
         }
         // An op-slot index is packed into the 24-bit `user_data` slot field (`user_data::SLOT_MASK`, which `MAX_POOL`
@@ -620,19 +601,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "uring-fs")]
-    #[test]
-    fn validate_refuses_a_bound_of_no_fsyncs() {
-        let addrs = [Listen::from(ServerAddr::Tcp("127.0.0.1:0".parse().unwrap()))];
-        for (bound, ok) in [(None, true), (Some(1), true), (Some(u32::MAX), true), (Some(0), false)] {
-            let cfg = ServerConfig {
-                max_fsyncs_in_flight: bound,
-                ..ServerConfig::default()
-            };
-            assert_eq!(cfg.validate(&addrs).is_ok(), ok, "{bound:?}");
-        }
-    }
-
     /// The offload bounds spawn real threads on the reactor thread at first use, so they are bounded at construction
     /// like every other sizing knob, for every pool.
     #[cfg(feature = "uring-fs")]
@@ -723,28 +691,6 @@ mod tests {
             fs.write_bounds(),
             crate::uring_fs::OffloadBounds { floor: 2, ceiling: 3 }
         );
-    }
-
-    /// A server's fs core takes its bound on bounded fsyncs from the config.
-    #[cfg(all(feature = "uring-fs", not(loom)))]
-    #[test]
-    fn a_servers_fs_core_takes_its_fsync_bound_from_the_config() {
-        use crate::net::core::protocol::{Endian, PrefixWidth};
-        use crate::net::server::{Server, length_prefixed};
-        let cfg = ServerConfig {
-            fs_ops: 16,
-            max_fsyncs_in_flight: Some(3),
-            ..ServerConfig::default()
-        };
-        let proto = length_prefixed(PrefixWidth::U32, Endian::Big, false, |_h, _b, _p| None);
-        let addr = ServerAddr::Tcp("127.0.0.1:0".parse().unwrap());
-        let server = match Server::with_config([addr], cfg, proto) {
-            Ok(s) => s,
-            Err(crate::Error::Errno(e)) if crate::uring::setup_unavailable(e) => return,
-            Err(e) => panic!("Server::with_config: {e}"),
-        };
-        let fs = server.fs.as_ref().expect("a server with an fs table");
-        assert_eq!(fs.fsync_bound(), Some(3));
     }
 
     /// `recv_buffer_bytes` is bounded, and a zero receipt window - which would renew a spliced body's budget on no

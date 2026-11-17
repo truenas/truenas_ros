@@ -211,14 +211,10 @@ pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
 ///
 /// **Called before the teardown reap**, so whatever a callback here stages is cancelled and reaped with the rest. **One
 /// pass only**, bounded as [`deliver_pool_completions`] is, so a consumer's retry loop cannot hold teardown open.
-///
-/// The bounded fsyncs still waiting are dropped last, any a callback here asked among them, since the reap reaches none
-/// of them ([`FsCore::drop_waiting_fsyncs`]).
 pub(crate) fn drain_stop_window(fs: &mut FsCore, eng: &mut Engine) {
     // The teardown below blocks without parking, so flush what the last iteration queued.
     fs.flush_offloads();
     deliver_pool_completions(fs, eng);
-    fs.drop_waiting_fsyncs();
 }
 
 /// Fire an embedded on-loop completion reaped by [`FsCore::on_cqe`] with a fresh owner-scoped [`FsConn`]; a no-op when
