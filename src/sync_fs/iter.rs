@@ -54,6 +54,23 @@ fn how(flags: OFlag, resolve: ResolveFlag) -> OpenHow {
     OpenHow::new().flags(flags).resolve(resolve)
 }
 
+/// Open an entry of the walk, waiting out a lease break.
+///
+/// An `O_NONBLOCK` open that conflicts with a lease, an NFSv4 delegation `knfsd` holds for a client among them, starts
+/// the break and fails `EWOULDBLOCK` instead of waiting for the holder to let go (`__break_lease`,
+/// `fs/locks.c:1599-1601`). A FIFO never fails an `O_NONBLOCK` open that way (`fifo_open`, `fs/pipe.c:1163-1189`), so
+/// an entry `readdir` typed `DT_REG` is opened again without the flag, and the kernel waits for the break. A
+/// `DT_UNKNOWN` entry is not, since it may be a device, whose blocking open can wait in its driver for good
+/// (`tty_port_block_til_ready` in `drivers/tty/tty_port.c`).
+fn open_entry(dfd: BorrowedFd<'_>, name: &OsStr, d_type: u8, flags: OFlag) -> crate::errno::Result<OwnedFd> {
+    match openat2(dfd, name, how(flags, ITER_RESOLVE)) {
+        Err(Errno::EAGAIN) if d_type == libc::DT_REG => {
+            openat2(dfd, name, how(flags.difference(OFlag::O_NONBLOCK), ITER_RESOLVE))
+        }
+        res => res,
+    }
+}
+
 /// What kind of filesystem object an [`Entry`] refers to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryType {
@@ -385,7 +402,7 @@ impl FsIter {
         } else {
             // A regular file, or an entry whose type `readdir` didn't report (`DT_UNKNOWN`). `O_NONBLOCK` makes a FIFO
             // hiding behind one open at once instead of blocking on an absent writer, and does not affect a regular
-            // file's reads.
+            // file's reads. It does fail an open that breaks a lease, which `open_entry` opens again.
             self.file_open_flags | OFlag::O_NONBLOCK
         };
 
@@ -395,7 +412,7 @@ impl FsIter {
         let dfd = unsafe { BorrowedFd::borrow_raw(dfd_raw) };
         let name = dirent.name.as_os_str();
 
-        let (fd, is_mount) = match openat2(dfd, name, how(open_flags, ITER_RESOLVE)) {
+        let (fd, is_mount) = match open_entry(dfd, name, dirent.d_type, open_flags) {
             Ok(fd) => (fd, false),
             // A symlink `readdir` didn't flag (`DT_UNKNOWN`): a readable open of one fails `ELOOP` under `O_NOFOLLOW`.
             // Grab an `O_PATH` handle so the walk classifies it as a symlink, exactly as it would from a `DT_LNK` hint.
@@ -435,7 +452,7 @@ impl FsIter {
             // that survives the retry fails the walk.
             Err(Errno::EPERM | Errno::EACCES) if !is_dir_hint && !is_lnk => {
                 let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
-                match openat2(dfd, name, how(flags, ITER_RESOLVE)) {
+                match open_entry(dfd, name, dirent.d_type, flags) {
                     Ok(fd) => (fd, false),
                     Err(Errno::ELOOP | Errno::ENOENT) => return Ok(None),
                     Err(e) => return Err(e.into()),
