@@ -432,7 +432,7 @@ where
             fs.set_timer_cap(u32::try_from(cfg.max_in_flight_requests).unwrap_or(u32::MAX));
             // The file half of `ServerConfig::force_async`. The core reads only `READ` and `WRITE` from it; passing the
             // whole set keeps one knob rather than two halves that can drift.
-            fs.set_force_async(cfg.force_async);
+            fs.set_force_async(cfg.force_async, cfg.force_async_min_bytes);
             fs.set_lookup_bounds(crate::uring_fs::OffloadBounds {
                 floor: cfg.lookup_offload_floor,
                 ceiling: cfg.lookup_offload_ceiling,
