@@ -162,6 +162,93 @@ fn special_files_classify_without_hanging() {
     assert_eq!(kinds.get("pipe"), Some(&EntryType::Special));
 }
 
+/// An open that breaks a lease waits for the holder rather than failing the walk.
+///
+/// A write lease is the kernel object behind an NFSv4 write delegation `knfsd` holds for a client, and the walk's
+/// `O_NONBLOCK` open of a regular file starts its break and fails `EWOULDBLOCK` (`__break_lease` in `fs/locks.c`). The
+/// holder gives the lease back only once the break has begun, so the walk passes only by waiting for it.
+#[test]
+fn an_open_that_breaks_a_lease_waits_for_the_holder() {
+    use std::os::fd::AsRawFd;
+
+    // The `fcntl(2)` owner command and kind the libc crate lacks for this target.
+    const F_SETOWN_EX: libc::c_int = 15;
+    const F_OWNER_TID: libc::c_int = 0;
+    #[repr(C)]
+    struct OwnerEx {
+        kind: libc::c_int,
+        pid: libc::pid_t,
+    }
+
+    let dir = truenas_ros::tempdir().unwrap();
+    let leased = dir.path().join("leased");
+    std::fs::write(&leased, b"x").unwrap();
+    std::fs::write(dir.path().join("other"), b"y").unwrap();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&leased)
+            .unwrap();
+        let fd = file.as_raw_fd();
+        // The break comes as `SIGIO`, which ends the process on any thread that has it unblocked. This thread blocks
+        // it and is made the owner before the lease is taken, which `lease_setup` keeps (`__f_setown` in
+        // `fs/fcntl.c`), so the signal comes here alone.
+        let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: `sigemptyset` initializes the set before `sigaddset` and `assume_init` read it.
+        let set = unsafe {
+            libc::sigemptyset(set.as_mut_ptr());
+            libc::sigaddset(set.as_mut_ptr(), libc::SIGIO);
+            set.assume_init()
+        };
+        let owner = OwnerEx {
+            kind: F_OWNER_TID,
+            // SAFETY: gettid has no preconditions.
+            pid: unsafe { libc::gettid() },
+        };
+        // SAFETY: `fd` is open while `file` lives, and `set` and `owner` outlive the calls that read them.
+        unsafe {
+            assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()), 0);
+            assert_eq!(
+                libc::fcntl(fd, F_SETOWN_EX, &owner as *const OwnerEx),
+                0,
+                "{}",
+                Errno::last()
+            );
+            assert_eq!(libc::fcntl(fd, libc::F_SETLEASE, libc::F_WRLCK), 0, "{}", Errno::last());
+        }
+        ready_tx.send(()).unwrap();
+        let wait = libc::timespec { tv_sec: 10, tv_nsec: 0 };
+        let broken = loop {
+            // SAFETY: `set` and `wait` are initialized, and the info pointer may be null.
+            if unsafe { libc::sigtimedwait(&set, std::ptr::null_mut(), &wait) } != libc::SIGIO {
+                break false;
+            }
+            // A lease under a break answers the type it is to become (`target_leasetype` in `fs/locks.c`).
+            // SAFETY: `fd` is open while `file` lives.
+            if unsafe { libc::fcntl(fd, libc::F_GETLEASE) } != libc::F_WRLCK {
+                break true;
+            }
+        };
+        // SAFETY: as above.
+        unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK) };
+        broken
+    });
+    if ready_rx.recv().is_err() {
+        std::panic::resume_unwind(holder.join().unwrap_err());
+    }
+
+    let names: BTreeSet<String> = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
+        .build()
+        .unwrap()
+        .map(|res| res.unwrap().name().to_string_lossy().into_owned())
+        .collect();
+    assert!(holder.join().unwrap(), "the walk broke the lease");
+    assert!(names.contains("leased") && names.contains("other"), "{names:?}");
+}
+
 #[test]
 fn skip_descent_prunes_subtree() {
     let dir = truenas_ros::tempdir().unwrap();
