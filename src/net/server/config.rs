@@ -263,6 +263,10 @@ pub struct ServerConfig {
     /// Empty by default. [`ForceAsync`] says what the flag costs each class, since the kernel decides by whether the
     /// file polls, and why the classes are separate knobs.
     pub force_async: ForceAsync,
+    /// The smallest file read or write of a class in [`force_async`](Self::force_async) that carries `IOSQE_ASYNC`, in
+    /// bytes. 0, the default, flags every one.
+    #[cfg(feature = "uring-fs")]
+    pub force_async_min_bytes: usize,
     /// The most io-wq workers this server's ring runs at once for bounded work, or `None`, the default, which keeps the
     /// kernel's own bound, the lesser of the ring's submission entries and four for each CPU (`io_init_wq_offload`,
     /// `io_uring/tctx.c`).
@@ -330,6 +334,8 @@ impl Default for ServerConfig {
             max_send_coalesce: 8,
             body_placement_threshold: Some(64 * 1024),
             force_async: ForceAsync::empty(),
+            #[cfg(feature = "uring-fs")]
+            force_async_min_bytes: 0,
             iowq_bounded_workers: None,
         }
     }

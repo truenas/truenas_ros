@@ -918,6 +918,8 @@ pub(crate) struct FsCore {
     /// Which of this core's reads and writes carry `IOSQE_ASYNC`, as the host set it ([`FsCore::set_force_async`]).
     /// Only `READ` and `WRITE` are read here, as the socket classes belong to the net reactor.
     force_async: ForceAsync,
+    /// The smallest read or write of a class in `force_async` that carries the flag, in bytes.
+    force_async_min: usize,
     /// Host refusals awaiting delivery ([`FsCore::refuse`]), each with its owner, callback and outcome.
     refusals: VecDeque<(Owner, EmbeddedCb, FsDone)>,
     /// The file leases this ring holds and the signalfd their breaks arrive on ([`FileLeases`]).
@@ -986,6 +988,7 @@ impl FsCore {
             armed_timers: HashMap::new(),
             timer_cap: None,
             force_async: ForceAsync::empty(),
+            force_async_min: 0,
             refusals: VecDeque::new(),
             file_leases: FileLeases::default(),
         }
@@ -1005,11 +1008,12 @@ impl FsCore {
         self.timer_cap = Some(per_owner);
     }
 
-    /// Stamp `IOSQE_ASYNC` on this core's `READV`/`WRITEV` submissions (see the field). Setup-time only, on
+    /// Flag this core's reads and writes of `classes` with `IOSQE_ASYNC` from `min_bytes` up. Setup-time only, on
     /// [`FsCore::set_timer_cap`]'s rule.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
-    pub(crate) fn set_force_async(&mut self, classes: ForceAsync) {
+    pub(crate) fn set_force_async(&mut self, classes: ForceAsync, min_bytes: usize) {
         self.force_async = classes;
+        self.force_async_min = min_bytes;
     }
 
     /// Whether `owner`'s connection has already been swept.

@@ -10,7 +10,7 @@ fn a_pump_read_carries_iosqe_async_only_for_its_own_class() {
     let staged_flags = |classes: ForceAsync| -> Option<u8> {
         let mut eng = engine_or_skip()?;
         let mut core = FsCore::new(4, OffloadBounds::default());
-        core.set_force_async(classes);
+        core.set_force_async(classes, 0);
         let dir = crate::tempdir().expect("tempdir");
         let p = dir.path().join("f");
         std::fs::write(&p, b"0123456789").unwrap();
@@ -41,6 +41,58 @@ fn a_pump_read_carries_iosqe_async_only_for_its_own_class() {
             flags & crate::uring::sys::IOSQE_ASYNC,
             0,
             "a read must stay unflagged under {wrong:?}"
+        );
+    }
+}
+
+/// A forced read carries `IOSQE_ASYNC` from the size threshold up, on each path that stages one.
+#[test]
+fn a_read_carries_iosqe_async_only_from_the_threshold_up() {
+    const LEN: usize = 4096;
+    let staged_flags = |path: u8, min_bytes: usize| -> Option<u8> {
+        let mut eng = engine_or_skip()?;
+        let mut core = FsCore::new(4, OffloadBounds::default());
+        core.set_force_async(ForceAsync::READ, min_bytes);
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let fd = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let (tx, _rx) = mpsc::channel();
+        match path {
+            0 => core.submit_rw(&mut eng, TAG_READV, 0, fd, vec![vec![0u8; LEN]], 0, 0, chan(&tx)),
+            1 => core.submit_read_spare(&mut eng, 0, fd, Vec::with_capacity(LEN), LEN, 0, 0, chan(&tx)),
+            _ => core
+                .submit_pump_read(
+                    &mut eng,
+                    &File::new(fd),
+                    PumpDest::Owned(Vec::with_capacity(LEN)),
+                    LEN,
+                    0,
+                    (1, 1),
+                )
+                .expect("submit"),
+        }
+        let flags = eng.staged_sqe(0).flags;
+        // Only the completion releases the op.
+        eng.ring.submit_and_wait(1).expect("submit_and_wait");
+        let cqe = eng.ring.reap().expect("cqe");
+        let (tag, slot, g) = unpack_raw(cqe.user_data);
+        let _ = core.on_cqe(&mut eng, tag, slot, g, cqe.res);
+        Some(flags)
+    };
+    for path in 0..3 {
+        let Some(at) = staged_flags(path, LEN) else {
+            return;
+        };
+        assert_eq!(
+            at & crate::uring::sys::IOSQE_ASYNC,
+            crate::uring::sys::IOSQE_ASYNC,
+            "path {path}: a read of the threshold carries the flag"
+        );
+        let below = staged_flags(path, LEN + 1).expect("ring was available");
+        assert_eq!(
+            below & crate::uring::sys::IOSQE_ASYNC,
+            0,
+            "path {path}: a read under the threshold goes without it"
         );
     }
 }

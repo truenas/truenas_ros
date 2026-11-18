@@ -1,5 +1,11 @@
 use super::*;
 
+/// `IOSQE_ASYNC` for a read or write of `class` that moves `bytes`, if `classes` has `class` and `bytes >= min_bytes`,
+/// else 0.
+fn force_bit(classes: ForceAsync, min_bytes: usize, class: ForceAsync, bytes: usize) -> u8 {
+    if bytes < min_bytes { 0 } else { classes.sqe_bit(class) }
+}
+
 impl FsCore {
     // ---- submission (from drained injects) -----------------------------
 
@@ -163,13 +169,14 @@ impl FsCore {
         e.file = Some(file);
         let iov_ptr = e.iov.as_ptr() as u64;
         let iov_len = e.iov.len() as u32;
+        let bytes: usize = e.iov.iter().map(|v| v.iov_len).sum();
 
         let (opcode, class) = if tag == TAG_READV {
             (IORING_OP_READV, ForceAsync::READ)
         } else {
             (IORING_OP_WRITEV, ForceAsync::WRITE)
         };
-        let force = self.force_async.sqe_bit(class);
+        let force = force_bit(self.force_async, self.force_async_min, class, bytes);
         let ud = pack_raw(tag, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = opcode;
@@ -230,7 +237,7 @@ impl FsCore {
         // the CQE.
         let val = e.value.insert(buf);
         let room = val.spare_capacity_mut().as_mut_ptr() as u64;
-        let force = self.force_async.sqe_bit(ForceAsync::READ);
+        let force = force_bit(self.force_async, self.force_async_min, ForceAsync::READ, count);
         let ud = pack_raw(TAG_READ_SPARE, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = IORING_OP_READ;
@@ -290,7 +297,7 @@ impl FsCore {
         // until the CQE.
         let val = e.value.insert(buf);
         let at = val[range.clone()].as_ptr() as u64;
-        let force = self.force_async.sqe_bit(ForceAsync::WRITE);
+        let force = force_bit(self.force_async, self.force_async_min, ForceAsync::WRITE, range.len());
         let ud = pack_raw(TAG_WRITE_OWNED, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = IORING_OP_WRITE;
@@ -372,7 +379,7 @@ impl FsCore {
                 (IORING_OP_WRITEV, iov, count as u32)
             }
         };
-        let force = self.force_async.sqe_bit(ForceAsync::WRITE);
+        let force = force_bit(self.force_async, self.force_async_min, ForceAsync::WRITE, total);
         let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = opcode;
@@ -530,7 +537,7 @@ impl FsCore {
         // ownership).
         e.file = Some(Arc::clone(&file.fd));
         let iov_ptr = e.iov.as_ptr() as u64;
-        let force = self.force_async.sqe_bit(ForceAsync::READ);
+        let force = force_bit(self.force_async, self.force_async_min, ForceAsync::READ, want);
         let ud = pack_raw(TAG_READV, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = IORING_OP_READV;
