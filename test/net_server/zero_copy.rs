@@ -205,6 +205,60 @@ fn loopback_copies_so_later_sends_go_with_a_copy() {
     );
 }
 
+/// Several zero-copy sends owed at once, the state the ledger's window and held list exist for. Loopback reports a
+/// copy only at a notification, and with a peer that is not reading, every result comes before any notification.
+#[test]
+fn several_zero_copy_sends_are_owed_at_once_and_all_go_back() {
+    const N: usize = 6;
+    const EACH: usize = 8192;
+    let Some(mut server) = bare_server_with(zero_copy_config(Duration::from_secs(30))) else {
+        return;
+    };
+    let stats = server.stats_handle();
+    let (mut client, sock) = stalled_pair();
+    let push = server.adopt(sock, ()).expect("adopt");
+    let stop = server.shutdown_handle();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        // The payload lives here, so it outlives every `done` this thread waits for.
+        let part = vec![0x5au8; EACH];
+        // One at a time, each behind the previous send's result, so they do not coalesce into one gather.
+        for i in 0..N {
+            push.push_parts(vec![lend(&part, done_tx.clone())]);
+            wait_for(&stats, Duration::from_secs(5), "the next send's result", |s| {
+                s.send_ops as usize > i || s.zero_copy_fallbacks > 0
+            });
+        }
+        let owed = stats.snapshot();
+        let early = done_rx.try_recv().is_ok();
+        let mut got = vec![0u8; N * EACH];
+        let read = client.read_exact(&mut got);
+        let mut late = 0;
+        while late < N && done_rx.recv_timeout(Duration::from_secs(10)).is_ok() {
+            late += 1;
+        }
+        let intact = got.chunks(EACH).all(|c| c == &part[..]);
+        stop.shutdown();
+        (owed, early, read, intact, late)
+    });
+    server.serve_forever().expect("serve_forever");
+    let (owed, early, read, intact, late) = worker.join().expect("thread join");
+    read.expect("client read");
+    assert!(intact, "the replies arrive unchanged");
+    if zero_copy_refused(&owed) {
+        return;
+    }
+    assert_eq!(
+        (owed.zero_copy_sends as usize, owed.zero_copy_bytes as usize),
+        (N, N * EACH),
+        "not every send went zero-copy while the earlier notifications were owed: {owed:?}"
+    );
+    assert_eq!(owed.zero_copy_copied, 0, "a notification arrived early: {owed:?}");
+    assert!(!early, "bytes went back while the kernel could still read them");
+    assert_eq!(late, N, "not every lent reply went back once the peer acknowledged");
+}
+
 #[test]
 fn a_closed_connection_keeps_its_slot_until_the_peer_acknowledges() {
     let Some(mut server) = bare_server_with(zero_copy_config(Duration::from_secs(10))) else {
@@ -291,28 +345,41 @@ fn a_closed_connection_whose_peer_never_reads_is_reset_after_the_linger() {
 #[test]
 fn a_stop_with_a_stalled_peer_resets_it_after_the_linger() {
     let linger = Duration::from_millis(200);
-    let Some(mut server) = bare_server_with(zero_copy_config(linger)) else {
-        return;
-    };
-    let stats = server.stats_handle();
-    let (client, sock) = stalled_pair();
-    let push = server.adopt(sock, ()).expect("adopt");
-    let payload = payload();
     let (done_tx, done_rx) = mpsc::channel();
-    push.push_parts(vec![lend(&payload, done_tx)]);
-    let stop = server.shutdown_handle();
-    let worker = thread::spawn(move || {
-        let _stop = ShutdownOnDrop(stop.clone());
-        let at_result = sent(&stats);
-        let asked = Instant::now();
-        stop.shutdown();
-        (at_result, asked, client)
+    let (out_tx, out_rx) = mpsc::channel();
+    // The server runs on a thread of its own, so a drain that waits for ever fails the test instead of hanging the
+    // run. A server cannot move between threads, so the thread makes it.
+    thread::spawn(move || {
+        let Some(mut server) = bare_server_with(zero_copy_config(linger)) else {
+            let _ = out_tx.send(None);
+            return;
+        };
+        let stats = server.stats_handle();
+        let (client, sock) = stalled_pair();
+        let push = server.adopt(sock, ()).expect("adopt");
+        let payload = payload();
+        push.push_parts(vec![lend(&payload, done_tx)]);
+        let stop = server.shutdown_handle();
+        let worker = thread::spawn(move || {
+            let _stop = ShutdownOnDrop(stop.clone());
+            let at_result = sent(&stats);
+            let asked = Instant::now();
+            stop.shutdown();
+            (at_result, asked, client)
+        });
+        server.serve_forever().expect("serve_forever");
+        let returned = Instant::now();
+        let (at_result, asked, _client) = worker.join().expect("thread join");
+        let stats = server.stats_handle().snapshot();
+        drop(server);
+        let _ = out_tx.send(Some((at_result, asked, returned, stats)));
     });
-    server.serve_forever().expect("serve_forever");
-    let returned = Instant::now();
-    let (at_result, asked, _client) = worker.join().expect("thread join");
-    let stats = server.stats_handle().snapshot();
-    drop(server);
+    let (at_result, asked, returned, stats) = match out_rx.recv_timeout(linger + Duration::from_secs(30)) {
+        Ok(Some(out)) => out,
+        Ok(None) => return,
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("the stop never returned"),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the server thread failed"),
+    };
     if zero_copy_refused(&at_result) {
         return;
     }
@@ -353,27 +420,46 @@ fn a_socket_with_a_ulp_sends_with_a_copy() {
         );
         return;
     }
+    // A plain socket on the same ring must send zero-copy. Otherwise every refusal counts the same, and a host that
+    // refuses them all would pass this test with the ULP doing nothing.
+    let (mut control_client, control_sock) = accepted_elsewhere();
+    let control_push = server.adopt(control_sock, ()).expect("adopt the control");
     let push = server.adopt(sock, ()).expect("adopt");
     let payload = vec![9u8; 64 * 1024];
     let (done_tx, done_rx) = mpsc::channel();
+    let (control_tx, control_rx) = mpsc::channel();
+    control_push.push_parts(vec![lend(&payload, control_tx)]);
     push.push_parts(vec![lend(&payload, done_tx)]);
     let stop = server.shutdown_handle();
     let want = payload.len();
     let worker = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
+        let mut control_got = vec![0u8; want];
+        let control_read = control_client.read_exact(&mut control_got);
+        let control_done = control_rx.recv_timeout(Duration::from_secs(5)).is_ok();
         let mut got = vec![0u8; want];
         let read = client.read_exact(&mut got);
         let done = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
         stop.shutdown();
-        (read, got, done)
+        (control_read, control_got, control_done, read, got, done)
     });
     server.serve_forever().expect("serve_forever");
-    let (read, got, done) = worker.join().expect("thread join");
+    let (control_read, control_got, control_done, read, got, done) = worker.join().expect("thread join");
+    control_read.expect("control read");
+    assert!(control_got == payload, "the control's reply arrives unchanged");
+    assert!(control_done, "the control's bytes never went back");
     read.expect("client read");
     assert!(got == payload, "the reply arrives unchanged");
     assert!(done);
     let s = stats.snapshot();
-    assert_eq!((s.zero_copy_fallbacks, s.zero_copy_sends), (1, 0), "{s:?}");
+    if s.zero_copy_sends == 0 {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_ZERO_COPY").is_none(),
+            "TRUENAS_ROS_REQUIRE_ZERO_COPY set but the kernel refused the control's zero-copy send: {s:?}"
+        );
+        return;
+    }
+    assert_eq!((s.zero_copy_sends, s.zero_copy_fallbacks), (1, 1), "{s:?}");
 }
 
 #[test]
@@ -430,7 +516,22 @@ fn zero_copy_settings_are_validated() {
         ),
         (
             SendZeroCopy {
+                threshold: usize::MAX,
+                max_pinned: usize::MAX,
+                ..SendZeroCopy::default()
+            },
+            "threshold",
+        ),
+        (
+            SendZeroCopy {
                 linger: Duration::from_micros(500),
+                ..SendZeroCopy::default()
+            },
+            "linger",
+        ),
+        (
+            SendZeroCopy {
+                linger: Duration::from_millis(i32::MAX as u64 + 1),
                 ..SendZeroCopy::default()
             },
             "linger",
@@ -455,8 +556,69 @@ fn zero_copy_refuses_a_detach_handler() {
         return;
     };
     server.set_detach_handler(|_ctx, _detached| {});
+    // Asked to stop before it starts, so a server that does not refuse returns `Ok` at once instead of serving for
+    // ever.
+    server.shutdown_handle().shutdown();
     match server.serve_forever() {
         Err(Error::Validation(m)) => assert!(m.contains("send_zero_copy"), "{m}"),
         other => panic!("serve_forever: {other:?}"),
     }
+}
+
+/// The ring's pinned total comes back at every notification. The cap holds two payloads, and more than two go out,
+/// each acknowledged before the next, so a total that drifted fills the cap and later sends copy. Admission at a full
+/// cap counts neither a send nor a fallback, while a kernel refusal counts a fallback, so `zero_copy_sends +
+/// zero_copy_fallbacks` falls short only when the cap drifted.
+#[test]
+fn the_pinned_total_comes_back_at_every_notification() {
+    const CONNS: u64 = 6;
+    let payload = payload();
+    let cfg = ServerConfig {
+        send_zero_copy: Some(SendZeroCopy {
+            threshold: 4096,
+            max_pinned: 2 * payload.len(),
+            linger: Duration::from_secs(10),
+        }),
+        ..ServerConfig::default()
+    };
+    let Some(mut server) = bare_server_with(cfg) else {
+        return;
+    };
+    let stats = server.stats_handle();
+    let mut clients = Vec::new();
+    let mut pushes = Vec::new();
+    for _ in 0..CONNS {
+        let (client, sock) = stalled_pair();
+        pushes.push(server.adopt(sock, ()).expect("adopt"));
+        clients.push(client);
+    }
+    let stop = server.shutdown_handle();
+    let want = payload.len();
+    let worker = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        for (i, (push, mut client)) in pushes.into_iter().zip(clients).enumerate() {
+            let (done_tx, done_rx) = mpsc::channel();
+            push.push_parts(vec![lend(&payload, done_tx)]);
+            let mut got = vec![0u8; want];
+            client.read_exact(&mut got).expect("client read");
+            assert!(got == payload, "connection {i}: the reply arrives unchanged");
+            // Only the notification runs `done`, so the credit has happened by here.
+            done_rx.recv_timeout(Duration::from_secs(10)).expect("done");
+        }
+        let s = stats.snapshot();
+        stop.shutdown();
+        s
+    });
+    server.serve_forever().expect("serve_forever");
+    let s = worker.join().expect("thread join");
+    assert_eq!(
+        s.zero_copy_sends + s.zero_copy_fallbacks,
+        CONNS,
+        "a send neither went zero-copy nor was refused, so admission found the cap full: {s:?}"
+    );
+    assert_eq!(
+        s.zero_copy_bytes,
+        s.zero_copy_sends * want as u64,
+        "the bytes charged do not account for the sends that went: {s:?}"
+    );
 }

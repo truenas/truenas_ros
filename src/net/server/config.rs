@@ -249,16 +249,20 @@ pub struct ServerConfig {
     /// armed are gathered, so a lone reply is never delayed, and `send_timeout` bounds the whole op. Default 8, the
     /// kernel's inline iovec fast path (`UIO_FASTIOV`). `1` disables coalescing, and the cap is 1024 (`UIO_MAXIOV`).
     pub max_send_coalesce: usize,
-    /// Send gathers of at least [`SendZeroCopy::threshold`] bytes without the kernel's copy. `None`, the default, copies
-    /// every send.
+    /// Send gathers of at least [`SendZeroCopy::threshold`] bytes without the kernel's copy. `None`, the default,
+    /// copies every send.
     ///
     /// The kernel then reads the bytes from this process until the peer acknowledges them. So a [`Lent`] runs `done`,
     /// and recycled storage goes home and off [`held_cap`](Self::held_cap)'s count, only at the send's notification.
     ///
-    /// Only TCP without kTLS qualifies, and never a file body. A connection goes back to copying when the kernel copies
-    /// anyway (loopback, a device without scatter-gather, a packet tap) or refuses a send. A ring created without
-    /// `CAP_IPC_LOCK` is charged the pinned pages against `RLIMIT_MEMLOCK` (`io_notif_account_mem`). A server with
+    /// Only TCP without kTLS qualifies, and never a file body. A connection copies for the rest of its life once the
+    /// kernel copies anyway (loopback, a device without scatter-gather, a packet tap) or refuses a send. A server with
     /// zero-copy cannot detach connections ([`Response::Detach`]).
+    ///
+    /// A ring created without `CAP_IPC_LOCK` is charged the pinned pages against `RLIMIT_MEMLOCK`, and a send past
+    /// the limit fails with `ENOMEM` (`io_notif_account_mem`, `io_uring/notif.h`). The charge goes on the user's
+    /// `locked_vm`, which all rings of that user share, their own memory included (`__io_account_mem`,
+    /// `io_uring/rsrc.c`). A ring created as root is not charged.
     pub send_zero_copy: Option<SendZeroCopy>,
     /// Read a message body at least this large into storage of its own, claimed from the ring's body pool, instead of
     /// the connection's buffer, so [`Body::take`] moves it with no copy. It applies when the body still has bytes to
@@ -520,8 +524,11 @@ impl ServerConfig {
             )));
         }
         if let Some(zc) = self.send_zero_copy {
-            if zc.threshold == 0 {
-                return Err(Error::Validation("send_zero_copy.threshold must be non-zero".into()));
+            // `usize::MAX` is the core config's marker for zero-copy off (`CoreConfig::zero_copy`).
+            if zc.threshold == 0 || zc.threshold == usize::MAX {
+                return Err(Error::Validation(
+                    "send_zero_copy.threshold must be in 1..usize::MAX".into(),
+                ));
             }
             if zc.max_pinned < zc.threshold {
                 return Err(Error::Validation(
@@ -595,13 +602,13 @@ pub struct SendZeroCopy {
     /// The smallest gather, in bytes, sent without a copy. Below about 10 KB the copy is cheaper
     /// (`Documentation/networking/msg_zerocopy.rst`). Default 64 KiB.
     pub threshold: usize,
-    /// The most bytes of one ring's zero-copy sends that may wait for acknowledgement at once. Past it, sends copy. The
-    /// kernel's TCP memory limits do not count these bytes (`__zerocopy_sg_from_iter`, `net/core/datagram.c`).
-    /// Default 64 MiB.
+    /// The most bytes of one ring's zero-copy sends that may wait for acknowledgement at once, counted from when the
+    /// ring takes a send. Past it, sends copy. Default 64 MiB. Each socket's send buffer bounds its own pinned bytes
+    /// too, since the kernel counts them in `sk_wmem_queued` (`__zerocopy_sg_from_iter`, `net/core/datagram.c`).
     pub max_pinned: usize,
-    /// How long a closing connection or a stopping server waits for a peer to acknowledge zero-copy bytes. A closing
-    /// connection's socket gets it as `TCP_USER_TIMEOUT`, so the kernel resets a peer that never acknowledges. A
-    /// stopping server resets such peers itself. Default 1 s.
+    /// How long a closing connection or a stopping server waits for a peer to acknowledge zero-copy bytes. A stopping
+    /// server resets such peers itself. A closing connection's socket gets it as `TCP_USER_TIMEOUT`, which TCP
+    /// checks only when a retransmit or probe timer fires, so the reset can come a timer interval later. Default 1 s.
     pub linger: Duration,
 }
 
@@ -843,5 +850,28 @@ mod tests {
         ] {
             assert!(fine.validate(&a).is_ok(), "refused: {fine:?}");
         }
+    }
+
+    /// Every `SendZeroCopy` field reaches the reactor's config, and `None` reaches it as the off sentinel. The tests of
+    /// the linger bound their waits loosely, so they do not see a wrong linger.
+    #[test]
+    fn send_zero_copy_reaches_the_core_config() {
+        let off = ServerConfig::default().to_core();
+        assert_eq!(off.zc_threshold, usize::MAX, "off must read as the off sentinel");
+        assert!(!off.zero_copy());
+        let on = ServerConfig {
+            send_zero_copy: Some(SendZeroCopy {
+                threshold: 4096,
+                max_pinned: 1 << 20,
+                linger: Duration::from_millis(200),
+            }),
+            ..ServerConfig::default()
+        }
+        .to_core();
+        assert_eq!(
+            (on.zc_threshold, on.zc_max_pinned, on.zc_linger),
+            (4096, 1 << 20, Duration::from_millis(200))
+        );
+        assert!(on.zero_copy());
     }
 }

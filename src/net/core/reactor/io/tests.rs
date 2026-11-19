@@ -532,6 +532,19 @@ fn zero_copy_is_staged_only_above_the_threshold_on_plain_tcp() {
         .unwrap(),
         "past max_pinned",
     );
+    // The reply is queued before the tail, since a PDU enqueued behind an active one is diverted into it and would
+    // leave nothing armed - which would read as a copy for the threshold's reason rather than the tail's.
+    #[cfg(feature = "uring-fs")]
+    copies(
+        first_send(tcp_peer(), 1, |r| {
+            reply(r);
+            let fd: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").expect("open").into();
+            let file = crate::uring_fs::File::new(crate::sync::Arc::new(fd));
+            r.table.conn_mut(0).install_file_tail(file, 0, 20);
+        })
+        .unwrap(),
+        "a file body in flight",
+    );
     let mut off = reactor_with_one_conn(None, None).unwrap();
     reply(&mut off);
     off.submit_send(0, 0).unwrap();
@@ -624,13 +637,97 @@ fn a_closing_connection_holds_its_close_until_notified() {
 
     // The setsockopt reaps first: the notification is still owed, so still no CLOSE.
     let before = r.engine.staged_sqes().len();
-    r.on_zc_linger(0).unwrap();
+    r.on_zc_linger(0, 0).unwrap();
     assert_eq!(r.engine.staged_sqes().len(), before);
     // The notification lets it go.
     r.on_send_zc_notif(0, 0, 0).unwrap();
     let close = r.engine.staged_sqes().pop().unwrap();
     assert_eq!(close.opcode, IORING_OP_CLOSE);
     assert_eq!(close.file_index, 1);
+}
+
+/// The reset count reports resets that went out, not resets the ring refused.
+#[cfg(feature = "net-server")]
+#[test]
+fn a_reset_the_ring_refuses_is_not_counted() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(mut r) = one_zero_copy_send_owed() else {
+        return;
+    };
+    assert_eq!(r.stats.zero_copy_resets.load(Relaxed), 0);
+    r.engine.stage_seam.refuse_next = true;
+    let refused = r.reset_owing();
+    assert!(matches!(refused, Err(crate::errno::Errno::EBUSY)), "{refused:?}");
+    assert_eq!(
+        r.stats.zero_copy_resets.load(Relaxed),
+        0,
+        "a reset the kernel never saw was counted"
+    );
+    r.reset_owing().expect("the reset stages");
+    assert_eq!(r.stats.zero_copy_resets.load(Relaxed), 1);
+    assert_eq!(
+        r.engine.staged_sqes().pop().expect("an SQE").user_data,
+        pack(Op::ZcReset, 0, 0)
+    );
+}
+
+/// A zero-copy reactor whose connection has two 100-byte zero-copy sends waiting for notifications, and the
+/// `user_data` of the second.
+#[cfg(feature = "net-server")]
+fn two_zero_copy_sends_waiting_for_notifications() -> Option<(Reactor<()>, u64)> {
+    let mut r = one_zero_copy_send_owed()?;
+    r.table.conn_mut(0).enqueue_reply(vec![8; 100]);
+    r.submit_send(0, 0).expect("stage the second send");
+    let second = r.engine.staged_sqes().pop().expect("the second send's SQE").user_data;
+    r.on_send_zc_complete(0, 1, 100, IORING_CQE_F_MORE)
+        .expect("the second result");
+    assert_eq!((r.zc_pinned, r.zc_owed), (200, 2));
+    Some((r, second))
+}
+
+/// A held `CLOSE` waits for the last notification and for the `TCP_USER_TIMEOUT` setsockopt, in either order.
+#[cfg(feature = "net-server")]
+#[test]
+fn a_held_close_waits_for_every_notification_and_for_the_linger() {
+    let Some((mut r, second)) = two_zero_copy_sends_waiting_for_notifications() else {
+        return;
+    };
+    // Each send carries its own sequence, or the ledger credits one notification against another send's bytes.
+    assert_eq!(
+        second,
+        pack(Op::SendZc, 0, 1),
+        "the second zero-copy send did not carry the next sequence"
+    );
+
+    // The setsockopt reaps first, then one of the two notifications: still one send owed, so still no CLOSE.
+    r.close_conn(0, 0, CloseReason::PeerClosed).expect("close");
+    r.on_zc_linger(0, 0).expect("the setsockopt");
+    let before = r.engine.staged_sqes().len();
+    r.on_send_zc_notif(0, 0, 0).expect("the first notification");
+    let staged = r.engine.staged_sqes().split_off(before);
+    assert!(
+        staged.iter().all(|s| s.opcode != IORING_OP_CLOSE),
+        "a CLOSE went out while a second send was still owed"
+    );
+    r.on_send_zc_notif(0, 1, 0).expect("the second notification");
+    assert_eq!(r.engine.staged_sqes().pop().expect("the CLOSE").opcode, IORING_OP_CLOSE);
+
+    // The other order: both notifications arrive while the setsockopt is still in flight. Nothing is owed, but the
+    // held CLOSE must come after the command that is reading the ledger's linger value.
+    let Some((mut r, _)) = two_zero_copy_sends_waiting_for_notifications() else {
+        return;
+    };
+    r.close_conn(0, 0, CloseReason::PeerClosed).expect("close");
+    let before = r.engine.staged_sqes().len();
+    r.on_send_zc_notif(0, 0, 0).expect("the first notification");
+    r.on_send_zc_notif(0, 1, 0).expect("the second notification");
+    let staged = r.engine.staged_sqes().split_off(before);
+    assert!(
+        staged.iter().all(|s| s.opcode != IORING_OP_CLOSE),
+        "a CLOSE went out with the TCP_USER_TIMEOUT setsockopt still in flight"
+    );
+    r.on_zc_linger(0, 0).expect("the setsockopt");
+    assert_eq!(r.engine.staged_sqes().pop().expect("the CLOSE").opcode, IORING_OP_CLOSE);
 }
 
 #[cfg(feature = "net-server")]
@@ -656,4 +753,107 @@ fn a_stop_resets_only_the_sockets_that_still_owe() {
         before,
         "a socket that owes nothing was reset"
     );
+}
+
+/// A `TCP_USER_TIMEOUT` completion for an incarnation the slot has left reaches nothing, and the completion of the
+/// current one releases the held `CLOSE`.
+#[cfg(feature = "net-server")]
+#[test]
+fn a_zero_copy_linger_for_a_past_incarnation_reaches_nothing() {
+    let Some(mut r) = one_zero_copy_send_owed() else {
+        return;
+    };
+    // The teardown holds the CLOSE and sets TCP_USER_TIMEOUT, so a linger is in flight on this incarnation.
+    r.close_conn(0, 0, CloseReason::PeerClosed).expect("hold the close");
+    assert!(r.table.conn(0).zc.as_deref().expect("the ledger").linger_inflight);
+    let stale = r.table.generation_low(0);
+
+    // The slot recycles into the state a stale linger would walk into a CLOSE: a held CLOSE, its own linger in
+    // flight, and nothing owed.
+    r.table.free(0);
+    r.table.install(0, Connection::new(tcp_peer(), (), 1));
+    let generation = r.table.generation_low(0);
+    assert_ne!(generation, stale, "the recycle must bump the generation");
+    {
+        let mut zc = Box::new(crate::net::core::conn::ZcLedger::new(1000));
+        zc.close_held = true;
+        zc.linger_inflight = true;
+        r.table.conn_mut(0).zc = Some(zc);
+    }
+
+    let before = r.engine.staged_sqes().len();
+    r.on_zc_linger(0, stale).expect("the stale linger");
+    assert_eq!(
+        r.engine.staged_sqes().len(),
+        before,
+        "a stale linger released the new connection's held CLOSE"
+    );
+    {
+        let zc = r.table.conn(0).zc.as_deref().expect("the ledger");
+        assert!(
+            zc.linger_inflight,
+            "a stale linger cleared a setsockopt still in flight"
+        );
+        assert!(zc.close_held, "a stale linger took the hold off the CLOSE");
+    }
+
+    // The control: this incarnation's own completion means the kernel has read the value, so the CLOSE may go.
+    r.on_zc_linger(0, generation).expect("this incarnation's linger");
+    {
+        let zc = r.table.conn(0).zc.as_deref().expect("the ledger");
+        assert!(!zc.linger_inflight);
+        assert!(!zc.close_held, "the hold is released as the CLOSE is staged");
+    }
+    let close = r.engine.staged_sqes().pop().expect("the CLOSE");
+    assert_eq!(close.opcode, IORING_OP_CLOSE);
+    assert_eq!(close.file_index, 1);
+}
+
+/// A zero-copy send the ring refuses owes nothing, since no completion will ever name it.
+#[cfg(feature = "net-server")]
+#[test]
+fn a_zero_copy_send_the_ring_refuses_owes_nothing() {
+    let Some(mut r) = zero_copy_reactor(tcp_peer(), 1) else {
+        return;
+    };
+    r.table.conn_mut(0).enqueue_reply(vec![7; 100]);
+    r.engine.stage_seam.refuse_next = true;
+    assert_eq!(r.submit_send(0, 0), Err(crate::errno::Errno::EBUSY));
+    assert_eq!((r.zc_owed, r.zc_pinned, r.engine.inflight), (0, 0, 0));
+    let zc = r.table.conn(0).zc.as_deref().expect("admission made the ledger");
+    assert!(!zc.owes());
+    assert_eq!(zc.admit(), Some(0), "the refused sequence is free again");
+}
+
+/// The cap counts a send's armed bytes once the ring takes it, so the next admission in the same loop sees them.
+#[cfg(feature = "net-server")]
+#[test]
+fn the_cap_counts_a_staged_zero_copy_send_before_its_result() {
+    let Some(mut r) = zero_copy_reactor(tcp_peer(), 1) else {
+        return;
+    };
+    r.cfg.zc_max_pinned = 150;
+    r.table.install(1, Connection::new(tcp_peer(), (), 1));
+    for slot in 0..2 {
+        r.table.conn_mut(slot).enqueue_reply(vec![7; 100]);
+        r.submit_send(slot, 0).expect("stage the send");
+    }
+    let ops: Vec<u8> = r.engine.staged_sqes().iter().map(|s| s.opcode).collect();
+    assert_eq!(
+        ops,
+        [IORING_OP_SEND_ZC, IORING_OP_SEND],
+        "the second send passed the cap"
+    );
+    assert_eq!((r.zc_pinned, r.zc_owed), (100, 1));
+}
+
+/// The stop drain starts the linger once only notifications are left, and also when the owed count is too high, so
+/// that a count gone wrong ends in the reset rather than in a wait with no deadline.
+#[cfg(feature = "net-server")]
+#[test]
+fn the_stop_drain_lingers_when_the_owed_count_is_too_high() {
+    use crate::net::core::reactor::zero_copy::only_notifications_left;
+    assert!(only_notifications_left(1, 1));
+    assert!(only_notifications_left(1, 2));
+    assert!(!only_notifications_left(2, 1));
 }

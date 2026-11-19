@@ -10,6 +10,12 @@ use crate::net::core::protocol::ClientAddr;
 use crate::uring::sys::*;
 use std::time::Instant;
 
+/// Whether only notifications are left of the ops in flight: every one is an owed send. `<=`, so that a count gone
+/// wrong still ends in the reset instead of a wait with no deadline.
+pub(super) fn only_notifications_left(inflight: u64, owed: u64) -> bool {
+    inflight <= owed
+}
+
 /// A `CONNECT` to `AF_UNSPEC` disconnects the socket, and TCP then resets the peer and drops its send queues
 /// (`tcp_disconnect`, `net/ipv4/tcp.c`). The kernel copies the address at prep.
 static UNSPEC: libc::sockaddr = libc::sockaddr {
@@ -19,7 +25,8 @@ static UNSPEC: libc::sockaddr = libc::sockaddr {
 
 impl<U> Reactor<U> {
     /// The sequence of a zero-copy send for the gather just armed on `slot`, or `None` to copy. Called only when the
-    /// gather reaches the threshold.
+    /// gather reaches the threshold. Nothing is counted until the ring takes the SQE
+    /// ([`commit_zero_copy`](Self::commit_zero_copy)), since staging can fail with `EBUSY`.
     #[cold]
     pub(crate) fn admit_zero_copy(&mut self, slot: u32, armed: usize) -> Option<u32> {
         if self.zc_pinned.saturating_add(armed) > self.cfg.zc_max_pinned {
@@ -27,15 +34,28 @@ impl<U> Reactor<U> {
         }
         let linger_ms = u32::try_from(self.cfg.zc_linger.as_millis()).unwrap_or(u32::MAX);
         let conn = self.table.conn_mut(slot);
-        // A ULP such as kTLS clears `SOCK_SUPPORT_ZC` (`net/ipv4/tcp_ulp.c`), and AF_UNIX never has it.
+        // A ULP such as kTLS clears `SOCK_SUPPORT_ZC` (`__tcp_set_ulp`, `net/ipv4/tcp_ulp.c`), a BPF sockmap does too
+        // (`sock_replace_proto`), and AF_UNIX never has it. A socket this misses takes the `EOPNOTSUPP` fallback.
         if !matches!(conn.peer, ClientAddr::Inet(_)) || conn.is_ktls() || conn.file_body_in_flight() {
             return None;
         }
-        let zc = conn.zc.get_or_insert_with(|| Box::new(ZcLedger::new(linger_ms)));
-        let seq = zc.admit()?;
-        zc.staged(seq);
+        conn.zc
+            .get_or_insert_with(|| Box::new(ZcLedger::new(linger_ms)))
+            .admit()
+    }
+
+    /// Counts zero-copy send `seq`, which the ring took for `slot`. Its armed bytes count against `max_pinned` from now
+    /// on, so every later admission in this loop sees them.
+    pub(crate) fn commit_zero_copy(&mut self, slot: u32, seq: u32, armed: usize) {
+        let zc = self
+            .table
+            .conn_mut(slot)
+            .zc
+            .as_deref_mut()
+            .expect("admission made the ledger");
+        zc.staged(seq, armed);
         self.zc_owed += 1;
-        Some(seq)
+        self.zc_pinned += armed;
     }
 
     /// The result of zero-copy send `seq`. Its bytes stay pinned until the notification, if `IORING_CQE_F_MORE` says
@@ -46,14 +66,14 @@ impl<U> Reactor<U> {
             debug_assert!(false, "a zero-copy result names slot {slot}, which has no ledger");
             return Ok(SendStep::Done);
         };
-        let pinned = zc.result(seq, res, more);
-        if !more {
+        let (was_owed, staged, moved) = zc.result(seq, res, more);
+        if was_owed && !more {
             self.zc_owed -= 1;
         }
-        self.zc_pinned += pinned;
-        if pinned > 0 {
+        self.zc_pinned = self.zc_pinned - staged + moved;
+        if moved > 0 {
             stat!(self, zero_copy_sends);
-            stat!(self, zero_copy_bytes, pinned as u64);
+            stat!(self, zero_copy_bytes, moved as u64);
         }
         let generation = self.table.generation_low(slot);
         if matches!(-res, libc::EOPNOTSUPP | libc::ENOMEM | libc::EINVAL) {
@@ -102,8 +122,12 @@ impl<U> Reactor<U> {
     }
 
     /// The `TCP_USER_TIMEOUT` setsockopt completed. Its result does not matter, since the `CLOSE` still waits for the
-    /// notifications.
-    pub(crate) fn on_zc_linger(&mut self, slot: u32) -> errno::Result<()> {
+    /// notifications. A completion of a past incarnation must not touch the slot: it would release the new
+    /// connection's `CLOSE` while the kernel may still read that connection's `optval`.
+    pub(crate) fn on_zc_linger(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
+        if !self.table.slot_matches_cqe(slot, generation) {
+            return Ok(());
+        }
         let Some(zc) = self.table.get_conn_mut(slot).and_then(|c| c.zc.as_deref_mut()) else {
             return Ok(());
         };
@@ -119,8 +143,9 @@ impl<U> Reactor<U> {
 
     /// Whether the `CLOSE` of `slot` must wait for zero-copy notifications. Until they come, the kernel may read the
     /// pages, and the slot and its fd index must stay taken, since an accept takes any free index. The first hold sets
-    /// `TCP_USER_TIMEOUT`, so the kernel resets a peer that never acknowledges (`tcp_probe_timer`,
-    /// `net/ipv4/tcp_timer.c`).
+    /// `TCP_USER_TIMEOUT`, so the kernel resets a peer that never acknowledges. TCP checks the timeout only when a
+    /// retransmit or zero-window probe timer fires (`tcp_write_timeout`, `tcp_probe_timer`, `net/ipv4/tcp_timer.c`),
+    /// so the reset can come a timer interval after the linger.
     pub(super) fn hold_close(&mut self, slot: u32, generation: u32) -> errno::Result<bool> {
         let Some(zc) = self.table.get_conn_mut(slot).and_then(|c| c.zc.as_deref_mut()) else {
             return Ok(false);
@@ -166,7 +191,7 @@ impl<U> Reactor<U> {
         let mut reset = false;
         while self.engine.inflight > 0 {
             let mut wait = None;
-            if !reset && self.engine.inflight == self.zc_owed {
+            if !reset && only_notifications_left(self.engine.inflight, self.zc_owed) {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     self.reset_owing()?;
@@ -200,10 +225,11 @@ impl<U> Reactor<U> {
                     self.zc_pinned -= moved;
                 } else {
                     let more = cqe.flags & IORING_CQE_F_MORE != 0;
-                    self.zc_pinned += zc.result(seq, cqe.res, more);
-                    if !more {
+                    let (was_owed, staged, moved) = zc.result(seq, cqe.res, more);
+                    if was_owed && !more {
                         self.zc_owed -= 1;
                     }
+                    self.zc_pinned = self.zc_pinned - staged + moved;
                 }
             }
             Some(Op::ZcLinger) => {
@@ -227,7 +253,6 @@ impl<U> Reactor<U> {
             if !owes {
                 continue;
             }
-            stat!(self, zero_copy_resets);
             let generation = self.table.generation_low(slot);
             self.stage(pack(Op::ZcReset, slot, generation), |sqe| {
                 sqe.opcode = IORING_OP_CONNECT;
@@ -236,6 +261,8 @@ impl<U> Reactor<U> {
                 sqe.addr = std::ptr::addr_of!(UNSPEC) as u64;
                 sqe.off_addr2 = size_of::<libc::sockaddr>() as u64;
             })?;
+            // Counted after the stage, which can fail, so the count reports only resets that went out.
+            stat!(self, zero_copy_resets);
         }
         Ok(())
     }

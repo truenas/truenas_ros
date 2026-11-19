@@ -1026,8 +1026,8 @@ fn zc_conn() -> Box<Connection<()>> {
 fn zc_send(c: &mut Connection<()>, res: usize) -> u32 {
     let zc = c.zc.as_deref_mut().unwrap();
     let seq = zc.admit().expect("a free window slot");
-    zc.staged(seq);
-    assert_eq!(zc.result(seq, res as i32, true), res);
+    zc.staged(seq, res);
+    assert_eq!(zc.result(seq, res as i32, true), (true, res, res));
     let _ = c.advance_sent(res, Some(seq));
     seq
 }
@@ -1079,6 +1079,20 @@ fn a_front_item_split_across_sends_waits_for_its_newest_carrier() {
     assert_eq!(done.ran(), 0, "the first send still reads the head of the item");
     zc_notify(&mut c, first);
     assert_eq!(done.ran(), 1);
+
+    // The same split with the carriers notified oldest first, which is the order that tells the newest carrier from
+    // the oldest: the item is held under the newer send, and that one is still owed.
+    let done = Done::default();
+    let mut c = zc_conn();
+    c.enqueue_push_buf(done.lent(0, &[1; 100]), true);
+    assert_eq!(c.arm_send(), 100);
+    let first = zc_send(&mut c, 40);
+    assert_eq!(c.arm_send(), 60);
+    let second = zc_send(&mut c, 60);
+    zc_notify(&mut c, first);
+    assert_eq!(done.ran(), 0, "the item went back while its newest carrier was owed");
+    zc_notify(&mut c, second);
+    assert_eq!(done.ran(), 1);
 }
 
 #[cfg(feature = "net-server")]
@@ -1099,6 +1113,28 @@ fn notifications_in_any_order_release_oldest_first() {
     zc_notify(&mut c, a);
     assert_eq!(done.ran(), 0b11);
     assert!(!c.zc.as_deref().unwrap().owes());
+
+    // Three sends, and the oldest notified first: with two, `oldest_owed` is always the held front's own sequence or
+    // `None`, so a wrong rotation or scan cannot show.
+    let done = Done::default();
+    let mut c = zc_conn();
+    c.enqueue_push_buf(done.lent(0, &[1; 10]), true);
+    assert_eq!(c.arm_send(), 10);
+    let a = zc_send(&mut c, 10);
+    c.enqueue_push_buf(done.lent(1, &[2; 20]), true);
+    assert_eq!(c.arm_send(), 20);
+    let b = zc_send(&mut c, 20);
+    c.enqueue_push_buf(done.lent(2, &[3; 30]), true);
+    assert_eq!(c.arm_send(), 30);
+    let d = zc_send(&mut c, 30);
+    zc_notify(&mut c, a);
+    assert_eq!(done.ran(), 0b001, "the oldest notification kept its own item");
+    assert_eq!(c.zc.as_deref().unwrap().held_len(), 2);
+    zc_notify(&mut c, d);
+    assert_eq!(done.ran(), 0b001, "the newest notification freed an older send's bytes");
+    zc_notify(&mut c, b);
+    assert_eq!(done.ran(), 0b111);
+    assert!(!c.zc.as_deref().unwrap().owes());
 }
 
 #[cfg(feature = "net-server")]
@@ -1108,10 +1144,15 @@ fn a_zero_copy_result_without_more_owes_nothing() {
     let mut c = zc_conn();
     let zc = c.zc.as_deref_mut().unwrap();
     let seq = zc.admit().unwrap();
-    zc.staged(seq);
+    zc.staged(seq, 100);
     assert!(zc.owes());
-    assert_eq!(zc.result(seq, -libc::ENOMEM, false), 0);
+    assert_eq!(zc.result(seq, -libc::ENOMEM, false), (true, 100, 0));
     assert!(!zc.owes(), "a notification that will never come is still owed");
+    assert_eq!(
+        zc.result(seq, -libc::ENOMEM, false),
+        (false, 0, 0),
+        "a result for a send not owed counts"
+    );
 }
 
 #[cfg(feature = "net-server")]
@@ -1121,8 +1162,8 @@ fn the_zero_copy_window_refuses_a_sequence_still_owed() {
     let zc = c.zc.as_deref_mut().unwrap();
     for _ in 0..ZC_WINDOW {
         let seq = zc.admit().expect("a free window slot");
-        zc.staged(seq);
-        assert_eq!(zc.result(seq, 1, true), 1);
+        zc.staged(seq, 1);
+        assert_eq!(zc.result(seq, 1, true), (true, 1, 1));
     }
     // The next sequence has the bit of the oldest one, which is still owed.
     assert_eq!(zc.admit(), None);
@@ -1139,14 +1180,178 @@ fn a_copy_report_turns_zero_copy_off_only_after_bytes_moved() {
     let zc = c.zc.as_deref_mut().unwrap();
     // A send that moved nothing reports a copy too (`io_notif_tw_complete`, `io_uring/notif.c`).
     let idle = zc.admit().unwrap();
-    zc.staged(idle);
-    assert_eq!(zc.result(idle, -libc::ECANCELED, true), 0);
+    zc.staged(idle, 4096);
+    assert_eq!(zc.result(idle, -libc::ECANCELED, true), (true, 4096, 0));
     assert_eq!(zc.notified(idle, true), (true, 0, false));
     assert!(!zc.off, "a send that moved nothing turned zero-copy off");
     let moved = zc.admit().unwrap();
-    zc.staged(moved);
-    assert_eq!(zc.result(moved, 4096, true), 4096);
+    zc.staged(moved, 4096);
+    assert_eq!(zc.result(moved, 4096, true), (true, 4096, 4096));
     assert_eq!(zc.notified(moved, true), (true, 4096, true));
     assert!(zc.off);
     assert_eq!(zc.admit(), None, "a connection that went back to copying stays there");
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn a_notified_send_releases_its_item_while_newer_sends_still_owe() {
+    let done = Done::default();
+    let mut c = zc_conn();
+    for id in 0..3 {
+        c.enqueue_push_buf(done.lent(id, &[1; 10]), true);
+    }
+    let mut seqs = Vec::new();
+    for k in 0..3 {
+        assert_eq!(c.arm_send(), 10 * (3 - k));
+        seqs.push(zc_send(&mut c, 10));
+    }
+    assert_eq!(c.zc.as_deref().unwrap().held_len(), 3);
+    // The oldest notification frees its own item and nothing behind it. A release that waited for the window to
+    // drain would hold every sent reply for as long as the pipeline keeps a send owed.
+    zc_notify(&mut c, seqs[0]);
+    assert_eq!(
+        done.ran(),
+        0b001,
+        "the oldest send's item waited for a newer notification"
+    );
+    assert_eq!(c.zc.as_deref().unwrap().held_len(), 2);
+    zc_notify(&mut c, seqs[1]);
+    assert_eq!(done.ran(), 0b011);
+    assert_eq!(c.zc.as_deref().unwrap().held_len(), 1);
+    zc_notify(&mut c, seqs[2]);
+    assert_eq!(done.ran(), 0b111);
+    assert_eq!(c.zc.as_deref().unwrap().held_len(), 0);
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn a_steady_zero_copy_pipeline_does_not_hoard_sent_items() {
+    static ONE: [u8; 1] = [1];
+    let done = Done::default();
+    let mut c = zc_conn();
+    let mut owed: Option<u32> = None;
+    // A pipeline with a send always owed never lets `owed` reach zero, and the sequence wraps the window several
+    // times over. The ledger has to free items as the notifications come.
+    for i in 0..4 * ZC_WINDOW {
+        c.enqueue_push_buf(done.lent(0, &ONE), true);
+        assert_eq!(c.arm_send(), 1);
+        let seq = zc_send(&mut c, 1);
+        if let Some(prev) = owed.replace(seq) {
+            zc_notify(&mut c, prev);
+        }
+        let held = c.zc.as_deref().unwrap().held_len();
+        assert!(held <= 2, "send {i}: the ledger holds {held} items with one send owed");
+    }
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn the_oldest_owed_send_is_named_from_every_window_position() {
+    static ONE: [u8; 1] = [1];
+    // Owed sets by position in the window: each end and the middle, two with gaps, and a spread run. Ascending, so
+    // the first entry is the oldest.
+    let owed_sets: [Vec<u32>; 6] = [
+        vec![0],
+        vec![63],
+        vec![32],
+        vec![0, 63],
+        vec![5, 6, 40],
+        (0..ZC_WINDOW).filter(|k| k % 3 == 0).collect(),
+    ];
+    for offset in 0..ZC_WINDOW {
+        for owed in &owed_sets {
+            let mut c = zc_conn();
+            // Cycle the window on, so `next % ZC_WINDOW` takes every value before the window is filled.
+            let warm = Done::default();
+            for i in 0..offset {
+                c.enqueue_push_buf(warm.lent(i, &ONE), true);
+                assert_eq!(c.arm_send(), 1);
+                let seq = zc_send(&mut c, 1);
+                zc_notify(&mut c, seq);
+            }
+            // Fill the window, one item to each send.
+            let done = Done::default();
+            let mut seqs = Vec::new();
+            for k in 0..ZC_WINDOW {
+                c.enqueue_push_buf(done.lent(k, &ONE), true);
+                assert_eq!(c.arm_send(), 1);
+                seqs.push(zc_send(&mut c, 1));
+            }
+            assert_eq!(c.zc.as_deref().unwrap().held_len(), ZC_WINDOW as usize);
+            // Notify everything but the chosen set, newest first - the order must not matter.
+            for k in (0..ZC_WINDOW).rev() {
+                if !owed.contains(&k) {
+                    zc_notify(&mut c, seqs[k as usize]);
+                }
+            }
+            let oldest = owed[0];
+            let state = format!("offset {offset}, owed {owed:?}");
+            assert_eq!(done.ran(), (1u64 << oldest) - 1, "{state}: the wrong items went home");
+            assert_eq!(
+                c.zc.as_deref().unwrap().held_len(),
+                (ZC_WINDOW - oldest) as usize,
+                "{state}: the wrong number of items stayed"
+            );
+            for &k in owed {
+                zc_notify(&mut c, seqs[k as usize]);
+            }
+            assert_eq!(done.ran(), u64::MAX, "{state}: a sent item never went home");
+            assert_eq!(c.zc.as_deref().unwrap().held_len(), 0, "{state}");
+        }
+    }
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn a_notification_for_a_send_that_is_not_owed_changes_nothing() {
+    let done = Done::default();
+    let mut c = zc_conn();
+    c.enqueue_push_buf(done.lent(0, &[1; 10]), true);
+    assert_eq!(c.arm_send(), 10);
+    let seq = zc_send(&mut c, 10);
+    let zc = c.zc.as_deref_mut().unwrap();
+    assert_eq!(zc.notified(seq, false), (true, 10, false));
+    // The reactor takes the pinned bytes off the ring's count and the op off `zc_owed` on the owed answer alone, so
+    // a repeat, a sequence that never staged, and one the window has moved past must all report nothing.
+    assert_eq!(zc.notified(seq, false), (false, 0, false));
+    assert_eq!(zc.notified(seq.wrapping_add(1), false), (false, 0, false));
+    assert_eq!(zc.notified(seq.wrapping_sub(ZC_WINDOW), false), (false, 0, false));
+    assert_eq!(done.ran(), 1);
+    // And a copy report on one of them does not turn zero-copy off.
+    assert_eq!(zc.notified(seq, true), (false, 0, false));
+    assert!(!zc.off);
+}
+
+/// A connection owing a zero-copy notification is not settled for a detach, though every other term of the gate
+/// passes once the send's result has retired the PDU.
+#[cfg(feature = "net-server")]
+#[test]
+fn a_connection_owing_a_zero_copy_notification_is_not_settled_for_a_detach() {
+    let done = Done::default();
+    let mut c = zc_conn();
+    assert!(c.detach_settled(), "an idle connection detaches");
+    c.enqueue_push_buf(done.lent(0, &[1; 100]), true);
+    assert!(!c.detach_settled(), "a queued PDU is not settled");
+    assert_eq!(c.arm_send(), 100);
+    let seq = zc_send(&mut c, 100);
+    // The control: every term but the ledger's passes once the result has landed.
+    assert!(
+        !c.closing
+            && c.ops == 0
+            && !c.recving
+            && !c.sending
+            && !c.splicing
+            && !c.splice_polling
+            && c.outstanding == 0
+            && c.buffered() == 0
+            && !c.has_pending_send(),
+        "the send's result left the connection settled but for the ledger"
+    );
+    assert!(c.zc.as_deref().unwrap().owes());
+    assert!(!c.detach_settled(), "the kernel may still read the sent pages");
+    zc_notify(&mut c, seq);
+    assert!(
+        c.detach_settled(),
+        "the notification frees the pages, so a detach is safe"
+    );
 }

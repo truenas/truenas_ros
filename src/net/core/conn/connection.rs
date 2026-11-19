@@ -832,6 +832,28 @@ impl<U> Connection<U> {
         !self.send_queue.is_empty()
     }
 
+    /// Whether this connection may be detached to a worker ([`Response::Detach`]). Detach hands the socket fd to a
+    /// worker for a blocking op, so it is only safe on a fully settled connection: no other request in flight, nothing
+    /// buffered past the one being answered (the raw stream that follows belongs to the fd, not the framer), and no
+    /// zero-copy send owed. A detaching connection is out of `SlotState::Serving`, so its notification would be dropped
+    /// and the send owed for ever. A body handler can return `Detach` with no detach handler set, which
+    /// `serve_forever`'s refusal does not see. A teardown in flight (`closing`, `ops`) owns the slot's completions.
+    ///
+    /// [`Response::Detach`]: crate::net::server::Response::Detach
+    #[cfg(feature = "net-server")]
+    pub(crate) fn detach_settled(&self) -> bool {
+        !self.closing
+            && self.ops == 0
+            && !self.recving
+            && !self.sending
+            && !self.splicing
+            && !self.splice_polling
+            && self.outstanding == 0
+            && self.buffered() == 0
+            && !self.has_pending_send()
+            && !self.zc.as_deref().is_some_and(ZcLedger::owes)
+    }
+
     /// Total bytes queued (including the partially-sent front PDU).
     pub(crate) fn queued_bytes(&self) -> usize {
         self.queued_bytes
@@ -943,8 +965,8 @@ impl<U> Connection<U> {
         progress
     }
 
-    /// Whether a file body is streaming or still has chunks queued. Its sends keep the copy, since the tail paces itself
-    /// on chunks flushing.
+    /// Whether a file body is streaming or still has chunks queued. Its sends keep the copy, since the tail paces
+    /// itself on chunks flushing.
     #[cfg(feature = "net-server")]
     pub(crate) fn file_body_in_flight(&self) -> bool {
         #[cfg(feature = "uring-fs")]

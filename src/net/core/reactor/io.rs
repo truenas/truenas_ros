@@ -684,7 +684,7 @@ impl<U> Reactor<U> {
             sqe.op_flags = flags;
         };
         let send_ts = (self.cfg.send_timeout.is_some()).then_some(std::ptr::addr_of!(self.pads.send_timeout) as u64);
-        match send_ts {
+        let staged = match send_ts {
             None => self.stage(user_data, fill),
             // Stall guard: a linked timeout cancels a send that sits with no progress for `send_timeout` (a peer that
             // stopped reading). On a cancelled partial send the CQE carries the progress made, so a slow-but-draining
@@ -698,7 +698,13 @@ impl<U> Reactor<U> {
                 pack(Op::LinkTimeout, slot, generation),
                 move |sqe| fill_link_timeout(sqe, ts),
             ),
+        };
+        // Only a send the ring took is owed. No completion of this send can reap before this line.
+        #[cfg(feature = "net-server")]
+        if let (Ok(()), Some(seq)) = (&staged, zc) {
+            self.commit_zero_copy(slot, seq, armed);
         }
+        staged
     }
 
     /// Classify a short-positive exact recv completion: `fired` is whether the recv's linked clock reported `-ETIME`. A

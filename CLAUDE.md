@@ -583,8 +583,18 @@ A streamed window is written to a file straight out of its recv buffer.
   an item waits until every send that carried it is notified. Pinned by
   `zero_copy_bytes_go_back_at_the_notification_not_the_result`,
   `notifications_in_any_order_release_oldest_first`,
-  `a_front_item_split_across_sends_waits_for_its_newest_carrier` and
-  `a_lent_reply_goes_back_only_once_the_peer_acknowledges_it`.
+  `a_notified_send_releases_its_item_while_newer_sends_still_owe`,
+  `the_oldest_owed_send_is_named_from_every_window_position`,
+  `a_front_item_split_across_sends_waits_for_its_newest_carrier`,
+  `a_lent_reply_goes_back_only_once_the_peer_acknowledges_it` and
+  `several_zero_copy_sends_are_owed_at_once_and_all_go_back`.
+- **A send counts once the ring takes it.** Admission only checks. After
+  the SQE is staged, the send is owed and its armed bytes count against
+  `max_pinned` until its result, so the cap holds within one loop and a
+  refused SQE owes nothing. Pinned by
+  `the_cap_counts_a_staged_zero_copy_send_before_its_result`,
+  `a_zero_copy_send_the_ring_refuses_owes_nothing` and
+  `the_pinned_total_comes_back_at_every_notification`.
 - **A notification follows only a result with `IORING_CQE_F_MORE`**, and
   the op stays in flight until then (`counted`). A send the kernel refuses
   goes again with a copy. Pinned by
@@ -596,12 +606,19 @@ A streamed window is written to a file straight out of its recv buffer.
   slot and fd index stay taken while the kernel may read. Its socket gets
   `TCP_USER_TIMEOUT`, so the kernel resets a peer that never acknowledges.
   Pinned by `a_closing_connection_holds_its_close_until_notified`,
+  `a_held_close_waits_for_every_notification_and_for_the_linger`,
   `a_closed_connection_keeps_its_slot_until_the_peer_acknowledges` and
   `a_closed_connection_whose_peer_never_reads_is_reset_after_the_linger`.
+- **A connection that owes a notification never detaches**, since a
+  notification for a detaching slot is dropped. Pinned by
+  `a_connection_owing_a_zero_copy_notification_is_not_settled_for_a_detach`
+  and `zero_copy_refuses_a_detach_handler`.
 - **A stop waits the linger, then resets the peers that still owe.** The
   sockets close only with the ring, after the drain, so without the reset a
-  silent peer would hold the drain for ever. Pinned by
-  `a_stop_with_a_stalled_peer_resets_it_after_the_linger`.
+  silent peer would hold the drain for ever. The linger starts also when the
+  owed count is too high. Pinned by
+  `a_stop_with_a_stalled_peer_resets_it_after_the_linger` and
+  `the_stop_drain_lingers_when_the_owed_count_is_too_high`.
 
 ## Validating against the platform
 

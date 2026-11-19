@@ -1,21 +1,28 @@
-//! Per-connection state of zero-copy sends. The kernel reads a zero-copy send's pages until the send's notification,
-//! and notifications can come out of send order (`io_link_skb`, `io_notif_tw_complete`, `io_uring/notif.c`). So each
-//! send has a sequence number, and a sent item is held until every send that carried its bytes is notified.
+//! Per-connection state of zero-copy sends. The kernel reads a zero-copy send's pages until the send's notification.
+//! Each notification fires when the kernel drops that send's pages (`io_tx_ubuf_complete`, `io_uring/notif.c`), so
+//! notifications can come out of send order. So each send has a sequence number, and a sent item is held until every
+//! send that carried its bytes is notified.
 
 use super::SendItem;
 use std::collections::VecDeque;
 
-/// The most zero-copy sends one connection may have waiting for a completion, one bit of `owed` each.
+/// The most zero-copy sends one connection may have waiting for a completion, one bit of `owed` each. It must be the
+/// width of `owed`, since `oldest_owed` rotates the whole map.
 pub(crate) const ZC_WINDOW: u32 = 64;
 
+const _: () = assert!(ZC_WINDOW == u64::BITS, "ZC_WINDOW is the width of `ZcLedger::owed`");
+
 pub(crate) struct ZcLedger {
-    /// Send with a copy from now on.
+    /// Send with a copy from now on, for the rest of the connection. After a copy report the kernel copies anyway
+    /// (loopback, a device without scatter-gather, a packet tap), and each zero-copy send would add a notification to
+    /// the copy. A tap that goes away does not bring zero-copy back: no probe tells when the copy stops.
     pub(crate) off: bool,
     next: u32,
     /// Bit `seq % ZC_WINDOW` is set while send `seq` waits for a completion.
     owed: u64,
-    /// The bytes each send moved, taken off the ring's pinned count at its notification.
-    moved: [usize; ZC_WINDOW as usize],
+    /// The bytes each owed send counts on the ring's pinned total: its armed bytes until its result, then the bytes it
+    /// moved until its notification.
+    pinned: [usize; ZC_WINDOW as usize],
     /// The newest send that carried part of the front item.
     front: Option<u32>,
     /// Sent items with the newest send that carried them, in send order.
@@ -35,7 +42,7 @@ impl ZcLedger {
             off: false,
             next: 0,
             owed: 0,
-            moved: [0; ZC_WINDOW as usize],
+            pinned: [0; ZC_WINDOW as usize],
             front: None,
             held: VecDeque::new(),
             close_held: false,
@@ -53,24 +60,30 @@ impl ZcLedger {
         Some(self.next)
     }
 
-    pub(crate) fn staged(&mut self, seq: u32) {
+    /// Send `seq`, the one [`admit`](Self::admit) named, is on the ring with `armed` bytes.
+    pub(crate) fn staged(&mut self, seq: u32, armed: usize) {
         debug_assert_eq!(seq, self.next, "staged out of turn");
         self.owed |= bit(seq);
-        self.moved[index(seq)] = 0;
+        self.pinned[index(seq)] = armed;
         self.next = seq.wrapping_add(1);
     }
 
-    /// Records the result of send `seq` and returns the bytes it pinned. Without `IORING_CQE_F_MORE` no notification
-    /// follows (`io_sendrecv_fail`, `io_uring/net.c`).
-    pub(crate) fn result(&mut self, seq: u32, res: i32, more: bool) -> usize {
+    /// Records the result of send `seq`. Returns whether it was owed, the bytes counted for it since it was staged, and
+    /// the bytes it pins until its notification. Without `IORING_CQE_F_MORE` the prep allocated no notification, so
+    /// none follows (`io_send_zc_prep`, `io_sendrecv_fail`, `io_uring/net.c`).
+    pub(crate) fn result(&mut self, seq: u32, res: i32, more: bool) -> (bool, usize, usize) {
+        if self.owed & bit(seq) == 0 {
+            return (false, 0, 0);
+        }
+        let staged = std::mem::take(&mut self.pinned[index(seq)]);
         if !more {
             self.owed &= !bit(seq);
             self.release();
-            return 0;
+            return (true, staged, 0);
         }
         let moved = usize::try_from(res).unwrap_or(0);
-        self.moved[index(seq)] = moved;
-        moved
+        self.pinned[index(seq)] = moved;
+        (true, staged, moved)
     }
 
     /// Records the notification of send `seq` and releases what no other send still carries. A copy report turns
@@ -81,7 +94,7 @@ impl ZcLedger {
             return (false, 0, false);
         }
         self.owed &= !bit(seq);
-        let moved = std::mem::take(&mut self.moved[index(seq)]);
+        let moved = std::mem::take(&mut self.pinned[index(seq)]);
         let turned_off = copied && moved > 0 && !self.off;
         self.off |= turned_off;
         self.release();

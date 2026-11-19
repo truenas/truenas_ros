@@ -551,9 +551,8 @@ mod tests {
             counted(&cqe(copied, IORING_CQE_F_NOTIF)),
             "a notification reporting a copy"
         );
-        assert!(
-            counted(&cqe(-libc::ENOMEM, 0)),
-            "a result that allocated no notification"
-        );
+        // A prep that failed before it allocated the notification. The `RLIMIT_MEMLOCK` refusal comes later, with
+        // `IORING_CQE_F_MORE` (`io_notif_account_mem`, `io_uring/notif.h`).
+        assert!(counted(&cqe(-libc::ENOMEM, 0)), "a result with no notification to come");
     }
 }

@@ -262,7 +262,10 @@ fn server_ring(cfg: &ServerConfig, addrs: &[Listen]) -> crate::Result<RingFd> {
 /// The completion-queue size of a zero-copy server with `entries` submission slots. Each notification is a second
 /// completion, and one acknowledgement can post a connection's whole window of them at once (`io_notif_tw_complete`).
 /// A completion that does not fit waits in an overflow list, and one the kernel cannot allocate there is lost
-/// (`io_cqring_add_overflow`).
+/// (`io_cqring_add_overflow`). The kernel rounds the size up to a power of two (`io_uring_fill_params`), so at the
+/// default `pool_size` a ring gets 65536 entries, a 1 MiB region, which a ring created without `CAP_IPC_LOCK` is
+/// charged against `RLIMIT_MEMLOCK` (`io_create_region`). `setup_sized` caps the size at the kernel's maximum, so
+/// past about 1024 connections a burst of notifications can still overflow.
 fn cq_entries(cfg: &ServerConfig, entries: u32) -> Option<u32> {
     cfg.send_zero_copy?;
     let windows = cfg.pool_size.saturating_mul(crate::net::core::conn::ZC_WINDOW);
@@ -737,7 +740,7 @@ where
                 self.core.on_send_zc_notif(slot, generation, cqe.res)?
             }
             Some(Op::SendZc) => self.on_send_zc(slot, generation, cqe.res, cqe.flags)?,
-            Some(Op::ZcLinger) => self.core.on_zc_linger(slot)?,
+            Some(Op::ZcLinger) => self.core.on_zc_linger(slot, generation)?,
             // Staged only by the teardown drain, which does not dispatch.
             Some(Op::ZcReset) => {}
             Some(Op::Close) => self.core.on_closed(slot)?,
