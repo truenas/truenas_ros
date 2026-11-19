@@ -328,7 +328,9 @@ Do not reopen these without a reason that is new.
   `Body` drops, since the handler owns its `Request`. A reply marked
   recycled goes back as its queue entry drops, sent or not, so a teardown
   sends home what it drains, and the injection drain sends home one that
-  reaches no request (`Server::spill`). Freed instead, a handler that reads
+  reaches no request (`Server::spill`). After a zero-copy send the entry
+  drops at the send's notification (see Zero-copy sends). Freed instead, a
+  handler that reads
   its body where it lies costs an allocation for every message. Pinned by
   `an_untaken_buffered_body_does_not_allocate_per_message`,
   `a_recycled_segment_queued_at_a_teardown_goes_home` and
@@ -336,7 +338,8 @@ Do not reopen these without a reason that is new.
 - **The count of held bytes is exact by construction.** The reactor counts
   the pool storage it holds by capacity, a placed or promoted body from its
   claim until it is taken or given back, and a reply marked recycled from
-  its queueing until it is sent or dropped. Promoted storage grows while
+  its queueing until it is sent or dropped, which after a zero-copy send is
+  at its notification. Promoted storage grows while
   held, amortized, and the capacity each growth adds goes on its ticket and
   on the count together (`RecvBuf::reserve_at`), so the cap sees what a
   record in fragments holds. Each holder carries what it put on the count
@@ -566,6 +569,56 @@ A streamed window is written to a file straight out of its recv buffer.
   Poison handling is not uniform - the failed mint's eviction,
   `invalidate`, `clear` and `len` swallow it. **Hoisting the fast path
   above that lock removes the guarantee.**
+
+### Zero-copy sends
+
+- **Off by default, and off costs one compare.** With
+  `ServerConfig::send_zero_copy` at `None`, the threshold is `usize::MAX`,
+  and `submit_send` stages the same SQE as before. Only TCP without kTLS
+  sends zero-copy, never a file body, and the client never does. Pinned by
+  `zero_copy_is_staged_only_above_the_threshold_on_plain_tcp`.
+- **Sent bytes go back at the notification, not at the result.** The kernel
+  reads the pages until the peer acknowledges them. Notifications can come
+  out of order, so each send has a sequence number in its `user_data`, and
+  an item waits until every send that carried it is notified. Pinned by
+  `zero_copy_bytes_go_back_at_the_notification_not_the_result`,
+  `notifications_in_any_order_release_oldest_first`,
+  `a_notified_send_releases_its_item_while_newer_sends_still_owe`,
+  `the_oldest_owed_send_is_named_from_every_window_position`,
+  `a_front_item_split_across_sends_waits_for_its_newest_carrier`,
+  `a_lent_reply_goes_back_only_once_the_peer_acknowledges_it` and
+  `several_zero_copy_sends_are_owed_at_once_and_all_go_back`.
+- **A send counts once the ring takes it.** Admission only checks. After
+  the SQE is staged, the send is owed and its armed bytes count against
+  `max_pinned` until its result, so the cap holds within one loop and a
+  refused SQE owes nothing. Pinned by
+  `the_cap_counts_a_staged_zero_copy_send_before_its_result`,
+  `a_zero_copy_send_the_ring_refuses_owes_nothing` and
+  `the_pinned_total_comes_back_at_every_notification`.
+- **A notification follows only a result with `IORING_CQE_F_MORE`**, and
+  the op stays in flight until then (`counted`). A send the kernel refuses
+  goes again with a copy. Pinned by
+  `a_zero_copy_send_ends_at_its_notification`,
+  `a_zero_copy_result_without_more_owes_nothing`,
+  `a_refused_zero_copy_send_is_resent_with_a_copy` and
+  `a_socket_with_a_ulp_sends_with_a_copy`.
+- **A closing connection holds its `CLOSE` until nothing is owed**, so its
+  slot and fd index stay taken while the kernel may read. Its socket gets
+  `TCP_USER_TIMEOUT`, so the kernel resets a peer that never acknowledges.
+  Pinned by `a_closing_connection_holds_its_close_until_notified`,
+  `a_held_close_waits_for_every_notification_and_for_the_linger`,
+  `a_closed_connection_keeps_its_slot_until_the_peer_acknowledges` and
+  `a_closed_connection_whose_peer_never_reads_is_reset_after_the_linger`.
+- **A connection that owes a notification never detaches**, since a
+  notification for a detaching slot is dropped. Pinned by
+  `a_connection_owing_a_zero_copy_notification_is_not_settled_for_a_detach`
+  and `zero_copy_refuses_a_detach_handler`.
+- **A stop waits the linger, then resets the peers that still owe.** The
+  sockets close only with the ring, after the drain, so without the reset a
+  silent peer would hold the drain for ever. The linger starts also when the
+  owed count is too high. Pinned by
+  `a_stop_with_a_stalled_peer_resets_it_after_the_linger` and
+  `the_stop_drain_lingers_when_the_owed_count_is_too_high`.
 
 ## Validating against the platform
 

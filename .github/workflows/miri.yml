@@ -163,11 +163,13 @@ env:
   # which need no ring either; 130 adds the seven tests of the rooms an
   # op table keeps its callbacks in, which need no ring and execute
   # here; 131 adds the closed gate of a `SelfRegistrar`, a mutex and no
-  # ring, so it executes here.) If that friction is unwanted,
+  # ring, so it executes here; 132 adds the zero-copy rows of the
+  # completion count, flag arithmetic that executes here.) If that
+  # friction is unwanted,
   # `-lt` pinned at the TRUE count still catches deletion, which is
   # the failure mode; what it must not be again is a floor far below
   # what runs.
-  MIRI_TESTS: "131"
+  MIRI_TESTS: "132"
 
   # The `http` band, run as its own step under its own feature set.
   # Exact for the same reason, and bumped by the same rule: 32 at the

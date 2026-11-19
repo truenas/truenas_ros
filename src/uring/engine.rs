@@ -21,8 +21,9 @@ use crate::sync::atomic::{AtomicBool, AtomicU64};
 #[cfg(feature = "uring-fs")]
 pub(crate) const MAX_CHAIN_LINKS: usize = 4;
 
-/// Whether a reaped completion ends an op this ring staged: one per op, so not a multishot's interim completions
-/// (`IORING_CQE_F_MORE`), and not one another ring posted ([`TAG_POSTED`](crate::uring::user_data::TAG_POSTED)).
+/// Whether a reaped completion ends an op this ring staged: one per op, so not a multishot's interim completions or a
+/// zero-copy send's result (`IORING_CQE_F_MORE`), and not one another ring posted
+/// ([`TAG_POSTED`](crate::uring::user_data::TAG_POSTED)).
 pub(crate) fn counted(cqe: &IoUringCqe) -> bool {
     cqe.flags & IORING_CQE_F_MORE == 0 && cqe.user_data as u8 != crate::uring::user_data::TAG_POSTED
 }
@@ -254,6 +255,12 @@ impl Engine {
     #[cfg(all(test, not(loom)))]
     pub(crate) fn staged_sqe(&self, i: u32) -> IoUringSqe {
         self.ring.staged_sqe(i)
+    }
+
+    /// Every staged SQE, oldest first.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn staged_sqes(&self) -> Vec<IoUringSqe> {
+        (0..self.ring.staged_count()).map(|i| self.ring.staged_sqe(i)).collect()
     }
 
     /// Leak the wake landing pad. On a failed teardown drain the armed wake `READ` may still be in flight and write 8
@@ -519,5 +526,33 @@ mod tests {
             );
             assert_eq!(eng.inflight, 0, "n = {n}: nothing was staged");
         }
+    }
+
+    /// A zero-copy send stays in flight until its notification. The net reactor relies on this to hold a connection's
+    /// slot until then.
+    #[test]
+    fn a_zero_copy_send_ends_at_its_notification() {
+        let cqe = |res, flags| IoUringCqe {
+            user_data: 25,
+            res,
+            flags,
+        };
+        assert!(
+            !counted(&cqe(4096, IORING_CQE_F_MORE)),
+            "a result with a notification to come"
+        );
+        assert!(
+            !counted(&cqe(-libc::ECANCELED, IORING_CQE_F_MORE)),
+            "a cancelled send still owes one"
+        );
+        assert!(counted(&cqe(0, IORING_CQE_F_NOTIF)), "the notification");
+        let copied = IORING_NOTIF_USAGE_ZC_COPIED as i32;
+        assert!(
+            counted(&cqe(copied, IORING_CQE_F_NOTIF)),
+            "a notification reporting a copy"
+        );
+        // A prep that failed before it allocated the notification. The `RLIMIT_MEMLOCK` refusal comes later, with
+        // `IORING_CQE_F_MORE` (`io_notif_account_mem`, `io_uring/notif.h`).
+        assert!(counted(&cqe(-libc::ENOMEM, 0)), "a result with no notification to come");
     }
 }

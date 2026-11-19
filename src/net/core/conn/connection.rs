@@ -47,6 +47,8 @@ impl<U> Connection<U> {
             // `arm_send` before kernel use.
             send_iovs: vec![unsafe { std::mem::zeroed() }; max_send_coalesce].into_boxed_slice(),
             send_msg: unsafe { std::mem::zeroed() },
+            #[cfg(feature = "net-server")]
+            zc: None,
             recving: false,
             recv_idle: false,
             served_since_idle_arm: false,
@@ -830,6 +832,28 @@ impl<U> Connection<U> {
         !self.send_queue.is_empty()
     }
 
+    /// Whether this connection may be detached to a worker ([`Response::Detach`]). Detach hands the socket fd to a
+    /// worker for a blocking op, so it is only safe on a fully settled connection: no other request in flight, nothing
+    /// buffered past the one being answered (the raw stream that follows belongs to the fd, not the framer), and no
+    /// zero-copy send owed. A detaching connection is out of `SlotState::Serving`, so its notification would be dropped
+    /// and the send owed for ever. A body handler can return `Detach` with no detach handler set, which
+    /// `serve_forever`'s refusal does not see. A teardown in flight (`closing`, `ops`) owns the slot's completions.
+    ///
+    /// [`Response::Detach`]: crate::net::server::Response::Detach
+    #[cfg(feature = "net-server")]
+    pub(crate) fn detach_settled(&self) -> bool {
+        !self.closing
+            && self.ops == 0
+            && !self.recving
+            && !self.sending
+            && !self.splicing
+            && !self.splice_polling
+            && self.outstanding == 0
+            && self.buffered() == 0
+            && !self.has_pending_send()
+            && !self.zc.as_deref().is_some_and(ZcLedger::owes)
+    }
+
     /// Total bytes queued (including the partially-sent front PDU).
     pub(crate) fn queued_bytes(&self) -> usize {
         self.queued_bytes
@@ -864,7 +888,14 @@ impl<U> Connection<U> {
     /// Advance the send cursor by `n` bytes (clamped to the armed gather): fully-sent PDUs are popped and tallied by
     /// kind; a partially-sent leader updates the front cursor. A popped [`SendBuf::recycled`] segment's storage goes
     /// back to the ring's body pool as it drops.
-    pub(crate) fn advance_sent(&mut self, n: usize) -> SendProgress {
+    ///
+    /// `carrier` is the zero-copy send that moved the bytes, `None` for a plain send. A PDU that a zero-copy send
+    /// carried goes to the ledger instead of dropping here.
+    pub(crate) fn advance_sent(&mut self, n: usize, carrier: Option<u32>) -> SendProgress {
+        #[cfg(not(feature = "net-server"))]
+        let _ = carrier;
+        #[cfg(feature = "net-server")]
+        let mut front_was_partial = self.front_sent > 0;
         let mut n = n.min(self.armed_bytes);
         self.armed_bytes -= n;
         let mut progress = SendProgress {
@@ -886,6 +917,10 @@ impl<U> Connection<U> {
                 - self.front_sent;
             if n < front_remaining {
                 self.front_sent += n;
+                #[cfg(feature = "net-server")]
+                if let (Some(seq), Some(zc)) = (carrier, self.zc.as_deref_mut()) {
+                    zc.carried_front(seq);
+                }
                 break;
             }
             n -= front_remaining;
@@ -918,8 +953,26 @@ impl<U> Connection<U> {
                     }
                 }
             }
+            #[cfg(feature = "net-server")]
+            if let Some(zc) = self.zc.as_deref_mut() {
+                zc.retire(item, carrier, std::mem::take(&mut front_was_partial));
+            }
+        }
+        #[cfg(feature = "net-server")]
+        if let Some(zc) = self.zc.as_deref_mut() {
+            zc.release();
         }
         progress
+    }
+
+    /// Whether a file body is streaming or still has chunks queued. Its sends keep the copy, since the tail paces
+    /// itself on chunks flushing.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn file_body_in_flight(&self) -> bool {
+        #[cfg(feature = "uring-fs")]
+        return self.chunk_out > 0 || self.tail_active();
+        #[cfg(not(feature = "uring-fs"))]
+        false
     }
 
     /// Stable pointer to the send `msghdr` for an SQE `addr` field.

@@ -8,7 +8,7 @@ use super::{PushHandle, Server};
 use crate::error::Error;
 use crate::net::core::protocol::ServerAddr;
 #[cfg(doc)]
-use crate::net::core::protocol::{Body, ClientAddr, CloseReason};
+use crate::net::core::protocol::{Body, ClientAddr, CloseReason, Lent};
 use crate::uring::force_async::ForceAsync;
 use std::time::Duration;
 
@@ -249,6 +249,21 @@ pub struct ServerConfig {
     /// armed are gathered, so a lone reply is never delayed, and `send_timeout` bounds the whole op. Default 8, the
     /// kernel's inline iovec fast path (`UIO_FASTIOV`). `1` disables coalescing, and the cap is 1024 (`UIO_MAXIOV`).
     pub max_send_coalesce: usize,
+    /// Send gathers of at least [`SendZeroCopy::threshold`] bytes without the kernel's copy. `None`, the default,
+    /// copies every send.
+    ///
+    /// The kernel then reads the bytes from this process until the peer acknowledges them. So a [`Lent`] runs `done`,
+    /// and recycled storage goes home and off [`held_cap`](Self::held_cap)'s count, only at the send's notification.
+    ///
+    /// Only TCP without kTLS qualifies, and never a file body. A connection copies for the rest of its life once the
+    /// kernel copies anyway (loopback, a device without scatter-gather, a packet tap) or refuses a send. A server with
+    /// zero-copy cannot detach connections ([`Response::Detach`]).
+    ///
+    /// A ring created without `CAP_IPC_LOCK` is charged the pinned pages against `RLIMIT_MEMLOCK`, and a send past
+    /// the limit fails with `ENOMEM` (`io_notif_account_mem`, `io_uring/notif.h`). The charge goes on the user's
+    /// `locked_vm`, which all rings of that user share, their own memory included (`__io_account_mem`,
+    /// `io_uring/rsrc.c`). A ring created as root is not charged.
+    pub send_zero_copy: Option<SendZeroCopy>,
     /// Read a message body at least this large into storage of its own, claimed from the ring's body pool, instead of
     /// the connection's buffer, so [`Body::take`] moves it with no copy. It applies when the body still has bytes to
     /// read at the frame verdict. A body a scanning framer already read whole is delivered in place, where `take`
@@ -332,6 +347,7 @@ impl Default for ServerConfig {
             unix_peercred: false,
             max_send_backlog: 8 * 1024 * 1024,
             max_send_coalesce: 8,
+            send_zero_copy: None,
             body_placement_threshold: Some(64 * 1024),
             force_async: ForceAsync::empty(),
             #[cfg(feature = "uring-fs")]
@@ -507,6 +523,25 @@ impl ServerConfig {
                 "max_in_flight_requests must be in 1..={MAX_IN_FLIGHT}"
             )));
         }
+        if let Some(zc) = self.send_zero_copy {
+            // `usize::MAX` is the core config's marker for zero-copy off (`CoreConfig::zero_copy`).
+            if zc.threshold == 0 || zc.threshold == usize::MAX {
+                return Err(Error::Validation(
+                    "send_zero_copy.threshold must be in 1..usize::MAX".into(),
+                ));
+            }
+            if zc.max_pinned < zc.threshold {
+                return Err(Error::Validation(
+                    "send_zero_copy.max_pinned must be at least its threshold".into(),
+                ));
+            }
+            // `TCP_USER_TIMEOUT` takes milliseconds in an int, and 0 there means the system default.
+            if zc.linger < Duration::from_millis(1) || zc.linger.as_millis() > i32::MAX as u128 {
+                return Err(Error::Validation(
+                    "send_zero_copy.linger must be from 1 ms to i32::MAX ms".into(),
+                ));
+            }
+        }
         for (name, d) in [
             ("send_timeout", self.send_timeout),
             ("request_timeout", self.request_timeout),
@@ -554,6 +589,35 @@ impl ServerConfig {
             tls_handshake_timeout: self.tls_handshake_timeout,
             recv_shortage_retry: self.recv_shortage_retry,
             force_async: self.force_async,
+            zc_threshold: self.send_zero_copy.map_or(usize::MAX, |zc| zc.threshold),
+            zc_max_pinned: self.send_zero_copy.map_or(0, |zc| zc.max_pinned),
+            zc_linger: self.send_zero_copy.map_or(Duration::ZERO, |zc| zc.linger),
+        }
+    }
+}
+
+/// Zero-copy sends, [`ServerConfig::send_zero_copy`].
+#[derive(Clone, Copy, Debug)]
+pub struct SendZeroCopy {
+    /// The smallest gather, in bytes, sent without a copy. Below about 10 KB the copy is cheaper
+    /// (`Documentation/networking/msg_zerocopy.rst`). Default 64 KiB.
+    pub threshold: usize,
+    /// The most bytes of one ring's zero-copy sends that may wait for acknowledgement at once, counted from when the
+    /// ring takes a send. Past it, sends copy. Default 64 MiB. Each socket's send buffer bounds its own pinned bytes
+    /// too, since the kernel counts them in `sk_wmem_queued` (`__zerocopy_sg_from_iter`, `net/core/datagram.c`).
+    pub max_pinned: usize,
+    /// How long a closing connection or a stopping server waits for a peer to acknowledge zero-copy bytes. A stopping
+    /// server resets such peers itself. A closing connection's socket gets it as `TCP_USER_TIMEOUT`, which TCP
+    /// checks only when a retransmit or probe timer fires, so the reset can come a timer interval later. Default 1 s.
+    pub linger: Duration,
+}
+
+impl Default for SendZeroCopy {
+    fn default() -> Self {
+        SendZeroCopy {
+            threshold: 64 * 1024,
+            max_pinned: 64 * 1024 * 1024,
+            linger: Duration::from_secs(1),
         }
     }
 }
@@ -786,5 +850,28 @@ mod tests {
         ] {
             assert!(fine.validate(&a).is_ok(), "refused: {fine:?}");
         }
+    }
+
+    /// Every `SendZeroCopy` field reaches the reactor's config, and `None` reaches it as the off sentinel. The tests of
+    /// the linger bound their waits loosely, so they do not see a wrong linger.
+    #[test]
+    fn send_zero_copy_reaches_the_core_config() {
+        let off = ServerConfig::default().to_core();
+        assert_eq!(off.zc_threshold, usize::MAX, "off must read as the off sentinel");
+        assert!(!off.zero_copy());
+        let on = ServerConfig {
+            send_zero_copy: Some(SendZeroCopy {
+                threshold: 4096,
+                max_pinned: 1 << 20,
+                linger: Duration::from_millis(200),
+            }),
+            ..ServerConfig::default()
+        }
+        .to_core();
+        assert_eq!(
+            (on.zc_threshold, on.zc_max_pinned, on.zc_linger),
+            (4096, 1 << 20, Duration::from_millis(200))
+        );
+        assert!(on.zero_copy());
     }
 }

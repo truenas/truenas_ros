@@ -214,6 +214,7 @@ variable that CI arms, turning the skip back into a hard failure:
 | `TRUENAS_ROS_REQUIRE_IO_URING` | the io_uring suites (`test/net_*.rs`, `test/uring_fs.rs`, `test/http_live.rs`), which otherwise skip when a ring cannot be created |
 | `TRUENAS_ROS_REQUIRE_KTLS` | the kernel-TLS data path, which needs the `tls` ULP *and* an OpenSSL built with `enable-ktls` |
 | `TRUENAS_ROS_REQUIRE_PEERCRED` | `unix_peercred`, which needs Linux >= 6.18.16 |
+| `TRUENAS_ROS_REQUIRE_ZERO_COPY` | the zero-copy send tests (`test/net_server/zero_copy.rs`), which skip when the kernel refuses a zero-copy send, as it does past `RLIMIT_MEMLOCK` for a ring created without `CAP_IPC_LOCK` |
 | `TRUENAS_ROS_REQUIRE_ZFS` | the ACL suites needing a provisioned ACL-typed ZFS dataset (`test/zfs.rs`) |
 | `TRUENAS_ROS_REQUIRE_SECRETMEM` | the `secrets` tests (`test/secrets.rs`), which need `CONFIG_SECRETMEM` |
 | `TRUENAS_ROS_REQUIRE_AUDIT` | the audit tests (`test/audit.rs`), which need a `NETLINK_AUDIT` socket |

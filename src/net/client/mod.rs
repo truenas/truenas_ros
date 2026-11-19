@@ -293,6 +293,9 @@ where
                 | Op::DetachInstall
                 | Op::Maintain
                 | Op::Handoff
+                | Op::SendZc
+                | Op::ZcLinger
+                | Op::ZcReset
                 | Op::Handed,
             ) => unreachable!("client never issues {op:?}"),
         }

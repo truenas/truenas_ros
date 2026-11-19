@@ -205,8 +205,9 @@ pub(crate) fn fill_link_timeout(sqe: &mut IoUringSqe, ts: u64) {
 /// Connect an outbound stream socket (client). `sqe.fd` is the (fixed) socket,
 /// `sqe.addr`@16 the target sockaddr, `sqe.addr2`@8 (`off_addr2`) its length;
 /// `len`/`op_flags`/`buf_index`/`file_index` must be 0 (`io_connect_prep` rejects otherwise). The kernel copies the
-/// sockaddr at prep, so it need only live until submission.
-#[cfg(feature = "net-client")]
+/// sockaddr at prep, so it need only live until submission. An `AF_UNSPEC` address disconnects the socket, and TCP then
+/// resets the peer and drops its send queues (`tcp_disconnect`, `net/ipv4/tcp.c`).
+#[cfg(any(feature = "net-client", feature = "net-server"))]
 pub(crate) const IORING_OP_CONNECT: u8 = 16;
 pub(crate) const IORING_OP_CLOSE: u8 = 19;
 pub(crate) const IORING_OP_READ: u8 = 22;
@@ -218,6 +219,12 @@ pub(crate) const IORING_OP_WRITE: u8 = 23;
 pub(crate) const IORING_OP_OPENAT2: u8 = 28;
 pub(crate) const IORING_OP_SEND: u8 = 26;
 pub(crate) const IORING_OP_RECV: u8 = 27;
+/// [`IORING_OP_SEND`] without the copy, with the zero-copy flags in `ioprio`. The kernel reads the pages until it posts
+/// a second CQE, the notification, with the same `user_data` and [`IORING_CQE_F_NOTIF`]. The first CQE has
+/// [`IORING_CQE_F_MORE`] when a notification follows (`io_send_zc`, `io_sendrecv_fail`, `io_uring/net.c`).
+pub(crate) const IORING_OP_SEND_ZC: u8 = 47;
+/// `SENDMSG` without the copy, like [`IORING_OP_SEND_ZC`].
+pub(crate) const IORING_OP_SENDMSG_ZC: u8 = 48;
 /// Move bytes between a pipe and another fd without a userspace copy - used to splice a framed message body straight
 /// from the socket to a consumer pipe.
 pub(crate) const IORING_OP_SPLICE: u8 = 30;
@@ -262,6 +269,10 @@ pub(crate) const SOCKET_URING_OP_SIOCOUTQ: u32 = 1;
 /// overlays fields we already declare, `cmd_op` @8 (`off_addr2` low half), `level` @16 and `optname` @20 (`addr` low
 /// and high halves on LE), `optlen` @44 (`file_index`) and `optval` @48 (`addr3`). CQE `res` is the optlen or `-errno`.
 pub(crate) const SOCKET_URING_OP_GETSOCKOPT: u32 = 2;
+
+/// `SOCKET_URING_OP_SETSOCKOPT`, with the overlay of [`SOCKET_URING_OP_GETSOCKOPT`]. It takes any level
+/// (`io_uring_cmd_setsockopt`, `io_uring/cmd_net.c`). CQE `res` is 0 or `-errno`.
+pub(crate) const SOCKET_URING_OP_SETSOCKOPT: u32 = 3;
 
 // Directory-entry ops. Every one takes its dirfd(s) as **real** fds in `sqe.fd` (and `sqe.len` for the second, where
 // there is one): each prep rejects `REQ_F_FIXED_FILE` with `-EBADF`, so a registered-table slot can never be a dirfd.
@@ -335,6 +346,14 @@ pub(crate) const SPLICE_F_FD_IN_FIXED: u32 = 1 << 31;
 // `cqe.flags`.
 pub(crate) const IORING_CQE_F_MORE: u32 = 1 << 1; // more CQEs follow (multishot)
 pub(crate) const IORING_CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
+/// The CQE is the notification of a zero-copy send ([`IORING_OP_SEND_ZC`]).
+pub(crate) const IORING_CQE_F_NOTIF: u32 = 1 << 3;
+
+/// A zero-copy `ioprio` flag. With it, the notification tells whether the kernel copied the bytes after all.
+pub(crate) const IORING_SEND_ZC_REPORT_USAGE: u16 = 1 << 3;
+/// Set in a notification's `res` when the kernel copied bytes or sent none (`io_notif_tw_complete`,
+/// `io_uring/notif.c`). It is the sign bit.
+pub(crate) const IORING_NOTIF_USAGE_ZC_COPIED: u32 = 1 << 31;
 
 /// `io_uring_enter` flag: also wait for completions.
 pub(crate) const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
@@ -439,6 +458,10 @@ pub(crate) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 /// the creating task. **Never set by this crate's rings**, since the credential broker must register personalities on
 /// a ring from outside. Declared for the probe that pins the gate's behavior.
 pub(crate) const IORING_SETUP_SINGLE_ISSUER: u32 = 1 << 12;
+
+/// `io_uring_setup` flag. The completion queue takes its size from `cq_entries`, not twice the submission depth
+/// (`io_uring_fill_params`, `io_uring/io_uring.c`).
+pub(crate) const IORING_SETUP_CQSIZE: u32 = 1 << 3;
 
 /// `io_uring_setup` flag: this process supplies the ring memory, at the addresses in `sq_off.user_addr` (the SQE array)
 /// and `cq_off.user_addr` (the combined SQ/CQ ring region), instead of the kernel allocating it

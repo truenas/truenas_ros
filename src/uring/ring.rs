@@ -363,21 +363,26 @@ impl RingFd {
     /// No help against `RLIMIT_MEMLOCK`, charged the same either way (`io_create_region` -> `__io_account_mem`), so
     /// surviving that ceiling means asking for a smaller ring.
     pub(crate) fn setup(entries: u32) -> errno::Result<RingFd> {
-        match Self::setup_kernel_memory(entries) {
+        Self::setup_sized(entries, None)
+    }
+
+    /// [`RingFd::setup`] with a completion queue of `cq_entries`, for a ring whose ops can post more than one
+    /// completion each. The size is capped at [`MAX_CQ_ENTRIES`]. Below the submission depth the kernel refuses it with
+    /// `EINVAL` (`io_uring_fill_params`).
+    pub(crate) fn setup_sized(entries: u32, cq_entries: Option<u32>) -> errno::Result<RingFd> {
+        let cq_entries = cq_entries.map(|cq| cq.min(MAX_CQ_ENTRIES));
+        match Self::setup_kernel_memory(entries, cq_entries) {
             // The retry reports its own errno, which need not be a memory one (`EMFILE`, `EPERM` after a sysctl flip,
             // `EINVAL` from a kernel without `NO_MMAP`). Test helpers skip on `ENOMEM` (`super::setup_unavailable`), so
             // mapping those to `ENOMEM` would hide failures.
-            Err(Errno::ENOMEM) => Self::setup_with_own_memory(entries),
+            Err(Errno::ENOMEM) => Self::setup_with_own_memory(entries, cq_entries),
             other => other,
         }
     }
 
     /// `io_uring_setup(2)` with the kernel allocating the ring memory.
-    fn setup_kernel_memory(entries: u32) -> errno::Result<RingFd> {
-        let mut params = IoUringParams {
-            flags: IORING_SETUP_NO_SQARRAY,
-            ..IoUringParams::default()
-        };
+    fn setup_kernel_memory(entries: u32, cq_entries: Option<u32>) -> errno::Result<RingFd> {
+        let mut params = sized_params(IORING_SETUP_NO_SQARRAY, cq_entries);
         let fd = io_uring_setup(entries, &mut params)?;
         Ok(RingFd {
             fd,
@@ -390,8 +395,8 @@ impl RingFd {
     ///
     /// `RingMemory` is built before the syscall so its `Drop` covers the `?`, including the `EINVAL` a kernel too old
     /// for the flag answers with.
-    fn setup_with_own_memory(entries: u32) -> errno::Result<RingFd> {
-        let (rings_len, sqes_len) = region_bytes(entries);
+    fn setup_with_own_memory(entries: u32, cq_entries: Option<u32>) -> errno::Result<RingFd> {
+        let (rings_len, sqes_len) = region_bytes(entries, cq_entries);
         let rings = mmap_anon(rings_len)?;
         let sqes = match mmap_anon(sqes_len) {
             Ok(s) => s,
@@ -408,10 +413,7 @@ impl RingFd {
             sqes_len,
         };
 
-        let mut params = IoUringParams {
-            flags: IORING_SETUP_NO_SQARRAY | IORING_SETUP_NO_MMAP,
-            ..IoUringParams::default()
-        };
+        let mut params = sized_params(IORING_SETUP_NO_SQARRAY | IORING_SETUP_NO_MMAP, cq_entries);
         // The kernel sizes each region itself and pins that much from the address given, so these need only be
         // page-aligned - `mmap` - and large enough, which `region_bytes` guarantees.
         params.cq_off.user_addr = rings as u64;
@@ -774,6 +776,12 @@ impl Ring {
         self.rings.sqes[idx].with(|sqe| unsafe { *sqe })
     }
 
+    /// How many SQEs are staged and not yet submitted.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn staged_count(&self) -> u32 {
+        self.to_submit
+    }
+
     /// Rewind SQE staging to empty, so a test that only *stages* SQEs can reuse one ring across iterations.
     ///
     /// Prefer this to a ring per iteration. A ring is freed asynchronously (`io_ring_exit_work`), and its regions stay
@@ -851,19 +859,36 @@ fn page_align(n: usize) -> usize {
     n.next_multiple_of(crate::uring::page_size())
 }
 
-/// Byte sizes of the two regions an `entries`-slot ring needs: the combined SQ/CQ ring region and the SQE array
-/// (`rings_size`, `io_uring/io_uring.c`).
+/// The kernel's ceiling on a completion queue (`IORING_MAX_CQ_ENTRIES`, `io_uring/io_uring.h`). This crate never sets
+/// `IORING_SETUP_CLAMP`, so a larger request would fail with `EINVAL`.
+pub(crate) const MAX_CQ_ENTRIES: u32 = 65536;
+
+/// Setup parameters with `flags`, and with [`IORING_SETUP_CQSIZE`] when `cq_entries` is set.
+fn sized_params(flags: u32, cq_entries: Option<u32>) -> IoUringParams {
+    let mut params = IoUringParams {
+        flags,
+        ..IoUringParams::default()
+    };
+    if let Some(cq) = cq_entries {
+        params.flags |= IORING_SETUP_CQSIZE;
+        params.cq_entries = cq;
+    }
+    params
+}
+
+/// Byte sizes of the two regions an `entries`-slot ring needs, the combined SQ/CQ ring region and the SQE array
+/// (`rings_size`, `io_uring/io_uring.c`). `cq_entries` is the completion-queue size asked for, if any.
 ///
 /// Upper bounds, since the kernel pins only what it sizes itself and under-sizing fails the pin with `EFAULT`. They
-/// hold because `cq_entries` is twice `roundup_pow_of_two(entries)` (`io_uring_fill_params`), this crate sets no
-/// `CQSIZE`, `SQE128` or `CQE32`, and `NO_SQARRAY` leaves no index array. `IO_RINGS_HEADER_MAX` covers
-/// `offsetof(struct io_rings, cqes)` for a 64- or 128-byte `L1_CACHE_BYTES`.
-fn region_bytes(entries: u32) -> (usize, usize) {
+/// hold because the completion queue is twice `roundup_pow_of_two(entries)`, or `roundup_pow_of_two(cq_entries)` under
+/// `CQSIZE` (`io_uring_fill_params`), this crate sets no `SQE128` or `CQE32`, and `NO_SQARRAY` leaves no index array.
+/// `IO_RINGS_HEADER_MAX` covers `offsetof(struct io_rings, cqes)` for a 64- or 128-byte `L1_CACHE_BYTES`.
+fn region_bytes(entries: u32, cq_entries: Option<u32>) -> (usize, usize) {
     const IO_RINGS_HEADER_MAX: usize = 256;
 
     // Widened before rounding, so `next_power_of_two` cannot overflow and no `u32` can panic here.
     let sq_entries = (entries.max(1) as usize).next_power_of_two();
-    let cq_entries = 2 * sq_entries;
+    let cq_entries = cq_entries.map_or(2 * sq_entries, |cq| (cq.max(1) as usize).next_power_of_two());
 
     let rings = IO_RINGS_HEADER_MAX + cq_entries * size_of::<IoUringCqe>();
     let sqes = sq_entries * size_of::<IoUringSqe>();
@@ -966,7 +991,7 @@ mod tests {
     /// At 4096 entries, since at 8 `region_bytes` is one page either way and page rounding would hide a sizing error.
     #[test]
     fn caller_allocated_ring_round_trips() {
-        let setup = match RingFd::setup_with_own_memory(4096) {
+        let setup = match RingFd::setup_with_own_memory(4096, None) {
             Ok(r) => r,
             Err(e) if crate::uring::setup_unavailable(e) => return,
             Err(e) => panic!("setup_with_own_memory: {e}"),
@@ -1058,7 +1083,7 @@ mod tests {
     fn unmapped_caller_allocated_ring_releases_its_memory() {
         const TRIES: usize = 8;
         for attempt in 1..=TRIES {
-            let setup = match RingFd::setup_with_own_memory(8) {
+            let setup = match RingFd::setup_with_own_memory(8, None) {
                 Ok(r) => r,
                 Err(e) if crate::uring::setup_unavailable(e) => return,
                 Err(e) => panic!("setup_with_own_memory: {e}"),
@@ -1086,7 +1111,7 @@ mod tests {
     /// through the fd (`io_region_validate_mmap`), so `MADV_DONTFORK` in `mmap_anon` is the whole of that boundary.
     #[test]
     fn caller_allocated_ring_memory_is_not_inherited() {
-        let setup = match RingFd::setup_with_own_memory(8) {
+        let setup = match RingFd::setup_with_own_memory(8, None) {
             Ok(r) => r,
             Err(e) if crate::uring::setup_unavailable(e) => return,
             Err(e) => panic!("setup_with_own_memory: {e}"),
@@ -1135,31 +1160,58 @@ mod tests {
     /// pin with `EFAULT`, and only on the rarely taken `ENOMEM` retry, so production would seldom show it.
     #[test]
     fn region_bytes_covers_the_kernel_layout() {
-        for entries in [1u32, 8, 512, 4096, 32768] {
+        let sizes = [
+            (1u32, None),
+            (8, None),
+            (512, None),
+            (4096, None),
+            (32768, None),
+            (8, Some(1000)),
+            (512, Some(MAX_CQ_ENTRIES)),
+        ];
+        for (entries, cq) in sizes {
             // Through the caller-allocated path, since the kernel-allocated one fails at 32768 entries on a fragmented
             // host.
-            let setup = match RingFd::setup_with_own_memory(entries) {
+            let setup = match RingFd::setup_with_own_memory(entries, cq) {
                 Ok(r) => r,
                 Err(e) if crate::uring::setup_unavailable(e) => return,
-                Err(e) => panic!("setup_with_own_memory({entries}): {e}"),
+                Err(e) => panic!("setup_with_own_memory({entries}, {cq:?}): {e}"),
             };
             let p = setup.params;
             // Release the fd and its memlock charge before the next size, since a ring is freed asynchronously.
             drop(setup);
+            if let Some(cq) = cq {
+                assert_eq!(
+                    p.cq_entries,
+                    cq.next_power_of_two(),
+                    "entries={entries}: CQSIZE was not applied"
+                );
+            }
 
-            let (rings_len, sqes_len) = region_bytes(entries);
+            let (rings_len, sqes_len) = region_bytes(entries, cq);
             let cq_end = (p.cq_off.cqes as usize) + (p.cq_entries as usize) * size_of::<IoUringCqe>();
             assert!(
                 rings_len >= page_align(cq_end),
-                "entries={entries}: ring region {rings_len} < {cq_end}"
+                "entries={entries} cq={cq:?}: ring region {rings_len} < {cq_end}"
             );
 
             let sqes_end = (p.sq_entries as usize) * size_of::<IoUringSqe>();
             assert!(
                 sqes_len >= page_align(sqes_end),
-                "entries={entries}: SQE region {sqes_len} < {sqes_end}"
+                "entries={entries} cq={cq:?}: SQE region {sqes_len} < {sqes_end}"
             );
         }
+    }
+
+    /// A completion queue asked for past the kernel's ceiling gets the ceiling, not `EINVAL`.
+    #[test]
+    fn a_completion_queue_past_the_ceiling_is_capped() {
+        let setup = match RingFd::setup_sized(8, Some(MAX_CQ_ENTRIES + 1)) {
+            Ok(r) => r,
+            Err(e) if crate::uring::setup_unavailable(e) => return,
+            Err(e) => panic!("setup_sized: {e}"),
+        };
+        assert_eq!(setup.params.cq_entries, MAX_CQ_ENTRIES);
     }
 
     /// A ring created on one thread is mapped and driven on another, and the completion comes back there: the property

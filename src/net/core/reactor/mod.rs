@@ -10,6 +10,8 @@
 mod close;
 mod io;
 mod wake;
+#[cfg(feature = "net-server")]
+mod zero_copy;
 
 // The role layers are the only consumers, so a core-alone build has none: gate the re-export or it is an unused import
 // there.
@@ -126,6 +128,12 @@ pub(crate) struct Reactor<U> {
     /// every ring of the spread reads when it accepts.
     #[cfg(feature = "net-server")]
     pub(crate) spread: Option<crate::net::server::spread::Joined>,
+    /// Bytes of this ring's zero-copy sends the kernel may still read, bounded by `SendZeroCopy::max_pinned`.
+    #[cfg(feature = "net-server")]
+    pub(crate) zc_pinned: usize,
+    /// Zero-copy sends of this ring that still owe a completion.
+    #[cfg(feature = "net-server")]
+    pub(crate) zc_owed: u64,
     /// The shared io_uring engine (ring, in-flight accounting, wake, stop flags). Declared last so the ring drops after
     /// `table`'s buffers.
     pub(crate) engine: Engine,
@@ -158,6 +166,10 @@ impl<U> Reactor<U> {
             held_turn: None,
             #[cfg(feature = "net-server")]
             spread: None,
+            #[cfg(feature = "net-server")]
+            zc_pinned: 0,
+            #[cfg(feature = "net-server")]
+            zc_owed: 0,
             engine,
         }
     }
@@ -182,17 +194,25 @@ impl<U> Reactor<U> {
     /// furnished fd's close - so close it here, or a teardown racing an install leaks a real process fd (it survives
     /// the ring's own close; matters when the process outlives the owner).
     pub(crate) fn cancel_and_reap_all(&mut self, other: &mut dyn FnMut(&IoUringCqe)) -> errno::Result<()> {
-        self.engine.cancel_and_reap_all(pack(Op::Cancel, 0, 0), |cqe| {
-            let (op, _, _) = unpack(cqe.user_data);
-            if matches!(op, Some(Op::FdInstall | Op::DetachInstall)) && cqe.res >= 0 {
-                // SAFETY: `res` is a freshly installed owned process fd that no handler will take ownership of on this
-                // teardown path.
-                unsafe { libc::close(cqe.res) };
-            }
-            // Anything not the reactor's own goes to the host sharing this ring, since this drain does not dispatch and
-            // an `openat2` completing here would leak a process fd. Tags are disjoint (`TAG_FS_DOMAIN`).
-            other(cqe);
-        })
+        #[cfg(feature = "net-server")]
+        if self.cfg.zero_copy() {
+            return self.settle_zero_copy(other);
+        }
+        self.engine
+            .cancel_and_reap_all(pack(Op::Cancel, 0, 0), |cqe| Self::on_drained(cqe, other))
+    }
+
+    /// The sweep [`cancel_and_reap_all`](Self::cancel_and_reap_all) gives each reaped completion.
+    fn on_drained(cqe: &IoUringCqe, other: &mut dyn FnMut(&IoUringCqe)) {
+        let (op, _, _) = unpack(cqe.user_data);
+        if matches!(op, Some(Op::FdInstall | Op::DetachInstall)) && cqe.res >= 0 {
+            // SAFETY: `res` is a freshly installed owned process fd that no handler will take ownership of on this
+            // teardown path.
+            unsafe { libc::close(cqe.res) };
+        }
+        // Anything not the reactor's own goes to the host sharing this ring, since this drain does not dispatch and an
+        // `openat2` completing here would leak a process fd. Tags are disjoint (`TAG_FS_DOMAIN`).
+        other(cqe);
     }
 
     /// Empty a fully-reaped slot (bumping its generation) and account a closed connection if one was serving there.

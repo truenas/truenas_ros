@@ -18,7 +18,7 @@ fn bare_server() -> Option<
 
 /// As [`bare_server`], with `cfg`.
 #[allow(clippy::type_complexity)]
-fn bare_server_with(
+pub(super) fn bare_server_with(
     cfg: ServerConfig,
 ) -> Option<
     Server<
@@ -36,7 +36,7 @@ fn bare_server_with(
 }
 
 /// A connected TCP pair whose server end was accepted outside any ring, like a socket another process passes on.
-fn accepted_elsewhere() -> (TcpStream, OwnedFd) {
+pub(super) fn accepted_elsewhere() -> (TcpStream, OwnedFd) {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let client = TcpStream::connect(l.local_addr().expect("local addr")).expect("connect");
     let (server_end, _) = l.accept().expect("accept");
@@ -171,7 +171,7 @@ fn adopt_reports_a_full_pool() {
 }
 
 /// A lent part whose `done` reports on a channel.
-fn lend(bytes: &[u8], done: std::sync::mpsc::Sender<()>) -> PushPart {
+pub(super) fn lend(bytes: &[u8], done: std::sync::mpsc::Sender<()>) -> PushPart {
     // SAFETY: every caller keeps `bytes` alive and unchanged until `done` has reported.
     PushPart::Lent(unsafe {
         Lent::new(bytes.as_ptr(), bytes.len(), move || {

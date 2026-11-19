@@ -79,6 +79,15 @@ pub(crate) enum Op {
     /// An `IORING_OP_MSG_RING` sending an accepted connection's descriptor to the ring of a spread with the fewest
     /// connections (server-only). The slot field is this ring's slot and the generation field the listener index.
     Handoff = 24,
+    /// A zero-copy send and later its notification (server-only). The generation field carries the send's sequence
+    /// instead. That is safe because a connection keeps its slot while it owes a zero-copy completion.
+    SendZc = 25,
+    /// The `TCP_USER_TIMEOUT` setsockopt of a closing connection with zero-copy bytes still unacknowledged
+    /// (server-only). Not counted in `conn.ops`, but the held `CLOSE` waits for it.
+    ZcLinger = 26,
+    /// The `CONNECT` to `AF_UNSPEC` that resets a socket at stop while it still owes notifications (server-only, staged
+    /// by the teardown drain alone).
+    ZcReset = 27,
     /// The completion another ring's `Handoff` posts here: `res` is the slot the kernel installed the connection in,
     /// and the slot field is the listener index (server-only). Its tag is
     /// [`TAG_POSTED`](crate::uring::user_data::TAG_POSTED), since nothing on this ring staged it.
@@ -113,6 +122,9 @@ impl Op {
             22 => Op::ReceiptDeadline,
             23 => Op::Maintain,
             24 => Op::Handoff,
+            25 => Op::SendZc,
+            26 => Op::ZcLinger,
+            27 => Op::ZcReset,
             crate::uring::user_data::TAG_POSTED => Op::Handed,
             _ => return None,
         })
@@ -834,6 +846,9 @@ pub(crate) struct Connection<U> {
     // stable for the life of the op.
     send_iovs: Box<[libc::iovec]>,
     send_msg: libc::msghdr,
+    /// Made at the first zero-copy send.
+    #[cfg(feature = "net-server")]
+    pub(crate) zc: Option<Box<ZcLedger>>,
     // ---- scheduling / lifecycle (owned by the server's state machine) ----
     pub recving: bool, // a recv op is in flight
     // The in-flight recv is an idle header read (armed with nothing buffered -- parked for the next request). Captured
@@ -976,3 +991,7 @@ pub(crate) struct SendProgress {
 mod tests;
 
 mod connection;
+#[cfg(feature = "net-server")]
+mod zero_copy;
+#[cfg(feature = "net-server")]
+pub(crate) use zero_copy::{ZC_WINDOW, ZcLedger};

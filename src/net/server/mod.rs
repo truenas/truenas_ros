@@ -99,7 +99,7 @@ pub use crate::net::core::protocol::{
 };
 pub use crate::uring::force_async::ForceAsync;
 pub use crate::uring::ring::RingFd;
-pub use config::{Listen, ServerConfig};
+pub use config::{Listen, SendZeroCopy, ServerConfig};
 pub use handles::{
     ControlHandle, DeferPermit, Deferred, DetachPermit, Detached, PushFinish, PushHandle, PushPart, Responder,
     ServerStats, ShutdownHandle, StatsHandle,
@@ -250,7 +250,26 @@ pub struct Server<U, AcceptFn, HeaderFn, BodyFn> {
 pub fn setup_ring(addrs: impl IntoIterator<Item = impl Into<Listen>>, cfg: &ServerConfig) -> crate::Result<RingFd> {
     let addrs: Vec<Listen> = addrs.into_iter().map(Into::into).collect();
     cfg.validate(&addrs)?;
-    Ok(RingFd::setup(ring_entries(cfg, &addrs))?)
+    server_ring(cfg, &addrs)
+}
+
+/// The ring for a server on `addrs` under `cfg`.
+fn server_ring(cfg: &ServerConfig, addrs: &[Listen]) -> crate::Result<RingFd> {
+    let entries = ring_entries(cfg, addrs);
+    Ok(RingFd::setup_sized(entries, cq_entries(cfg, entries))?)
+}
+
+/// The completion-queue size of a zero-copy server with `entries` submission slots. Each notification is a second
+/// completion, and one acknowledgement can post a connection's whole window of them at once (`io_notif_tw_complete`).
+/// A completion that does not fit waits in an overflow list, and one the kernel cannot allocate there is lost
+/// (`io_cqring_add_overflow`). The kernel rounds the size up to a power of two (`io_uring_fill_params`), so at the
+/// default `pool_size` a ring gets 65536 entries, a 1 MiB region, which a ring created without `CAP_IPC_LOCK` is
+/// charged against `RLIMIT_MEMLOCK` (`io_create_region`). `setup_sized` caps the size at the kernel's maximum, so
+/// past about 1024 connections a burst of notifications can still overflow.
+fn cq_entries(cfg: &ServerConfig, entries: u32) -> Option<u32> {
+    cfg.send_zero_copy?;
+    let windows = cfg.pool_size.saturating_mul(crate::net::core::conn::ZC_WINDOW);
+    Some(entries.saturating_mul(2).saturating_add(windows))
 }
 
 /// Op-table size for the embedded fs reactor, 0 when disabled. The handler's budget (`fs_ops`) plus one slot per
@@ -313,7 +332,7 @@ where
     ) -> crate::Result<Self> {
         let addrs: Vec<Listen> = addrs.into_iter().map(Into::into).collect();
         cfg.validate(&addrs)?;
-        let ring = RingFd::setup(ring_entries(&cfg, &addrs))?;
+        let ring = server_ring(&cfg, &addrs)?;
         Self::build(addrs, cfg, protocol, ring)
     }
 
@@ -542,6 +561,12 @@ where
                     .into(),
             ));
         }
+        // A detached socket would leave while the kernel may still read its zero-copy pages.
+        if self.handlers.detach.is_some() && self.core.cfg.zero_copy() {
+            return Err(Error::Validation(
+                "send_zero_copy cannot be combined with Response::Detach".into(),
+            ));
+        }
         self.core.arm_wake()?;
         self.core.engine.shared.wake.activate();
         self.submit_maintain()?;
@@ -710,6 +735,14 @@ where
             // splice for the remainder.
             Some(Op::SplicePoll) => self.core.on_splice_poll(slot, generation, cqe.res)?,
             Some(Op::Send) => self.on_send(slot, generation, cqe.res)?,
+            // For a zero-copy send the generation field carries its sequence.
+            Some(Op::SendZc) if cqe.flags & IORING_CQE_F_NOTIF != 0 => {
+                self.core.on_send_zc_notif(slot, generation, cqe.res)?
+            }
+            Some(Op::SendZc) => self.on_send_zc(slot, generation, cqe.res, cqe.flags)?,
+            Some(Op::ZcLinger) => self.core.on_zc_linger(slot, generation)?,
+            // Staged only by the teardown drain, which does not dispatch.
+            Some(Op::ZcReset) => {}
             Some(Op::Close) => self.core.on_closed(slot)?,
             // The graceful-shutdown grace period expired (or the op was cancelled at teardown): if still draining,
             // escalate to a hard stop - `serve_forever`'s drain cancels whatever remains.
@@ -1066,5 +1099,25 @@ mod iowq_tests {
         let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
         let kernel = entries.min(4 * online as u32);
         assert_eq!(bounded, kernel, "the kernel's own bound");
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod cq_tests {
+    use super::*;
+
+    /// A zero-copy ring gets room for each connection's window of notifications on top of the default. Others keep the
+    /// kernel's sizing.
+    #[test]
+    fn a_zero_copy_ring_gets_room_for_its_notifications() {
+        let off = ServerConfig::default();
+        assert_eq!(cq_entries(&off, 1024), None, "a ring without zero-copy changed size");
+        let on = ServerConfig {
+            pool_size: 4,
+            send_zero_copy: Some(SendZeroCopy::default()),
+            ..ServerConfig::default()
+        };
+        let window = crate::net::core::conn::ZC_WINDOW;
+        assert_eq!(cq_entries(&on, 64), Some(2 * 64 + 4 * window));
     }
 }

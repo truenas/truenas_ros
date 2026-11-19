@@ -123,6 +123,20 @@ pub(crate) struct StatsInner {
     /// Provided-buffer rings `RLIMIT_MEMLOCK` refused at construction. Written once, before the loop starts.
     #[cfg(feature = "net-server")]
     pub(crate) buf_rings_refused_memlock: AtomicU64,
+    /// Zero-copy sends that moved bytes, and the bytes they moved (also in `send_ops` and `bytes_out`).
+    #[cfg(feature = "net-server")]
+    pub(crate) zero_copy_sends: AtomicU64,
+    #[cfg(feature = "net-server")]
+    pub(crate) zero_copy_bytes: AtomicU64,
+    /// Connections that went back to copying because the kernel copied a zero-copy send anyway.
+    #[cfg(feature = "net-server")]
+    pub(crate) zero_copy_copied: AtomicU64,
+    /// Zero-copy sends the kernel refused outright, each sent again with a copy.
+    #[cfg(feature = "net-server")]
+    pub(crate) zero_copy_fallbacks: AtomicU64,
+    /// Sockets a stopping server reset because their peers had not acknowledged zero-copy bytes within the linger.
+    #[cfg(feature = "net-server")]
+    pub(crate) zero_copy_resets: AtomicU64,
 }
 
 /// Bump a stats counter (single-writer loop thread; Relaxed is sufficient).

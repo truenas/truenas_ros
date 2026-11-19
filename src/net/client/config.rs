@@ -157,6 +157,10 @@ impl ClientConfig {
             recv_shortage_retry: None,
             // Server-only: the knob is on `ServerConfig`, and a client's ops are submitted unflagged.
             force_async: crate::uring::force_async::ForceAsync::empty(),
+            // Server-only: a client always copies.
+            zc_threshold: usize::MAX,
+            zc_max_pinned: 0,
+            zc_linger: std::time::Duration::ZERO,
         }
     }
 }

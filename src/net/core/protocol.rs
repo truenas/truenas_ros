@@ -418,7 +418,8 @@ impl std::fmt::Debug for Body<'_> {
 /// and unchanged until the `done` callback runs. The callback runs once, on the thread that drops the `Lent`: the ring
 /// thread after the last of the bytes is sent, the ring thread when the connection closes first, or the pushing thread
 /// when the push cannot reach the ring at all. A send completion means the kernel has copied the bytes, so the
-/// memory is free for reuse when `done` runs.
+/// memory is free for reuse when `done` runs. After a zero-copy send (`ServerConfig::send_zero_copy`), `done` runs at
+/// the send's notification, since the kernel reads the bytes until the peer acknowledges them.
 ///
 /// It does not run at all on one path. A teardown whose ring drain failed leaks the connection table rather than
 /// free it, since an op may still be reading those buffers, so a `Lent` queued there is forgotten with its callback
@@ -514,7 +515,8 @@ impl SendBuf {
     /// allocation once the pool is warm. A deferred reply is marked by sending it with `Deferred::reply_recycled`.
     ///
     /// Its storage goes home as well when its connection closes before it is sent. It is freed as any owned segment is
-    /// when it is empty or when the ring has no body pool.
+    /// when it is empty or when the ring has no body pool. After a zero-copy send it goes home at the send's
+    /// notification.
     pub fn recycled(bytes: Vec<u8>) -> SendBuf {
         SendBuf(Seg::Recycled(bytes))
     }

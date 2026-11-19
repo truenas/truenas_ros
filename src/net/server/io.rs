@@ -275,24 +275,7 @@ where
                 if (t.slot, t.generation, t.req_id) != (slot, gen64, req_id) {
                     return self.core.close_conn(slot, generation, CloseReason::HandlerClosed);
                 }
-                // Detach hands the socket fd to a worker for a blocking op, so it is only safe on a fully settled
-                // connection: no other request in flight, and nothing buffered past this one (the raw stream that
-                // follows belongs to the fd, not the framer).
-                let settled = {
-                    let conn = self.core.table.conn(slot);
-                    // `closing`/`ops`: a teardown already in flight owns this slot's remaining completions, and parking
-                    // it as `Detaching` would take it out of the state those completions are accounted against.
-                    !conn.closing
-                        && conn.ops == 0
-                        && !conn.recving
-                        && !conn.sending
-                        && !conn.splicing
-                        && !conn.splice_polling
-                        && conn.outstanding == 0
-                        && conn.buffered() == 0
-                        && !conn.has_pending_send()
-                };
-                if !settled {
+                if !self.core.table.conn(slot).detach_settled() {
                     return self.core.close_conn(slot, generation, CloseReason::HandlerClosed);
                 }
                 // Park as `Detaching` and materialize the real fd; the parked connection resumes or closes when the
@@ -365,6 +348,18 @@ where
         let step = self.core.on_send_complete(slot, generation, res)?;
         // Flushed tail chunks gave back their shares (`advance_sent`), so a read waiting on one can go now. A no-op on
         // a closed connection or without an active tail.
+        #[cfg(feature = "uring-fs")]
+        self.drive_file_tail(slot, generation, false)?;
+        match step {
+            SendStep::Pump => self.pump(slot, generation),
+            SendStep::Done => Ok(()),
+        }
+    }
+
+    /// The result of zero-copy send `seq` ([`Reactor::on_send_zc_complete`]), then as [`on_send`](Self::on_send).
+    pub(super) fn on_send_zc(&mut self, slot: u32, seq: u32, res: i32, flags: u32) -> errno::Result<()> {
+        let step = self.core.on_send_zc_complete(slot, seq, res, flags)?;
+        let generation = self.core.table.generation_low(slot);
         #[cfg(feature = "uring-fs")]
         self.drive_file_tail(slot, generation, false)?;
         match step {

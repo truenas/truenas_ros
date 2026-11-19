@@ -187,13 +187,23 @@ impl<U> Reactor<U> {
                 sqe.len = libc::SHUT_RDWR as u32;
             })
         } else {
-            self.submit_close(slot, generation)
+            self.close_unless_held(slot, generation)
         }
+    }
+
+    /// [`submit_close`](Self::submit_close), unless zero-copy sends still owe notifications. The last notification
+    /// stages the `CLOSE` then.
+    fn close_unless_held(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
+        #[cfg(feature = "net-server")]
+        if self.hold_close(slot, generation)? {
+            return Ok(());
+        }
+        self.submit_close(slot, generation)
     }
 
     /// Stage the `CLOSE` that reclaims a direct descriptor (and, once it reaps, the slot). Does not touch `ops` - the
     /// teardown is counted in `submit_teardown`.
-    fn submit_close(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
+    pub(super) fn submit_close(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         self.stage(pack(Op::Close, slot, generation), move |sqe| {
             sqe.opcode = IORING_OP_CLOSE;
             sqe.fd = 0;
@@ -205,7 +215,7 @@ impl<U> Reactor<U> {
     /// which is fine; any owed FIN is out. Submit the CLOSE. The slot cannot recycle between the two ops (release
     /// happens only in `on_closed`), so no generation recheck.
     pub(crate) fn on_shutdown(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
-        self.submit_close(slot, generation)
+        self.close_unless_held(slot, generation)
     }
 
     /// The `CLOSE` that reclaims a direct descriptor completed: account it and, once the connection's last op has
