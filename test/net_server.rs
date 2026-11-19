@@ -398,6 +398,10 @@ mod fs_conn;
 #[path = "net_server/fs_files.rs"]
 mod fs_files;
 
+#[cfg(feature = "uring-fs")]
+#[path = "net_server/fs_chain.rs"]
+mod fs_chain;
+
 // The helpers it shares with `fs_files` run no ring under loom.
 #[cfg(all(feature = "uring-fs", not(loom)))]
 #[path = "net_server/write_lane.rs"]

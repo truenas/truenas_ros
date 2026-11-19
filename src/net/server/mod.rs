@@ -366,8 +366,13 @@ where
         protocol: Protocol<AcceptFn, HeaderFn, BodyFn>,
         ring: RingFd,
     ) -> crate::Result<Self> {
-        // FS ops submit on raw fds, not the registered table, so the pool holds only the `pool_size` connection slots.
-        let mut engine = Engine::on_ring(ring, cfg.pool_size)?;
+        // FS ops submit on raw fds, not the registered table, so the pool holds only the `pool_size` connection slots,
+        // and past it one slot for each op slot when chains reopen into the table.
+        #[cfg(feature = "uring-fs")]
+        let chain_slots = if cfg.fs_chain_slots { fs_op_slots(&cfg) } else { 0 };
+        #[cfg(not(feature = "uring-fs"))]
+        let chain_slots = 0;
+        let mut engine = Engine::on_ring(ring, cfg.pool_size, chain_slots)?;
         if let Some(workers) = cfg.iowq_bounded_workers {
             engine.ring.bound_iowq_workers(workers)?;
         }
@@ -460,6 +465,9 @@ where
                 floor: cfg.write_offload_floor,
                 ceiling: cfg.write_offload_ceiling,
             });
+            if chain_slots > 0 {
+                fs.enable_chains(cfg.pool_size);
+            }
             fs
         });
         let mut core = Reactor::from_parts(engine, cfg.pool_size, cfg.to_core(), pads);

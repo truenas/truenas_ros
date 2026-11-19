@@ -155,7 +155,10 @@ pub(crate) mod core;
 pub mod file_lease;
 // Exported without `net-server`, since a consumer driving a standalone [`UringFs`] needs the `FsConn` facade to run
 // several operations back to back as much as an embedded server does.
-pub use core::{ConnToken, DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, StepPath, Timer, boxed_callbacks};
+pub use core::{
+    Chain, ChainDone, ChainStep, ConnToken, DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, Reopen, StepPath,
+    Timer, boxed_callbacks,
+};
 // The one on-loop type that is the server's alone: a window of a pooled receive buffer, which only the net server has.
 #[cfg(feature = "net-server")]
 pub use core::LeasedWindow;
@@ -484,7 +487,7 @@ impl ReopenAccess {
     /// The `open_how` of the reopen, this access with `O_CLOEXEC` and `O_NOCTTY`, and whether the special-file guard
     /// added `O_NONBLOCK`, which it does for every access, so that a FIFO answers at once rather than hold a worker. No
     /// resolve flag is set, since `RESOLVE_NO_MAGICLINKS` refuses the link under `/proc` that the reopen follows, and
-    /// the path is absolute, which `RESOLVE_BENEATH` and `RESOLVE_IN_ROOT` refuse.
+    /// the link leaves the folder it is named in, which `RESOLVE_BENEATH` and `RESOLVE_IN_ROOT` refuse.
     pub(crate) fn how(self) -> (RawOpenHow, bool) {
         let access = match self {
             ReopenAccess::Read => libc::O_RDONLY,

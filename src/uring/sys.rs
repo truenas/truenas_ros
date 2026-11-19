@@ -317,6 +317,17 @@ pub(crate) const IOSQE_FIXED_FILE: u8 = 1 << 0;
 /// `IORING_OP_LINK_TIMEOUT` that bounds this op's lifetime.
 pub(crate) const IOSQE_IO_LINK: u8 = 1 << 2;
 
+/// `sqe.flags`: link the following SQE as `IOSQE_IO_LINK` does, but run it whatever this one answers, a cancellation
+/// included, since `io_disarm_next` (`io_uring/timeout.c`) fails the rest of a link only without it.
+#[cfg(feature = "uring-fs")]
+pub(crate) const IOSQE_IO_HARDLINK: u8 = 1 << 3;
+
+/// `sqe.flags`: post no completion for this op unless it fails through `req_set_fail` (`io_uring/io_uring.h`), which
+/// only some opcodes call on their own errors. A ring that sets it can no longer take `IOSQE_IO_DRAIN`
+/// (`drain_disabled` in `io_init_req`, `io_uring/io_uring.c`).
+#[cfg(feature = "uring-fs")]
+pub(crate) const IOSQE_CQE_SKIP_SUCCESS: u8 = 1 << 6;
+
 /// `sqe.flags`: skip the inline issue and hand the op straight to io-wq (`REQ_F_FORCE_ASYNC`,
 /// `io_uring/io_uring.c:2367`).
 ///

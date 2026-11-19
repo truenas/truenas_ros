@@ -271,6 +271,42 @@ fn a_signal_left_from_a_lease_given_back_reports_no_break() {
     assert!(heard.borrow().is_empty(), "{:?}", heard.borrow());
 }
 
+/// A reopen names its file in the folder of the ring thread's own descriptors, not a path from the root, and the folder
+/// is the thread's, not the process's, since `/proc/thread-self` resolves to the thread that opens it.
+#[test]
+fn a_reopen_names_its_file_in_the_folder_of_the_ring_threads_descriptors() {
+    // A thread of its own, so its id differs from the process's, as a ring thread's does.
+    std::thread::spawn(|| {
+        let (mut eng, mut fs, _) = setup();
+        let (_dir, path, file) = a_file();
+        std::fs::write(&path, b"bytes").expect("write");
+        let out: Rc<RefCell<Option<FsDone>>> = Rc::default();
+        let o = Rc::clone(&out);
+        FsConn::new(&mut fs, &mut eng, None).reopen_proc_as_root(file, ReopenAccess::Read, move |d, _| {
+            *o.borrow_mut() = Some(d);
+        });
+        pump_until(&mut eng, &mut fs, |_| out.borrow().is_some());
+        let done = out.borrow_mut().take().expect("answered");
+        let file = done
+            .file()
+            .unwrap_or_else(|| panic!("the reopen worked: {:?}", done.result()));
+        let mut bytes = String::new();
+        std::io::Read::read_to_string(&mut std::fs::File::from(file.fd.try_clone().expect("dup")), &mut bytes)
+            .expect("read");
+        assert_eq!(bytes, "bytes");
+        let dir = fs.proc_fd_dir.as_ref().expect("the folder opened").as_raw_fd();
+        // SAFETY: `gettid` takes nothing.
+        let tid = unsafe { libc::gettid() };
+        let link = std::fs::read_link(format!("/proc/self/fd/{dir}")).expect("readlink");
+        assert_eq!(
+            link,
+            std::path::Path::new(&format!("/proc/{}/task/{tid}/fd", std::process::id()))
+        );
+    })
+    .join()
+    .expect("the thread's checks");
+}
+
 /// An open on the ring meets a lease with the special-file guard's `O_NONBLOCK`, so the reopen for writing answers
 /// `EWOULDBLOCK` at once, and the break it began reaches the handler.
 #[test]

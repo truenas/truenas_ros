@@ -100,6 +100,15 @@ pub struct ServerConfig {
     /// Default 256 KiB, validated to 4 KiB..=16 MiB.
     #[cfg(feature = "uring-fs")]
     pub fs_body_chunk: usize,
+    /// Give each op slot of the embedded fs reactor a slot of the registered table of its own past the pool, which
+    /// multishot accept never fills, so [`FsConn::chain`](crate::uring_fs::FsConn::chain) has a slot to reopen into
+    /// whenever it has an op, and keep beside each op slot what a chain needs while it runs, about 290 bytes, a statx
+    /// buffer among them. Off (the default), a chain is refused. The table then holds `pool_size` plus the whole op
+    /// table, and the kernel refuses one larger than `RLIMIT_NOFILE` as the ring is set up (`io_sqe_files_register` in
+    /// `io_uring/rsrc.c`), so a server that turns this on raises that limit first
+    /// ([`raise_nofile_limit`](crate::fd::raise_nofile_limit)).
+    #[cfg(feature = "uring-fs")]
+    pub fs_chain_slots: bool,
     /// Draw file-body chunk buffers from a registered provided-buffer ring (`true`, the default), or have each read
     /// supply its own. There is nothing to size. The ring has a 16-byte descriptor for every chunk that could be in
     /// flight, and buffers follow demand from [`buf_pool_initial_bytes`](ServerConfig::buf_pool_initial_bytes).
@@ -306,6 +315,8 @@ impl Default for ServerConfig {
             fs_ops: 0,
             #[cfg(feature = "uring-fs")]
             fs_callback_bytes: crate::uring_fs::core::FS_CALLBACK_BYTES,
+            #[cfg(feature = "uring-fs")]
+            fs_chain_slots: false,
             #[cfg(feature = "uring-fs")]
             fs_offload_floor: crate::uring_fs::core::OFFLOAD_FLOOR,
             #[cfg(feature = "uring-fs")]
