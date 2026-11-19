@@ -616,11 +616,24 @@ impl<U> Reactor<U> {
 
     pub(crate) fn submit_send(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         let conn = self.table.conn_mut(slot);
-        conn.arm_send();
+        let armed = conn.arm_send();
         conn.sending = true;
         conn.ops += 1;
         let single = conn.send_single();
         let ktls = conn.is_ktls();
+        // The threshold is `usize::MAX` when zero-copy is off.
+        #[cfg(feature = "net-server")]
+        let zc = if armed >= self.cfg.zc_threshold {
+            self.admit_zero_copy(slot, armed)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "net-server"))]
+        let zc: Option<u32> = {
+            let _ = armed;
+            None
+        };
+        let conn = self.table.conn_mut(slot);
         // SECURITY: over kTLS, a positive send completion is NOT delivery, and this reactor cannot make it one.
         //
         // Records can still sit in the TLS layer's `tx_list`, and the teardown's `SHUT_RDWR` is not a TLS operation, so
@@ -638,17 +651,33 @@ impl<U> Reactor<U> {
             (libc::MSG_WAITALL | libc::MSG_NOSIGNAL) as u32
         };
         let force = self.cfg.force_async.sqe_bit(ForceAsync::SEND);
+        // A zero-copy send carries its sequence in place of the generation, and its notification brings it back.
+        let user_data = match zc {
+            Some(seq) => pack(Op::SendZc, slot, seq),
+            None => pack(Op::Send, slot, generation),
+        };
         let fill = move |sqe: &mut IoUringSqe| {
             match single {
                 Some((ptr, len)) => {
-                    sqe.opcode = IORING_OP_SEND;
+                    sqe.opcode = if zc.is_some() {
+                        IORING_OP_SEND_ZC
+                    } else {
+                        IORING_OP_SEND
+                    };
                     sqe.addr = ptr;
                     sqe.len = len;
                 }
                 None => {
-                    sqe.opcode = IORING_OP_SENDMSG;
+                    sqe.opcode = if zc.is_some() {
+                        IORING_OP_SENDMSG_ZC
+                    } else {
+                        IORING_OP_SENDMSG
+                    };
                     sqe.addr = msg;
                 }
+            }
+            if zc.is_some() {
+                sqe.ioprio = IORING_SEND_ZC_REPORT_USAGE;
             }
             sqe.fd = slot as i32;
             sqe.flags = IOSQE_FIXED_FILE | force;
@@ -656,12 +685,12 @@ impl<U> Reactor<U> {
         };
         let send_ts = (self.cfg.send_timeout.is_some()).then_some(std::ptr::addr_of!(self.pads.send_timeout) as u64);
         match send_ts {
-            None => self.stage(pack(Op::Send, slot, generation), fill),
+            None => self.stage(user_data, fill),
             // Stall guard: a linked timeout cancels a send that sits with no progress for `send_timeout` (a peer that
             // stopped reading). On a cancelled partial send the CQE carries the progress made, so a slow-but-draining
             // peer resets the clock via the re-submit path.
             Some(ts) => self.stage_linked(
-                pack(Op::Send, slot, generation),
+                user_data,
                 move |sqe| {
                     fill(sqe);
                     sqe.flags |= IOSQE_IO_LINK;

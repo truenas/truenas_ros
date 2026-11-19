@@ -252,6 +252,17 @@ impl<U> Reactor<U> {
     /// The core of a send completion (`Op::Send`), returning the [`SendStep`] its role wrapper enacts, `Pump` when the
     /// gather is fully sent and reading should resume.
     pub(crate) fn on_send_complete(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<SendStep> {
+        self.finish_send(slot, generation, res, None)
+    }
+
+    /// [`on_send_complete`](Self::on_send_complete), where `carrier` names the zero-copy send that completed, if any.
+    pub(crate) fn finish_send(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        res: i32,
+        carrier: Option<u32>,
+    ) -> errno::Result<SendStep> {
         if !self.table.slot_matches_cqe(slot, generation) {
             return Ok(SendStep::Done);
         }
@@ -269,7 +280,7 @@ impl<U> Reactor<U> {
         // Retire the PDUs the gather flushed: replies free read-ahead slots (pushes don't participate in the cap).
         let progress = {
             let conn = self.table.conn_mut(slot);
-            let progress = conn.advance_sent(res as usize);
+            let progress = conn.advance_sent(res as usize, carrier);
             conn.outstanding = conn.outstanding.saturating_sub(progress.replies);
             // Bytes flushed to the peer: any idle clock armed before this completion measured a non-quiet interval
             // (`finish_failed_recv`).

@@ -44,6 +44,17 @@ pub(crate) fn fill_getsockopt_cmd(sqe: &mut IoUringSqe, optname: i32, optval: u6
     sqe.addr3 = optval;
 }
 
+/// Fill `sqe` as a `SOCKET_URING_OP_SETSOCKOPT(level, optname)` command with the `optlen` bytes at `optval`, which the
+/// kernel reads at issue. The caller sets `fd`, the flags and `user_data`, as for [`fill_getsockopt_cmd`].
+#[cfg(feature = "net-server")]
+pub(crate) fn fill_setsockopt_cmd(sqe: &mut IoUringSqe, level: i32, optname: i32, optval: u64, optlen: u32) {
+    sqe.opcode = IORING_OP_URING_CMD;
+    sqe.off_addr2 = u64::from(SOCKET_URING_OP_SETSOCKOPT);
+    sqe.addr = (level as u32 as u64) | ((optname as u32 as u64) << 32);
+    sqe.file_index = optlen;
+    sqe.addr3 = optval;
+}
+
 /// Probe whether this kernel accepts socket `URING_CMD`s on `AF_UNIX`.
 ///
 /// The getsockopt command exists since Linux 6.7, but a too-strict `prot->ioctl` guard rejected every socket command on

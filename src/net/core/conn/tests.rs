@@ -11,12 +11,12 @@ fn send_gather_and_advance() {
     // Gather caps at max_send_coalesce (2): PDUs 1+2 armed, PDU 3 waits.
     assert_eq!(c.arm_send(), 30);
     // Partial completion mid-PDU-2: PDU 1 (a reply) finishes, cursor lands inside PDU 2.
-    let p = c.advance_sent(15);
+    let p = c.advance_sent(15, None);
     assert_eq!((p.replies, p.pushes, p.armed_remaining), (1, 0, 15));
     assert_eq!(c.queued_bytes(), 50);
     // Error-recovery re-arm from the cursor: PDU 2's tail + PDU 3.
     assert_eq!(c.arm_send(), 15 + 30);
-    let p = c.advance_sent(45);
+    let p = c.advance_sent(45, None);
     assert_eq!((p.replies, p.pushes, p.armed_remaining), (1, 1, 0));
     assert_eq!(c.queued_bytes(), 0);
     assert!(!c.has_pending_send());
@@ -24,7 +24,7 @@ fn send_gather_and_advance() {
     // A completion never advances past what was armed.
     c.enqueue(vec![4; 8], SendKind::ReplyLast);
     assert_eq!(c.arm_send(), 8);
-    let p = c.advance_sent(usize::MAX);
+    let p = c.advance_sent(usize::MAX, None);
     assert_eq!((p.replies, p.armed_remaining), (1, 0));
 }
 
@@ -35,7 +35,7 @@ fn vectored_reply_head_counts_as_one_reply_no_push() {
     // as a push.
     assert!(c.enqueue_reply_segments(vec![vec![b'H'; 12].into(), vec![b'B'; 40].into(),]));
     assert_eq!(c.arm_send(), 12 + 40);
-    let p = c.advance_sent(12 + 40);
+    let p = c.advance_sent(12 + 40, None);
     assert_eq!((p.replies, p.pushes, p.armed_remaining), (1, 0, 0));
 }
 
@@ -49,7 +49,7 @@ fn a_static_segment_is_armed_at_its_own_address() {
     assert_eq!(c.arm_send(), 8 + BODY.len());
     assert_eq!(c.send_iovs[1].iov_base as *const u8, BODY.as_ptr());
     assert_eq!(c.send_iovs[1].iov_len, BODY.len());
-    let p = c.advance_sent(8 + BODY.len());
+    let p = c.advance_sent(8 + BODY.len(), None);
     assert_eq!((p.replies, p.pushes), (1, 0));
     assert_eq!(c.queued_bytes(), 0);
 }
@@ -84,17 +84,17 @@ fn a_recycled_segment_gives_its_storage_back_once_sent() {
     assert_eq!(pool.borrow().held(), 64 + 16, "counted once queued");
     assert_eq!(c.arm_send(), 12 + 8 + 10);
 
-    let _ = c.advance_sent(4);
+    let _ = c.advance_sent(4, None);
     assert_eq!(pool.borrow().retained(), 0, "a partly sent segment keeps its storage");
     assert_eq!(pool.borrow().held(), 64 + 16, "and stays counted");
 
     // The rest of the head, all of the plain segment and half the last.
-    let p = c.advance_sent(8 + 8 + 5);
+    let p = c.advance_sent(8 + 8 + 5, None);
     assert_eq!(p.replies, 1);
     assert_eq!(pool.borrow().retained(), 64, "only the marked segment goes home");
     assert_eq!(pool.borrow().held(), 16, "and leaves the count");
 
-    let p = c.advance_sent(5);
+    let p = c.advance_sent(5, None);
     assert_eq!((p.replies, p.armed_remaining), (1, 0));
     assert_eq!(pool.borrow().retained(), 64 + 16);
     assert_eq!(pool.borrow().held(), 0);
@@ -390,9 +390,12 @@ fn user_data_round_trip() {
             | Op::ReceiptDeadline
             | Op::Maintain
             | Op::Handoff
+            | Op::SendZc
+            | Op::ZcLinger
+            | Op::ZcReset
             | Op::Handed => {}
         }
-        26
+        29
     };
     // Every decodable op value: `from_u8` must invert the discriminant (a renumbered enum with a stale table shows
     // up here), and the decoded set must cover every variant.
@@ -453,7 +456,7 @@ fn file_tail_diverts_reclaims_and_releases_in_order() {
     // The tail's own chunks go straight through.
     c.enqueue_file_chunk(SendBuf::from(vec![b'a'; 8]), false);
     assert_eq!(c.arm_send(), 4 + 8, "head + chunk, no diverted bytes");
-    let p = c.advance_sent(12);
+    let p = c.advance_sent(12, None);
     assert_eq!((p.replies, p.pushes), (0, 0), "nothing retires before the last chunk");
     // The flush freed this connection's share, so a read can be armed again.
     assert!(c.tail_claim_chunk(), "the flush freed a chunk");
@@ -466,7 +469,7 @@ fn file_tail_diverts_reclaims_and_releases_in_order() {
     assert_eq!(c.send_iovs[0].iov_len, 12);
     assert_eq!(c.send_iovs[1].iov_len, 2, "push held until the tail");
     assert_eq!(c.send_iovs[2].iov_len, 3, "deferred reply after it");
-    let p = c.advance_sent(12 + 2 + 3);
+    let p = c.advance_sent(12 + 2 + 3, None);
     assert_eq!(
         (p.replies, p.pushes),
         (2, 1),
@@ -553,7 +556,7 @@ fn chunk_buffers_outlive_the_body_that_minted_them() {
         c.enqueue_file_chunk(buf, true);
         c.finish_file_tail();
         assert_eq!(c.arm_send(), 4);
-        let _ = c.advance_sent(4);
+        let _ = c.advance_sent(4, None);
     };
 
     // A body claims a share, and the flush gives it back - so the next body starts from the same place however many
@@ -923,7 +926,7 @@ fn a_chunk_outliving_its_tail_still_frees_its_buffer() {
     c.finish_file_tail();
     assert!(!c.tail_active(), "no successor");
     assert_eq!(c.arm_send(), 4);
-    let p = c.advance_sent(4);
+    let p = c.advance_sent(4, None);
     assert_eq!(c.chunk_out, 0, "the share came back");
     assert_eq!(p.freed, 1, "and the buffer id rode out to the pool");
     assert_eq!(p.freed_bids[0], 7, "the one the segment held");
@@ -986,4 +989,164 @@ fn a_mark_ends_with_its_message_and_not_at_a_redelivery() {
     c.set_frame(4, 8);
     c.consume();
     assert!(!c.let_in, "the mark outlived its message");
+}
+
+/// Which lent segments ran their `done`, one bit per id.
+#[cfg(feature = "net-server")]
+#[derive(Default)]
+struct Done(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+#[cfg(feature = "net-server")]
+impl Done {
+    fn lent(&self, id: u32, bytes: &'static [u8]) -> SendBuf {
+        let done = std::sync::Arc::clone(&self.0);
+        // SAFETY: a `'static` slice stays valid and unchanged for ever.
+        let lent = unsafe {
+            crate::net::core::protocol::Lent::new(bytes.as_ptr(), bytes.len(), move || {
+                done.fetch_or(1 << id, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        lent.into()
+    }
+
+    fn ran(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "net-server")]
+fn zc_conn() -> Box<Connection<()>> {
+    let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+    c.zc = Some(Box::new(ZcLedger::new(1000)));
+    c
+}
+
+/// Stage a zero-copy send on `c` and complete it with `res` bytes moved and a notification to come.
+#[cfg(feature = "net-server")]
+fn zc_send(c: &mut Connection<()>, res: usize) -> u32 {
+    let zc = c.zc.as_deref_mut().unwrap();
+    let seq = zc.admit().expect("a free window slot");
+    zc.staged(seq);
+    assert_eq!(zc.result(seq, res as i32, true), res);
+    let _ = c.advance_sent(res, Some(seq));
+    seq
+}
+
+#[cfg(feature = "net-server")]
+fn zc_notify(c: &mut Connection<()>, seq: u32) {
+    let (owed, _, _) = c.zc.as_deref_mut().unwrap().notified(seq, false);
+    assert!(owed, "send {seq} was not owed");
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn zero_copy_bytes_go_back_at_the_notification_not_the_result() {
+    let done = Done::default();
+    let mut c = zc_conn();
+    c.enqueue_push_buf(done.lent(0, &[1; 100]), true);
+    assert_eq!(c.arm_send(), 100);
+    let seq = zc_send(&mut c, 100);
+    assert!(!c.has_pending_send(), "the result retires the PDU from the queue");
+    assert_eq!(done.ran(), 0, "the kernel may still read the bytes after the result");
+    zc_notify(&mut c, seq);
+    assert_eq!(done.ran(), 1, "the notification hands the bytes back");
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn a_front_item_split_across_sends_waits_for_its_newest_carrier() {
+    // Zero-copy, then plain: the plain send pops an item a zero-copy send still carries.
+    let done = Done::default();
+    let mut c = zc_conn();
+    c.enqueue_push_buf(done.lent(0, &[1; 100]), true);
+    assert_eq!(c.arm_send(), 100);
+    let first = zc_send(&mut c, 40);
+    assert_eq!(c.arm_send(), 60);
+    let _ = c.advance_sent(60, None);
+    assert_eq!(done.ran(), 0, "a plain send freed bytes a zero-copy send still carries");
+    zc_notify(&mut c, first);
+    assert_eq!(done.ran(), 1);
+
+    // Zero-copy twice, with the notifications in reverse order.
+    let done = Done::default();
+    let mut c = zc_conn();
+    c.enqueue_push_buf(done.lent(0, &[1; 100]), true);
+    assert_eq!(c.arm_send(), 100);
+    let first = zc_send(&mut c, 40);
+    assert_eq!(c.arm_send(), 60);
+    let second = zc_send(&mut c, 60);
+    zc_notify(&mut c, second);
+    assert_eq!(done.ran(), 0, "the first send still reads the head of the item");
+    zc_notify(&mut c, first);
+    assert_eq!(done.ran(), 1);
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn notifications_in_any_order_release_oldest_first() {
+    let done = Done::default();
+    let mut c = zc_conn();
+    c.enqueue_push_buf(done.lent(0, &[1; 10]), true);
+    assert_eq!(c.arm_send(), 10);
+    let a = zc_send(&mut c, 10);
+    c.enqueue_push_buf(done.lent(1, &[2; 20]), true);
+    assert_eq!(c.arm_send(), 20);
+    let b = zc_send(&mut c, 20);
+    // A count of notifications would free the oldest item here, which send `a` still reads.
+    zc_notify(&mut c, b);
+    assert_eq!(done.ran(), 0, "a newer notification freed an older send's bytes");
+    assert_eq!(c.zc.as_deref().unwrap().held_len(), 2);
+    zc_notify(&mut c, a);
+    assert_eq!(done.ran(), 0b11);
+    assert!(!c.zc.as_deref().unwrap().owes());
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn a_zero_copy_result_without_more_owes_nothing() {
+    // A send refused before the kernel made its notification has no `IORING_CQE_F_MORE` and no notification.
+    let mut c = zc_conn();
+    let zc = c.zc.as_deref_mut().unwrap();
+    let seq = zc.admit().unwrap();
+    zc.staged(seq);
+    assert!(zc.owes());
+    assert_eq!(zc.result(seq, -libc::ENOMEM, false), 0);
+    assert!(!zc.owes(), "a notification that will never come is still owed");
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn the_zero_copy_window_refuses_a_sequence_still_owed() {
+    let mut c = zc_conn();
+    let zc = c.zc.as_deref_mut().unwrap();
+    for _ in 0..ZC_WINDOW {
+        let seq = zc.admit().expect("a free window slot");
+        zc.staged(seq);
+        assert_eq!(zc.result(seq, 1, true), 1);
+    }
+    // The next sequence has the bit of the oldest one, which is still owed.
+    assert_eq!(zc.admit(), None);
+    let (owed, moved, _) = zc.notified(0, false);
+    assert!(owed);
+    assert_eq!(moved, 1);
+    assert_eq!(zc.admit(), Some(ZC_WINDOW));
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn a_copy_report_turns_zero_copy_off_only_after_bytes_moved() {
+    let mut c = zc_conn();
+    let zc = c.zc.as_deref_mut().unwrap();
+    // A send that moved nothing reports a copy too (`io_notif_tw_complete`, `io_uring/notif.c`).
+    let idle = zc.admit().unwrap();
+    zc.staged(idle);
+    assert_eq!(zc.result(idle, -libc::ECANCELED, true), 0);
+    assert_eq!(zc.notified(idle, true), (true, 0, false));
+    assert!(!zc.off, "a send that moved nothing turned zero-copy off");
+    let moved = zc.admit().unwrap();
+    zc.staged(moved);
+    assert_eq!(zc.result(moved, 4096, true), 4096);
+    assert_eq!(zc.notified(moved, true), (true, 4096, true));
+    assert!(zc.off);
+    assert_eq!(zc.admit(), None, "a connection that went back to copying stays there");
 }

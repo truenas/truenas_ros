@@ -47,6 +47,8 @@ impl<U> Connection<U> {
             // `arm_send` before kernel use.
             send_iovs: vec![unsafe { std::mem::zeroed() }; max_send_coalesce].into_boxed_slice(),
             send_msg: unsafe { std::mem::zeroed() },
+            #[cfg(feature = "net-server")]
+            zc: None,
             recving: false,
             recv_idle: false,
             served_since_idle_arm: false,
@@ -864,7 +866,14 @@ impl<U> Connection<U> {
     /// Advance the send cursor by `n` bytes (clamped to the armed gather): fully-sent PDUs are popped and tallied by
     /// kind; a partially-sent leader updates the front cursor. A popped [`SendBuf::recycled`] segment's storage goes
     /// back to the ring's body pool as it drops.
-    pub(crate) fn advance_sent(&mut self, n: usize) -> SendProgress {
+    ///
+    /// `carrier` is the zero-copy send that moved the bytes, `None` for a plain send. A PDU that a zero-copy send
+    /// carried goes to the ledger instead of dropping here.
+    pub(crate) fn advance_sent(&mut self, n: usize, carrier: Option<u32>) -> SendProgress {
+        #[cfg(not(feature = "net-server"))]
+        let _ = carrier;
+        #[cfg(feature = "net-server")]
+        let mut front_was_partial = self.front_sent > 0;
         let mut n = n.min(self.armed_bytes);
         self.armed_bytes -= n;
         let mut progress = SendProgress {
@@ -886,6 +895,10 @@ impl<U> Connection<U> {
                 - self.front_sent;
             if n < front_remaining {
                 self.front_sent += n;
+                #[cfg(feature = "net-server")]
+                if let (Some(seq), Some(zc)) = (carrier, self.zc.as_deref_mut()) {
+                    zc.carried_front(seq);
+                }
                 break;
             }
             n -= front_remaining;
@@ -918,8 +931,26 @@ impl<U> Connection<U> {
                     }
                 }
             }
+            #[cfg(feature = "net-server")]
+            if let Some(zc) = self.zc.as_deref_mut() {
+                zc.retire(item, carrier, std::mem::take(&mut front_was_partial));
+            }
+        }
+        #[cfg(feature = "net-server")]
+        if let Some(zc) = self.zc.as_deref_mut() {
+            zc.release();
         }
         progress
+    }
+
+    /// Whether a file body is streaming or still has chunks queued. Its sends keep the copy, since the tail paces itself
+    /// on chunks flushing.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn file_body_in_flight(&self) -> bool {
+        #[cfg(feature = "uring-fs")]
+        return self.chunk_out > 0 || self.tail_active();
+        #[cfg(not(feature = "uring-fs"))]
+        false
     }
 
     /// Stable pointer to the send `msghdr` for an SQE `addr` field.

@@ -31,6 +31,19 @@ fn reactor_with_force_async(
     request_timeout: Option<Duration>,
     force_async: ForceAsync,
 ) -> Option<Reactor<()>> {
+    let tcp = ClientAddr::Inet("127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap());
+    reactor_with_peer(max_receipt_time, request_timeout, force_async, tcp, 1)
+}
+
+/// [`reactor_with_force_async`] with the connection's peer and gather width named.
+#[cfg(feature = "net-server")]
+fn reactor_with_peer(
+    max_receipt_time: Option<Duration>,
+    request_timeout: Option<Duration>,
+    force_async: ForceAsync,
+    peer: ClientAddr,
+    max_send_coalesce: usize,
+) -> Option<Reactor<()>> {
     let engine = match crate::uring::engine::Engine::new(64, 8) {
         Ok(e) => e,
         Err(crate::Error::Errno(e)) if crate::uring::setup_unavailable(e) => {
@@ -52,6 +65,9 @@ fn reactor_with_force_async(
         tls_handshake_timeout: None,
         recv_shortage_retry: None,
         force_async,
+        zc_threshold: usize::MAX,
+        zc_max_pinned: 0,
+        zc_linger: std::time::Duration::ZERO,
     };
     let pads = Box::new(KernelPads {
         deadline: KernelTimespec::default(),
@@ -65,8 +81,7 @@ fn reactor_with_force_async(
         maintain: KernelTimespec::default(),
     });
     let mut r: Reactor<()> = Reactor::from_parts(engine, 4, cfg, pads);
-    let peer = ClientAddr::Inet("127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap());
-    r.table.install(0, Connection::new(peer, (), 1));
+    r.table.install(0, Connection::new(peer, (), max_send_coalesce));
     Some(r)
 }
 
@@ -417,4 +432,228 @@ fn a_send_carries_iosqe_async_only_for_its_own_class() {
         let flags = staged_send_flags(wrong).expect("ring was available");
         assert_eq!(flags & IOSQE_ASYNC, 0, "a send must stay unflagged under {wrong:?}");
     }
+}
+
+/// A reactor that sends gathers of 64 bytes and up zero-copy, with one connection at slot 0 whose peer is `peer`.
+#[cfg(feature = "net-server")]
+fn zero_copy_reactor(peer: ClientAddr, max_send_coalesce: usize) -> Option<Reactor<()>> {
+    let mut r = reactor_with_peer(None, None, ForceAsync::empty(), peer, max_send_coalesce)?;
+    r.cfg.zc_threshold = 64;
+    r.cfg.zc_max_pinned = 1 << 20;
+    r.cfg.zc_linger = Duration::from_secs(1);
+    Some(r)
+}
+
+#[cfg(feature = "net-server")]
+fn tcp_peer() -> ClientAddr {
+    ClientAddr::Inet("127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap())
+}
+
+/// The send SQE a zero-copy reactor stages once `prepare` has set its connection up, `None` without io_uring.
+#[cfg(feature = "net-server")]
+fn first_send(peer: ClientAddr, coalesce: usize, prepare: impl FnOnce(&mut Reactor<()>)) -> Option<IoUringSqe> {
+    let mut r = zero_copy_reactor(peer, coalesce)?;
+    prepare(&mut r);
+    r.submit_send(0, 0).expect("stage the send");
+    Some(r.engine.staged_sqe(0))
+}
+
+/// A zero-copy reactor whose connection has one 100-byte zero-copy send waiting for its notification.
+#[cfg(feature = "net-server")]
+fn one_zero_copy_send_owed() -> Option<Reactor<()>> {
+    let mut r = zero_copy_reactor(tcp_peer(), 1)?;
+    r.table.conn_mut(0).enqueue_reply(vec![7; 100]);
+    r.submit_send(0, 0).expect("stage the send");
+    r.on_send_zc_complete(0, 0, 100, IORING_CQE_F_MORE).expect("the result");
+    assert_eq!((r.zc_pinned, r.zc_owed), (100, 1));
+    Some(r)
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn zero_copy_is_staged_only_above_the_threshold_on_plain_tcp() {
+    let Some(sqe) = first_send(tcp_peer(), 1, |r| r.table.conn_mut(0).enqueue_reply(vec![7; 100])) else {
+        return;
+    };
+    assert_eq!(sqe.opcode, IORING_OP_SEND_ZC);
+    assert_eq!(sqe.ioprio, IORING_SEND_ZC_REPORT_USAGE);
+    assert_eq!(
+        sqe.user_data,
+        pack(Op::SendZc, 0, 0),
+        "the sequence rides in the generation field"
+    );
+    assert_eq!((sqe.addr3, sqe.pad2), (0, 0), "io_send_zc_prep refuses either");
+    assert_eq!(sqe.op_flags, (libc::MSG_WAITALL | libc::MSG_NOSIGNAL) as u32);
+    let gather = first_send(tcp_peer(), 8, |r| {
+        r.table.conn_mut(0).enqueue_reply(vec![7; 50]);
+        r.table.conn_mut(0).enqueue_reply(vec![8; 50]);
+    })
+    .expect("ring was available");
+    assert_eq!(gather.opcode, IORING_OP_SENDMSG_ZC, "a gather of 100 bytes");
+
+    // Each of these keeps the SQE a server without zero-copy stages.
+    let copies = |sqe: IoUringSqe, why: &str| {
+        assert_eq!(sqe.opcode, IORING_OP_SEND, "{why}");
+        assert_eq!(sqe.ioprio, 0, "{why}");
+        assert_eq!(sqe.user_data, pack(Op::Send, 0, 0), "{why}");
+    };
+    let reply = |r: &mut Reactor<()>| r.table.conn_mut(0).enqueue_reply(vec![7; 100]);
+    copies(
+        first_send(tcp_peer(), 1, |r| r.table.conn_mut(0).enqueue_reply(vec![7; 63])).unwrap(),
+        "below the threshold",
+    );
+    copies(
+        first_send(ClientAddr::Unix { cred: None }, 1, reply).unwrap(),
+        "an AF_UNIX peer",
+    );
+    copies(
+        first_send(tcp_peer(), 1, |r| {
+            r.table.conn_mut(0).install_ktls();
+            reply(r);
+        })
+        .unwrap(),
+        "kTLS",
+    );
+    copies(
+        first_send(tcp_peer(), 1, |r| {
+            let mut zc = Box::new(crate::net::core::conn::ZcLedger::new(1000));
+            zc.off = true;
+            r.table.conn_mut(0).zc = Some(zc);
+            reply(r);
+        })
+        .unwrap(),
+        "a connection turned back to copying",
+    );
+    copies(
+        first_send(tcp_peer(), 1, |r| {
+            r.cfg.zc_max_pinned = 99;
+            reply(r);
+        })
+        .unwrap(),
+        "past max_pinned",
+    );
+    let mut off = reactor_with_one_conn(None, None).unwrap();
+    reply(&mut off);
+    off.submit_send(0, 0).unwrap();
+    copies(off.engine.staged_sqe(0), "zero-copy off");
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn a_refused_zero_copy_send_is_resent_with_a_copy() {
+    for (res, flags) in [
+        (-libc::EOPNOTSUPP, IORING_CQE_F_MORE),
+        (-libc::ENOMEM, IORING_CQE_F_MORE),
+        (-libc::EINVAL, 0),
+    ] {
+        let Some(mut r) = zero_copy_reactor(tcp_peer(), 1) else {
+            return;
+        };
+        r.table.conn_mut(0).enqueue_reply(vec![7; 100]);
+        r.submit_send(0, 0).unwrap();
+        r.on_send_zc_complete(0, 0, res, flags).unwrap();
+        let again = r.engine.staged_sqe(1);
+        assert_eq!(again.opcode, IORING_OP_SEND, "res {res}: not sent again with a copy");
+        assert_eq!(again.user_data, pack(Op::Send, 0, 0), "res {res}");
+        assert!(!r.table.conn(0).closing, "res {res}: a refusal closed the connection");
+        assert!(r.table.conn(0).zc.as_deref().unwrap().off, "res {res}");
+        let fallbacks = r.stats.zero_copy_fallbacks.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(fallbacks, 1, "res {res}");
+        assert_eq!(
+            r.zc_owed,
+            u64::from(flags != 0),
+            "res {res}: only F_MORE owes a notification"
+        );
+    }
+    // Any other failure closes, as a plain send's does.
+    let Some(mut r) = zero_copy_reactor(tcp_peer(), 1) else {
+        return;
+    };
+    r.table.conn_mut(0).enqueue_reply(vec![7; 100]);
+    r.submit_send(0, 0).unwrap();
+    r.on_send_zc_complete(0, 0, -libc::EPIPE, IORING_CQE_F_MORE).unwrap();
+    assert!(r.table.conn(0).closing);
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn a_copy_report_turns_zero_copy_off_for_the_connection() {
+    let Some(mut r) = one_zero_copy_send_owed() else {
+        return;
+    };
+    r.on_send_zc_notif(0, 0, IORING_NOTIF_USAGE_ZC_COPIED as i32).unwrap();
+    assert_eq!((r.zc_pinned, r.zc_owed), (0, 0));
+    assert!(r.table.conn(0).zc.as_deref().unwrap().off);
+    assert_eq!(r.stats.zero_copy_copied.load(std::sync::atomic::Ordering::Relaxed), 1);
+    r.table.conn_mut(0).enqueue_reply(vec![7; 100]);
+    r.submit_send(0, 0).unwrap();
+    let next = r.engine.staged_sqes().pop().unwrap();
+    assert_eq!(
+        next.opcode, IORING_OP_SEND,
+        "a connection the kernel copies for keeps copying"
+    );
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn a_closing_connection_holds_its_close_until_notified() {
+    let Some(mut r) = one_zero_copy_send_owed() else {
+        return;
+    };
+    let before = r.engine.staged_sqes().len();
+    r.close_conn(0, 0, CloseReason::PeerClosed).unwrap();
+    let staged = r.engine.staged_sqes().split_off(before);
+    assert!(
+        staged.iter().all(|s| s.opcode != IORING_OP_CLOSE),
+        "a CLOSE went out while the kernel may still read the pages"
+    );
+    let linger = staged
+        .iter()
+        .find(|s| s.user_data == pack(Op::ZcLinger, 0, 0))
+        .expect("the socket gets TCP_USER_TIMEOUT");
+    assert_eq!(linger.opcode, IORING_OP_URING_CMD);
+    assert_eq!(linger.off_addr2, u64::from(SOCKET_URING_OP_SETSOCKOPT));
+    let level_and_name = (libc::IPPROTO_TCP as u32 as u64) | ((libc::TCP_USER_TIMEOUT as u32 as u64) << 32);
+    assert_eq!(linger.addr, level_and_name);
+    // SAFETY: `addr3` points at the ledger's linger value, which lives while the connection does.
+    assert_eq!(
+        unsafe { *(linger.addr3 as *const u32) },
+        1000,
+        "the linger in milliseconds"
+    );
+
+    // The setsockopt reaps first: the notification is still owed, so still no CLOSE.
+    let before = r.engine.staged_sqes().len();
+    r.on_zc_linger(0).unwrap();
+    assert_eq!(r.engine.staged_sqes().len(), before);
+    // The notification lets it go.
+    r.on_send_zc_notif(0, 0, 0).unwrap();
+    let close = r.engine.staged_sqes().pop().unwrap();
+    assert_eq!(close.opcode, IORING_OP_CLOSE);
+    assert_eq!(close.file_index, 1);
+}
+
+#[cfg(feature = "net-server")]
+#[test]
+fn a_stop_resets_only_the_sockets_that_still_owe() {
+    let Some(mut r) = one_zero_copy_send_owed() else {
+        return;
+    };
+    r.reset_owing().unwrap();
+    let reset = r.engine.staged_sqes().pop().unwrap();
+    assert_eq!(reset.opcode, IORING_OP_CONNECT);
+    assert_eq!(reset.user_data, pack(Op::ZcReset, 0, 0));
+    assert_eq!((reset.fd, reset.flags), (0, IOSQE_FIXED_FILE));
+    // SAFETY: `addr` is the static `AF_UNSPEC` sockaddr.
+    let family = unsafe { (*(reset.addr as *const libc::sockaddr)).sa_family };
+    assert_eq!(family, libc::AF_UNSPEC as libc::sa_family_t);
+
+    r.on_send_zc_notif(0, 0, 0).unwrap();
+    let before = r.engine.staged_sqes().len();
+    r.reset_owing().unwrap();
+    assert_eq!(
+        r.engine.staged_sqes().len(),
+        before,
+        "a socket that owes nothing was reset"
+    );
 }

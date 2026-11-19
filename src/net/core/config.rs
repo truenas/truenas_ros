@@ -20,4 +20,15 @@ pub(crate) struct CoreConfig {
     pub(crate) tls_handshake_timeout: Option<Duration>,
     pub(crate) recv_shortage_retry: Option<Duration>,
     pub(crate) force_async: ForceAsync,
+    /// The smallest gather sent zero-copy. `usize::MAX` turns zero-copy off.
+    pub(crate) zc_threshold: usize,
+    pub(crate) zc_max_pinned: usize,
+    pub(crate) zc_linger: Duration,
+}
+
+impl CoreConfig {
+    #[cfg(feature = "net-server")]
+    pub(crate) fn zero_copy(&self) -> bool {
+        self.zc_threshold != usize::MAX
+    }
 }

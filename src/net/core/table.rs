@@ -232,7 +232,9 @@ impl<U> ConnTable<U> {
 
     /// As [`ConnTable::slot_matches`] but for a kernel completion, whose `user_data` carried only the low 32 bits of
     /// the generation. A completion never outlives its op's incarnation (the slot frees only at `ops == 0`), so the low
-    /// bits are an exact match - this is belt-and-suspenders on that invariant.
+    /// bits are an exact match - this is belt-and-suspenders on that invariant. Zero-copy notifications keep it too,
+    /// since a connection holds its `CLOSE` until the last one. Their tag carries a sequence where the generation would
+    /// be.
     pub(crate) fn slot_matches_cqe(&self, slot: u32, generation: u32) -> bool {
         self.slots
             .get(slot as usize)

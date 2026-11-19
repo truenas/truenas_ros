@@ -372,6 +372,18 @@ where
             SendStep::Done => Ok(()),
         }
     }
+
+    /// The result of zero-copy send `seq` ([`Reactor::on_send_zc_complete`]), then as [`on_send`](Self::on_send).
+    pub(super) fn on_send_zc(&mut self, slot: u32, seq: u32, res: i32, flags: u32) -> errno::Result<()> {
+        let step = self.core.on_send_zc_complete(slot, seq, res, flags)?;
+        let generation = self.core.table.generation_low(slot);
+        #[cfg(feature = "uring-fs")]
+        self.drive_file_tail(slot, generation, false)?;
+        match step {
+            SendStep::Pump => self.pump(slot, generation),
+            SendStep::Done => Ok(()),
+        }
+    }
 }
 
 // Recv/send submission and transport checks - no handler runs here, so no closure bounds.

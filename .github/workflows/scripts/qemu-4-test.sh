@@ -110,6 +110,9 @@ export RUST_BACKTRACE=1
 # real failure that must turn CI red.
 export TRUENAS_ROS_REQUIRE_IO_URING=1
 export TRUENAS_ROS_REQUIRE_KTLS=1
+# The tests run as root here, so zero-copy sends are not charged to
+# RLIMIT_MEMLOCK (io_uring_create), and a refused one is a real failure.
+export TRUENAS_ROS_REQUIRE_ZERO_COPY=1
 # memfd_secret (CONFIG_SECRETMEM, default-on) backs the `secrets` module's
 # protected memory. `secretmem_init` mounts the backing fs only when
 # `secretmem_enable && can_set_direct_map()` (mm/secretmem.c:377), and on

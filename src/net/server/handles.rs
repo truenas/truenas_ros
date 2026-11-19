@@ -620,6 +620,18 @@ pub struct ServerStats {
     /// right for it. [`recv_bufs_total`](ServerStats::recv_bufs_total) reads 0 in both cases, so only this counter
     /// tells them apart.
     pub buf_rings_refused_memlock: u64,
+    /// Zero-copy sends ([`send_zero_copy`](super::ServerConfig::send_zero_copy)) that moved bytes. They are in
+    /// [`send_ops`](ServerStats::send_ops) too.
+    pub zero_copy_sends: u64,
+    /// Bytes those sends moved, also in [`bytes_out`](ServerStats::bytes_out).
+    pub zero_copy_bytes: u64,
+    /// Connections that went back to copying because the kernel copied a zero-copy send anyway, as on loopback.
+    pub zero_copy_copied: u64,
+    /// Zero-copy sends the kernel refused, each sent again with a copy. The connection copies from then on.
+    pub zero_copy_fallbacks: u64,
+    /// Sockets a stopping server reset because the peer did not acknowledge zero-copy bytes within
+    /// [`SendZeroCopy::linger`](super::SendZeroCopy::linger).
+    pub zero_copy_resets: u64,
 }
 
 /// A `Clone + Send + Sync` handle for reading a running server's counters from any thread ([`Server::stats_handle`]).
@@ -654,6 +666,11 @@ impl StatsHandle {
             buf_shortages: s.buf_shortages.load(Ordering::Relaxed),
             recv_bufs_total: s.recv_bufs_total.load(Ordering::Relaxed) as u32,
             buf_rings_refused_memlock: s.buf_rings_refused_memlock.load(Ordering::Relaxed),
+            zero_copy_sends: s.zero_copy_sends.load(Ordering::Relaxed),
+            zero_copy_bytes: s.zero_copy_bytes.load(Ordering::Relaxed),
+            zero_copy_copied: s.zero_copy_copied.load(Ordering::Relaxed),
+            zero_copy_fallbacks: s.zero_copy_fallbacks.load(Ordering::Relaxed),
+            zero_copy_resets: s.zero_copy_resets.load(Ordering::Relaxed),
         }
     }
 }
