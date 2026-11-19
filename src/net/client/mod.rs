@@ -134,7 +134,7 @@ where
 
     fn build(config: ClientConfig, framer: F, ring: RingFd) -> crate::Result<Self> {
         // A kernel without `FIXED_FD_INSTALL` or the TLS ULP fails a `tls` connect cleanly and leaves plain TCP alone.
-        let engine = Engine::on_ring(ring, config.pool_size)?;
+        let engine = Engine::on_ring(ring, config.pool_size, 0)?;
         let ktls_supported = probe_ktls().is_ok();
 
         let ts_of = connect::ts_of;

@@ -147,6 +147,9 @@ impl FsCore {
             }
             return ReapedFs::None;
         }
+        if is_chain_tag(tag) {
+            return self.on_chain_cqe(eng, tag, op_slot, gen32, res);
+        }
         #[cfg_attr(not(feature = "net-server"), allow(unused_mut))]
         let Some(mut completed) = self.take_op(tag, op_slot, gen32) else {
             return ReapedFs::None;
@@ -294,9 +297,12 @@ impl FsCore {
     /// Teardown-drain routing, which replies and frees but never stages, since the drain is cancelling everything.
     pub(crate) fn on_drain_cqe(&mut self, cqe: &IoUringCqe) {
         let (tag, op_slot, gen32) = unpack_raw(cqe.user_data);
-        if tag & 0x80 == 0 || tag == TAG_CANCEL || tag == TAG_WAKE || tag == TAG_FILE_LEASE {
+        if tag & 0x80 == 0 || tag == TAG_CANCEL || tag == TAG_WAKE || tag == TAG_FILE_LEASE || chain_mid(tag) {
             return;
         }
+        // A chain ends at its reopen or its link's last step, and stages nothing more here, so the rest of a size is
+        // left unrun and its slot to the ring's teardown.
+        let tag = if tag == TAG_CHAIN_REOPEN { TAG_CHAIN_END } else { tag };
         let Some(done) = self.take_op(tag, op_slot, gen32) else {
             return;
         };
@@ -351,14 +357,15 @@ impl FsCore {
     /// Leak the op table without dropping it, used only when a teardown drain failed with ops possibly still in flight.
     /// The kernel may still write into a buffer an op entry owns until its CQE reaps, so freeing it would be a
     /// use-after-free. Pairs with `ConnTable::leak` and `Engine::leak_wake_buf`. The callbacks in the slots' rooms leak
-    /// with their entries, as boxed ones do. So does the folder a reopen names its file in, whose number a reopen still
-    /// queued resolves as it runs.
+    /// with their entries, as boxed ones do. So do the buffers a chain's statx writes and the folder a reopen names its
+    /// file in, whose number a reopen still queued resolves as it runs.
     pub(crate) fn leak(&mut self) {
         std::mem::forget(std::mem::take(&mut self.ops));
         std::mem::forget(std::mem::replace(
             &mut self.cbs,
             crate::uring_fs::callbacks::Rooms::new(0, 0),
         ));
+        std::mem::forget(self.chains.take());
         std::mem::forget(self.proc_fd_dir.take());
     }
 
@@ -421,7 +428,7 @@ impl FsCore {
     /// Take a completed op entry out: returns its waiter and payloads and frees the slot (generation bumped) - the
     /// freed-before-fire rule. A callback in the slot's room stays there until [`deliver_embedded`] moves it out to
     /// run, and the room takes no other callback before then.
-    fn take_op(&mut self, tag: u8, op_slot: u32, gen32: u32) -> Option<Completed> {
+    pub(super) fn take_op(&mut self, tag: u8, op_slot: u32, gen32: u32) -> Option<Completed> {
         let entry = self.ops.get(op_slot as usize)?;
         if entry.generation as u32 != gen32 {
             return None;

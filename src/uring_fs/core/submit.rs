@@ -443,7 +443,7 @@ impl FsCore {
     }
 
     /// Pop a free op slot - the one way any submit path takes one.
-    fn pop_op(&mut self) -> Option<u32> {
+    pub(super) fn pop_op(&mut self) -> Option<u32> {
         self.op_free.pop()
     }
 

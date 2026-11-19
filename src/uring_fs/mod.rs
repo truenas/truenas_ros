@@ -155,7 +155,10 @@ pub(crate) mod core;
 pub mod file_lease;
 // Exported without `net-server`, since a consumer driving a standalone [`UringFs`] needs the `FsConn` facade to run
 // several operations back to back as much as an embedded server does.
-pub use core::{ConnToken, DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, StepPath, Timer, boxed_callbacks};
+pub use core::{
+    Chain, ChainDone, ChainStep, ConnToken, DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, Reopen, StepPath,
+    Timer, boxed_callbacks,
+};
 // The one on-loop type that is the server's alone: a window of a pooled receive buffer, which only the net server has.
 #[cfg(feature = "net-server")]
 pub use core::LeasedWindow;

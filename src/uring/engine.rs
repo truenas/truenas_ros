@@ -22,10 +22,16 @@ use crate::sync::atomic::{AtomicBool, AtomicU64};
 pub(crate) const MAX_CHAIN_LINKS: usize = 4;
 
 /// Whether a reaped completion ends an op this ring staged: one per op, so not a multishot's interim completions or a
-/// zero-copy send's result (`IORING_CQE_F_MORE`), and not one another ring posted
-/// ([`TAG_POSTED`](crate::uring::user_data::TAG_POSTED)).
+/// zero-copy send's result (`IORING_CQE_F_MORE`), not one another ring posted
+/// ([`TAG_POSTED`](crate::uring::user_data::TAG_POSTED)), and not a step of the file core's chain that posts with the
+/// chain still running ([`chain_mid`](crate::uring_fs::core::chain_mid)).
 pub(crate) fn counted(cqe: &IoUringCqe) -> bool {
-    cqe.flags & IORING_CQE_F_MORE == 0 && cqe.user_data as u8 != crate::uring::user_data::TAG_POSTED
+    let tag = cqe.user_data as u8;
+    #[cfg(feature = "uring-fs")]
+    if crate::uring_fs::core::chain_mid(tag) {
+        return false;
+    }
+    cqe.flags & IORING_CQE_F_MORE == 0 && tag != crate::uring::user_data::TAG_POSTED
 }
 
 /// What a test makes the next [`Engine::stage`] answer, since a full SQ is flushed and retried, so only the kernel
@@ -70,13 +76,16 @@ impl Engine {
     /// Build the ring, register a sparse fixed-file pool of `pool_slots`, run the universal capability probe, and wire
     /// the wake eventfd. Domain probes (socket commands, TLS ULP) run afterwards against [`Engine::ring`].
     pub(crate) fn new(entries: u32, pool_slots: u32) -> crate::Result<Engine> {
-        Self::on_ring(RingFd::setup(entries)?, pool_slots)
+        Self::on_ring(RingFd::setup(entries)?, pool_slots, 0)
     }
 
-    /// [`Engine::new`] over a ring created earlier, possibly on another thread. The mapping happens here, on the thread
+    /// [`Engine::new`] over a ring created earlier, possibly on another thread, with `past_pool` slots of the registered
+    /// table beyond the pool that accept never fills ([`Ring::register_pool`]). The mapping happens here, on the thread
     /// that will drive it.
-    pub(crate) fn on_ring(setup: RingFd, pool_slots: u32) -> crate::Result<Engine> {
-        Self::assemble(Ring::from_setup(setup)?, |ring| ring.register_pool(pool_slots))
+    pub(crate) fn on_ring(setup: RingFd, pool_slots: u32, past_pool: u32) -> crate::Result<Engine> {
+        Self::assemble(Ring::from_setup(setup)?, |ring| {
+            ring.register_pool(pool_slots, past_pool)
+        })
     }
 
     /// [`Engine::on_ring`] without the fixed-file pool, for a host whose descriptors are plain fds.
@@ -178,6 +187,18 @@ impl Engine {
             sqe.user_data = user_data;
         })?;
         self.inflight += n as u64;
+        Ok(())
+    }
+
+    /// Stage `n` SQEs as one link of the file core's chain, each with the `user_data` `fill` gives it, counted as one op
+    /// in flight, since a chain posts one counted completion however many of its steps post
+    /// ([`chain_mid`](crate::uring_fs::core::chain_mid)). Unlike [`Engine::stage_chain`] it takes no bound of its own,
+    /// since each link is staged contiguously however many there are ([`Ring::push_sqe_chain`]).
+    #[cfg(feature = "uring-fs")]
+    pub(crate) fn stage_fs_chain(&mut self, n: usize, fill: impl FnMut(usize, &mut IoUringSqe)) -> errno::Result<()> {
+        self.stage_seam.refusal()?;
+        self.ring.push_sqe_chain(n, fill)?;
+        self.inflight += 1;
         Ok(())
     }
 

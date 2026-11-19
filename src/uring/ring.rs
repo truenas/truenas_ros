@@ -583,10 +583,20 @@ impl Ring {
         register_iowq_max_workers(self.raw_fd(), [bounded, 0])
     }
 
-    /// Register the sparse file "pool" of `count` slots and confine auto-allocation to `[0, count)`.
-    pub(crate) fn register_pool(&self, count: u32) -> errno::Result<()> {
-        register_files_sparse(self.raw_fd(), count)?;
+    /// Register the sparse file "pool" of `count` slots, with `past` more beyond it, and confine auto-allocation to
+    /// `[0, count)`, so multishot accept never fills a slot past the pool. The kernel refuses a table larger than
+    /// `RLIMIT_NOFILE` (`io_sqe_files_register` in `io_uring/rsrc.c`).
+    pub(crate) fn register_pool(&self, count: u32, past: u32) -> errno::Result<()> {
+        register_files_sparse(self.raw_fd(), count.checked_add(past).ok_or(Errno::EINVAL)?)?;
         register_file_alloc_range(self.raw_fd(), 0, count)
+    }
+
+    /// Empty registered-file slot `slot` at once, dropping the file in it, or nothing when it is empty
+    /// (`__io_sqe_files_update` in `io_uring/rsrc.c`). A system call on this thread, so unlike a staged `CLOSE` it
+    /// needs no room in the submission queue and cannot be refused for the lack of it.
+    #[cfg(feature = "uring-fs")]
+    pub(crate) fn clear_file(&self, slot: u32) -> errno::Result<()> {
+        register_file_update(self.raw_fd(), slot, -1)
     }
 
     /// Install a connected socket `fd` into the pool at `slot`: a client's connection, or a socket a server adopts. A

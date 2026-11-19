@@ -522,6 +522,47 @@ mod tests {
 
     use crate::uring::setup_unavailable as skip_unavailable;
 
+    /// The standalone host registers no table of files, so it refuses a chain at once with a marked `EINVAL` and the
+    /// value back, whatever the chain asks.
+    #[test]
+    fn the_standalone_host_refuses_a_chain() {
+        use crate::uring_fs::core::{Chain, ChainDone, ChainStep, FsConn, Reopen, deliver_pool_completions};
+        use crate::uring_fs::{File, ReopenAccess};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut host = match UringFs::new(FsConfig::default()) {
+            Ok(h) => h,
+            Err(crate::Error::Errno(e)) if skip_unavailable(e) => return,
+            Err(e) => panic!("UringFs::new: {e}"),
+        };
+        let me = host.register_self().expect("personality");
+        let dir = crate::tempdir().expect("tempdir");
+        let fd = std::fs::File::open(dir.path()).expect("open");
+        let chain = Chain {
+            file: File::new(crate::sync::Arc::new(std::os::fd::OwnedFd::from(fd))),
+            reopen: Some(Reopen::AsCaller(ReopenAccess::Read)),
+            truncate: None,
+            set: Some(b"value".to_vec()),
+            statx: None,
+            sync: true,
+        };
+        let out: Rc<RefCell<Option<ChainDone>>> = Rc::default();
+        let o = Rc::clone(&out);
+        FsConn::new(&mut host.fs, &mut host.eng, Some((1, 1))).chain(me, chain, move |d, _| *o.borrow_mut() = Some(d));
+        deliver_pool_completions(&mut host.fs, &mut host.eng);
+        let done = out.borrow_mut().take().expect("refused at once");
+        assert!(done.was_refused());
+        assert!(
+            matches!(
+                done.step(ChainStep::Sync),
+                Some(Err(crate::Error::Errno(Errno::EINVAL)))
+            ),
+            "{done:?}"
+        );
+        assert_eq!(done.into_value(), b"value");
+    }
+
     /// `FsConfig` is checked before a ring is created. An op table wider than `user_data`'s 24-bit slot field
     /// (`user_data::SLOT_MASK`) would alias indices and route a completion to the wrong op, and nothing downstream
     /// re-checks it.
@@ -752,7 +793,7 @@ mod tests {
         let Some(mut ring) = ring_or_skip(8) else {
             return;
         };
-        ring.register_pool(4).expect("register pool");
+        ring.register_pool(4, 0).expect("register pool");
         let dir = crate::tempdir().unwrap();
         let path = CString::new(dir.path().join("f").as_os_str().as_bytes()).unwrap();
         let how = RawOpenHow {

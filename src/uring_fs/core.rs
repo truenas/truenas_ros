@@ -136,10 +136,29 @@ pub(crate) const TAG_FILE_LEASE: u8 = 0x96;
 /// `WRITE` of a range of one buffer ([`FsConn::pwritev2_owned`]). The buffer rides in the slot's `value`, as a read
 /// into spare room's does, and comes back whole whatever the kernel answers.
 pub(crate) const TAG_WRITE_OWNED: u8 = 0x97;
+/// The steps of a chain ([`FsConn::chain`]). The reopen skips its completion, so one that posts failed and ended the
+/// chain. A set, a statx or an fsync that is not last posts with the chain still running ([`chain_mid`]), and the last
+/// step of each link posts under [`TAG_CHAIN_END`].
+pub(crate) const TAG_CHAIN_REOPEN: u8 = 0x98;
+pub(crate) const TAG_CHAIN_SET: u8 = 0x99;
+pub(crate) const TAG_CHAIN_STATX: u8 = 0x9A;
+pub(crate) const TAG_CHAIN_SYNC: u8 = 0x9B;
+pub(crate) const TAG_CHAIN_END: u8 = 0x9C;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
 pub(crate) const TAG_CANCEL: u8 = 0x9E;
+
+/// Whether `tag` is a step of a chain that posts with the chain still running, which ends no op in flight
+/// ([`counted`](crate::uring::engine::counted)).
+pub(crate) fn chain_mid(tag: u8) -> bool {
+    matches!(tag, TAG_CHAIN_SET | TAG_CHAIN_STATX | TAG_CHAIN_SYNC)
+}
+
+/// Whether `tag` is any step of a chain.
+fn is_chain_tag(tag: u8) -> bool {
+    chain_mid(tag) || tag == TAG_CHAIN_REOPEN || tag == TAG_CHAIN_END
+}
 
 /// A completed embedded op's callback, fired on the loop thread by the embedding host (a `net` server) with the outcome
 /// and a fresh [`FsConn`] for chaining. It fires inline at the completion's dispatch, or at the wake drain for a host
@@ -935,6 +954,8 @@ pub(crate) struct FsCore {
     refusals: VecDeque<(Owner, EmbeddedCb, FsDone)>,
     /// The file leases this ring holds and the signalfd their breaks arrive on ([`FileLeases`]).
     pub(crate) file_leases: FileLeases,
+    /// What each op slot's chain keeps while it runs, on a ring with the chain slots alone ([`FsCore::enable_chains`]).
+    chains: Option<chain::Chains>,
     /// The folder of the ring thread's descriptors under `/proc`, which a reopen names its file in
     /// ([`FsCore::proc_fd_dir`]).
     proc_fd_dir: Option<OwnedFd>,
@@ -1005,6 +1026,7 @@ impl FsCore {
             force_async_min: 0,
             refusals: VecDeque::new(),
             file_leases: FileLeases::default(),
+            chains: None,
             proc_fd_dir: None,
         }
     }
@@ -1427,5 +1449,8 @@ mod routing;
 mod done;
 
 mod fs_conn;
+
+mod chain;
+pub use chain::{Chain, ChainDone, ChainStep, Reopen};
 
 mod pool_ops;
