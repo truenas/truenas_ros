@@ -484,7 +484,7 @@ impl ReopenAccess {
     /// The `open_how` of the reopen, this access with `O_CLOEXEC` and `O_NOCTTY`, and whether the special-file guard
     /// added `O_NONBLOCK`, which it does for every access, so that a FIFO answers at once rather than hold a worker. No
     /// resolve flag is set, since `RESOLVE_NO_MAGICLINKS` refuses the link under `/proc` that the reopen follows, and
-    /// the path is absolute, which `RESOLVE_BENEATH` and `RESOLVE_IN_ROOT` refuse.
+    /// the link leaves the folder it is named in, which `RESOLVE_BENEATH` and `RESOLVE_IN_ROOT` refuse.
     pub(crate) fn how(self) -> (RawOpenHow, bool) {
         let access = match self {
             ReopenAccess::Read => libc::O_RDONLY,

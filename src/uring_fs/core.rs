@@ -355,7 +355,8 @@ struct FsOpEntry {
     /// SQE carries its address, so it must not move until the CQE reaps. A name that fits `name` goes there instead
     /// ([`FsOpEntry::park_name`]).
     path: Option<Cow<'static, CStr>>,
-    /// The bytes of the op's name when it fits with its NUL, or the path of a descriptor under `/proc/thread-self/fd`.
+    /// The bytes of the op's name when it fits with its NUL, or the path of a descriptor under `/proc/thread-self/fd`,
+    /// or its number alone for a reopen in the ring's folder of them.
     /// The kernel copies it at prep, inside the enter that submits the SQE, and the op table never grows after
     /// [`FsCore::new`], so this address holds however many stages batch before that enter.
     name: [u8; NAME_ROOM],
@@ -688,8 +689,18 @@ impl FsOpEntry {
         ptr
     }
 
-    /// Write the path of `fd` under `/proc/thread-self/fd` into the slot's bytes, and give its address, for a reopen or
-    /// a read of an xattr that resolves it on the io-wq worker that runs it. The worker shares the descriptors of the
+    /// Write the number of `fd` into the slot's bytes, and give its address, for a reopen that names it in the ring's
+    /// folder of descriptors ([`FsCore::proc_fd_dir`]). `write!` into a slice allocates nothing.
+    fn park_fd_name(&mut self, fd: RawFd) -> u64 {
+        use std::io::Write as _;
+        let mut room = &mut self.name[..];
+        write!(room, "{fd}\0").expect("the number of a descriptor fits the slot");
+        self.name.as_ptr() as u64
+    }
+
+    /// Write the path of `fd` under `/proc/thread-self/fd` into the slot's bytes, and give its address, for a read of an
+    /// xattr that resolves it on the io-wq worker that runs it, since io_uring's `GETXATTR` takes no folder
+    /// (`io_getxattr` in `io_uring/xattr.c`). The worker shares the descriptors of the
     /// thread that submitted it (`create_io_thread` in `kernel/fork.c`), and a thread of the process reaches them
     /// whatever its personality, since `proc_fd_permission` in `fs/proc/fd.c` and `__ptrace_may_access` in
     /// `kernel/ptrace.c` let the same thread group through. The longest such path, of the largest descriptor number,
@@ -924,6 +935,9 @@ pub(crate) struct FsCore {
     refusals: VecDeque<(Owner, EmbeddedCb, FsDone)>,
     /// The file leases this ring holds and the signalfd their breaks arrive on ([`FileLeases`]).
     pub(crate) file_leases: FileLeases,
+    /// The folder of the ring thread's descriptors under `/proc`, which a reopen names its file in
+    /// ([`FsCore::proc_fd_dir`]).
+    proc_fd_dir: Option<OwnedFd>,
     /// Spawned tasks and their run queue ([`super::task`]), polled by the delivery functions below. **Last field on
     /// purpose**, since fields drop in declaration order and `Tasks::drop`, which runs pending task destructors, relies
     /// on everything above being gone.
@@ -991,6 +1005,7 @@ impl FsCore {
             force_async_min: 0,
             refusals: VecDeque::new(),
             file_leases: FileLeases::default(),
+            proc_fd_dir: None,
         }
     }
 

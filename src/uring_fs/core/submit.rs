@@ -801,14 +801,40 @@ impl FsCore {
         self.stage_reopen_proc(eng, 0, file, access, waiter);
     }
 
+    /// The folder of this thread's descriptors under `/proc`, opened at the first reopen, which a reopen names its file
+    /// in, so the walk from the root is left out. It names the thread that opened it, the ring's, whose descriptors the
+    /// io-wq worker that runs the open shares (`create_io_thread` in `kernel/fork.c`). An open that fails answers the
+    /// reopen, with no walk of the whole path to fall back on.
+    pub(super) fn proc_fd_dir(&mut self) -> Result<RawFd, Errno> {
+        if let Some(dir) = &self.proc_fd_dir {
+            return Ok(dir.as_raw_fd());
+        }
+        // SAFETY: a NUL-terminated literal, and `open` reads nothing else.
+        let fd = unsafe {
+            libc::open(
+                c"/proc/thread-self/fd".as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(Errno::last());
+        }
+        // SAFETY: `fd` was just opened, and nothing else owns it.
+        let dir = unsafe { crate::fd::owned_from_raw(fd) };
+        let raw = dir.as_raw_fd();
+        self.proc_fd_dir = Some(dir);
+        Ok(raw)
+    }
+
     /// Stage a reopen stamping `sqe.personality = personality_raw` verbatim, as the two callers own the personality
     /// policy.
     ///
     /// An open like any other ([`TAG_OPEN`]), so its completion wraps the new descriptor and strips the guard's
-    /// `O_NONBLOCK`. The path is absolute, so the dirfd is `AT_FDCWD`, and `file` is parked with the op so its number
-    /// is not reused before the io-wq worker follows the link ([`park_proc_path`](FsOpEntry::park_proc_path)). The open
-    /// takes `IOSQE_ASYNC`, since the inline try always fails, as `proc_pid_get_link` (`fs/proc/base.c`) answers
-    /// `ECHILD` with no dentry and `io_openat2` (`io_uring/openclose.c`) sets `LOOKUP_CACHED`.
+    /// `O_NONBLOCK`. It names the file's number in the ring's folder of descriptors ([`FsCore::proc_fd_dir`]), so the
+    /// walk from the root is left out, and `file` is parked with the op so its number is not reused before the io-wq
+    /// worker follows the link. The open takes `IOSQE_ASYNC`, since the inline try always fails, as `proc_pid_get_link`
+    /// (`fs/proc/base.c`) answers `ECHILD` with no dentry and `io_openat2` (`io_uring/openclose.c`) sets
+    /// `LOOKUP_CACHED`.
     fn stage_reopen_proc(
         &mut self,
         eng: &mut Engine,
@@ -817,6 +843,13 @@ impl FsCore {
         access: ReopenAccess,
         waiter: FsWaiter,
     ) {
+        let dir = match self.proc_fd_dir() {
+            Ok(dir) => dir,
+            Err(err) => {
+                self.refuse(eng, waiter, err, false, Vec::new(), Some(file));
+                return;
+            }
+        };
         let Some(op_slot) = self.pop_op() else {
             self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), Some(file));
             return;
@@ -830,14 +863,14 @@ impl FsCore {
         e.state = FsOpState::InFlight { tag: TAG_OPEN };
         e.waiter = Some(waiter);
         e.file = Some(file);
-        let path_ptr = e.park_proc_path(raw_fd);
+        let path_ptr = e.park_fd_name(raw_fd);
         e.how = Some(how);
         e.strip_nonblock = guarded;
         let how_ptr = e.how.as_ref().expect("just set") as *const RawOpenHow as u64;
         let ud = pack_raw(TAG_OPEN, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = IORING_OP_OPENAT2;
-            sqe.fd = libc::AT_FDCWD;
+            sqe.fd = dir;
             sqe.addr = path_ptr;
             sqe.off_addr2 = how_ptr;
             sqe.len = size_of::<RawOpenHow>() as u32;

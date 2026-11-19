@@ -351,13 +351,15 @@ impl FsCore {
     /// Leak the op table without dropping it, used only when a teardown drain failed with ops possibly still in flight.
     /// The kernel may still write into a buffer an op entry owns until its CQE reaps, so freeing it would be a
     /// use-after-free. Pairs with `ConnTable::leak` and `Engine::leak_wake_buf`. The callbacks in the slots' rooms leak
-    /// with their entries, as boxed ones do.
+    /// with their entries, as boxed ones do. So does the folder a reopen names its file in, whose number a reopen still
+    /// queued resolves as it runs.
     pub(crate) fn leak(&mut self) {
         std::mem::forget(std::mem::take(&mut self.ops));
         std::mem::forget(std::mem::replace(
             &mut self.cbs,
             crate::uring_fs::callbacks::Rooms::new(0, 0),
         ));
+        std::mem::forget(self.proc_fd_dir.take());
     }
 
     /// Move the staged callback of `waiter` into the room of `op_slot`, the slot it is about to wait in. A room that
